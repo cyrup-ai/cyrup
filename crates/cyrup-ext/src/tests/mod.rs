@@ -66,3 +66,4 @@ mod wasm_host;
 #[cfg(feature = "wasm-host")]
 mod wat_guest;
 mod wit_world_sync;
+mod word_nav;

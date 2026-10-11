@@ -61,7 +61,6 @@ pub(crate) use render::EmbeddedStatus;
 #[cfg(test)]
 pub(crate) use render::top_border_with_status;
 pub(crate) mod undo;
-pub(crate) mod word_nav;
 mod wrap;
 
 #[cfg(test)]
@@ -69,7 +68,10 @@ mod tests;
 
 // The editor-internal helpers the submodules share. Re-bound here so every submodule reaches
 // them through its own `use super::*;`, the same way `crate::app` and `crate::transcript` do.
-use word_nav::{WordSeg, find_word_backward, find_word_forward, is_punctuation};
+//
+// Word navigation and its ICU segmenter are SHARED with the overlay search inputs and live in
+// `cyrup_ext::word_nav` (EXT-113; born here as TUI-048).
+use cyrup_ext::word_nav::{self, WordSeg, find_word_backward, find_word_forward, is_punctuation};
 use wrap::{display_width, grapheme_boundaries};
 
 /// Outcome of feeding a key to the editor.

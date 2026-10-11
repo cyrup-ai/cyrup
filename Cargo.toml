@@ -300,7 +300,8 @@ unicode-segmentation = { version = "1.13.3" }
 # `Intl.Segmenter` (ICU) gives two — costing the exact column TUI-048's Verify line names. ICU4X is
 # already compiled into this workspace transitively (11 `icu_*` crates via `idna_adapter`); this
 # promotes a segmenter from that same stack to a direct dependency, and its dictionary payload is
-# the only genuinely new weight.
+# the only genuinely new weight. Declared by `cyrup-ext` alone, whose `word_nav` is the one
+# segmenter the editor and the overlay search inputs share (EXT-113).
 icu_segmenter = { version = "2.3.0" }
 unicode-normalization = { version = "0.1.24" }   # tools NFKC/NFD normalization (arch-03)
 feruca               = { version = "0.12.0" }    # pure-Rust UCA collation for `ls` localeCompare parity (arch-03, ls.ts:150)

@@ -25,16 +25,13 @@ use ratatui::widgets::Paragraph;
 
 use crate::editor::kill_ring::{kill_ring_push, kill_ring_rotate};
 use crate::editor::undo::{UNDO_CAP, push_bounded, should_snapshot_for_type};
-use crate::editor::word_nav::{
-    byte_seg_first_punct, byte_seg_is_whitespace, byte_seg_last_punct_end, byte_word_segments,
-    find_word_backward, find_word_forward,
-};
 use crate::keymap::{EditorAction, EditorKeymap, SelectAction, SelectKeymap};
 use crate::selector::{
     Selector, SelectorOutcome, border_rule, input_line_spans, stack_rows, title_lines,
     title_wrapped_height,
 };
 use crate::theme::UiTheme;
+use cyrup_ext::word_nav::{byte_find_word_backward, byte_find_word_forward};
 
 /// `lastAction` (`input.ts:34`): `"kill" | "yank" | "type-word" | null`. Gates kill-ring
 /// accumulation, yank-pop eligibility and undo coalescing.
@@ -561,38 +558,15 @@ impl Input {
     /// `findWordBackward(this.value, this.cursor)` (`word-navigation.ts:22-68`) over BYTE offsets —
     /// the same walk the multi-line editor runs over char columns, with no atomic paste markers
     /// because a single-line field has none.
+    ///
+    /// The walk is `cyrup_ext::word_nav`'s, the same one the `/llama` search box runs (EXT-113).
     fn word_left(&self) -> usize {
-        if self.cursor == 0 {
-            return 0;
-        }
-        let Some(before) = self.value.get(..self.cursor) else {
-            return self.cursor;
-        };
-        let segs = byte_word_segments(before);
-        find_word_backward(
-            segs,
-            self.cursor,
-            &|seg| byte_seg_is_whitespace(before, seg),
-            &|seg| byte_seg_last_punct_end(before, seg),
-        )
+        byte_find_word_backward(&self.value, self.cursor)
     }
 
     /// `findWordForward(this.value, this.cursor)` (`word-navigation.ts:76-114`).
     fn word_right(&self) -> usize {
-        let len = self.value.len();
-        if self.cursor >= len {
-            return len;
-        }
-        let Some(after) = self.value.get(self.cursor..) else {
-            return self.cursor;
-        };
-        let segs = byte_word_segments(after);
-        find_word_forward(
-            &segs,
-            self.cursor,
-            &|seg| byte_seg_is_whitespace(after, seg),
-            &|seg| byte_seg_first_punct(after, seg),
-        )
+        byte_find_word_forward(&self.value, self.cursor)
     }
 }
 

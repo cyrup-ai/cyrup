@@ -44,6 +44,12 @@ dashmap.workspace = true
 # dependency of `cyrup-mcp` and `cyrup-permission-system` at the same major, and Rust's `regex` is a
 # finite automaton with a linear-time matching guarantee.
 regex = "1.12.4"
+# ICU word segmentation (EXT-113, TUI-048): `Intl.Segmenter`'s word granularity, i.e. UAX#29 PLUS
+# the dictionary/LSTM pass for unspaced scripts. Lives here, in `word_nav`, so the editor
+# (`cyrup-tui`) and the overlay search inputs (`cyrup-llama`) share ONE segmenter: both already
+# depend on this crate, and nothing below it needs word navigation. Moved from `cyrup-tui`, which no
+# longer names it directly; not behind `wasm-host` because it is pure text.
+icu_segmenter = { workspace = true }
 # The `http-client` capability grant (arch-08 §3.2 draft; pi-mcp-adapter-port.md §3.2), backing
 # `caps::http::HttpCaps` — a real `reqwest`-based engine. Optional (bundled into `wasm-host`) so a
 # `--no-default-features` build of the native-only foundation pulls neither wasmtime nor reqwest.

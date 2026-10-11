@@ -2006,6 +2006,140 @@ fn input_word_motion_and_deletion() {
     assert_eq!(input.value(), "one |two");
 }
 
+/// Ctrl+Left / Ctrl+Right as the terminal reports them.
+fn ctrl_arrow(code: OverlayKeyCode) -> OverlayKey {
+    OverlayKey {
+        code,
+        ctrl: true,
+        alt: false,
+        shift: false,
+    }
+}
+
+/// Every caret stop `key` makes in `text`, as BYTE offsets, starting from the end of the line
+/// (`from_start == false`) or after Ctrl+A (`true`), until the caret stops moving.
+///
+/// Black-box: for the k-th stop it rebuilds the input, presses `key` k times through the real
+/// [`TextInput::handle_key`] (so the binding table resolves the key exactly as in the overlay),
+/// types `|` and reads where the `|` landed.
+fn word_stops(text: &str, key: &OverlayKey, from_start: bool) -> Vec<usize> {
+    let keys = LlamaKeys::default();
+    let mut stops = Vec::new();
+    for presses in 1..=text.chars().count() + 1 {
+        let mut input = input_with(text);
+        if from_start {
+            input.handle_key(&keys, &ctrl('a'));
+        }
+        for _ in 0..presses {
+            input.handle_key(&keys, key);
+        }
+        input.handle_key(&keys, &chr('|'));
+        let at = input.value().find('|').unwrap();
+        if stops.last() == Some(&at) {
+            break;
+        }
+        stops.push(at);
+    }
+    stops
+}
+
+/// EXT-113: the /llama search box breaks `日本語のモデル` where node 22.22.0's `Intl.Segmenter`
+/// (ICU 77.1) does — `日本語` / `の` / `モデル` — so Ctrl+Left from the end stops at bytes 12, 9, 0
+/// and Ctrl+Right from the start at 9, 12, 21 (node's UTF-16 answers 4, 3, 0 and 3, 4, 7 at three
+/// bytes per character). RED before the shared ICU helper: UAX#29 alone has no dictionary and split
+/// the kanji one per character, so Ctrl+Left stopped at 12, 9, 6, 3, 0.
+#[test]
+fn search_input_ctrl_arrows_stop_at_the_three_dictionary_boundaries() {
+    let text = "日本語のモデル";
+    assert_eq!(
+        word_stops(text, &ctrl_arrow(OverlayKeyCode::Left), false),
+        vec![12, 9, 0],
+        "ctrl+left over {text}"
+    );
+    assert_eq!(
+        word_stops(text, &ctrl_arrow(OverlayKeyCode::Right), true),
+        vec![9, 12, 21],
+        "ctrl+right over {text}"
+    );
+}
+
+/// EXT-113: word deletion walks the same dictionary words — Ctrl+W from the end kills `モデル`,
+/// then `の`, then `日本語`; Alt+D from the start kills them in the other order. RED before the
+/// shared helper (the third Ctrl+W killed `語` alone and left `日本`).
+#[test]
+fn search_input_word_deletion_kills_one_dictionary_word_at_a_time() {
+    let keys = LlamaKeys::default();
+    let mut input = input_with("日本語のモデル");
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        input.handle_key(&keys, &ctrl('w'));
+        seen.push(input.value().to_string());
+    }
+    assert_eq!(seen, vec!["日本語の", "日本語", ""], "ctrl+w");
+
+    let mut input = input_with("日本語のモデル");
+    input.handle_key(&keys, &ctrl('a'));
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        input.handle_key(&keys, &alt('d'));
+        seen.push(input.value().to_string());
+    }
+    assert_eq!(seen, vec!["のモデル", "モデル", ""], "alt+d");
+}
+
+/// EXT-113: `isWordLike` is ICU's, not "contains an alphanumeric". node 22.22.0 says `①` and `½`
+/// are NOT word-like and `__` and `‿‿` ARE, which decides between pi's two backward branches (one
+/// word-like segment, or the whole non-word run). Expected stops are node's, from a JS port of
+/// `word-navigation.ts` over `Intl.Segmenter` (UTF-16 indexes converted to bytes: `①` and `‿` are
+/// three bytes, `½` two). RED before the shared helper on 8 of the 10 directions: `x①①` stopped
+/// at 4 (each `①` a word-like segment of its own), `a.__` skipped 2 (`__` was punctuation and
+/// joined `.` in one run), and `x½½` / `a々` likewise. The `a ‿‿` row agreed at HEAD (both
+/// predicates send a lone `‿‿` to a one-segment stop) and is a non-regression guard row.
+#[test]
+fn search_input_word_motion_uses_icus_is_word_like() {
+    let left = ctrl_arrow(OverlayKeyCode::Left);
+    let right = ctrl_arrow(OverlayKeyCode::Right);
+    let mut wrong = Vec::new();
+    for (text, back, fwd) in [
+        ("x①①", vec![1, 0], vec![1, 7]),
+        ("x½½", vec![1, 0], vec![1, 5]),
+        ("a.__", vec![2, 1, 0], vec![1, 2, 4]),
+        ("a ‿‿", vec![2, 0], vec![1, 8]),
+        ("a々", vec![1, 0], vec![1, 4]),
+    ] {
+        let got = word_stops(text, &left, false);
+        if got != back {
+            wrong.push(format!("ctrl+left over {text}: {got:?}, node {back:?}"));
+        }
+        let got = word_stops(text, &right, true);
+        if got != fwd {
+            wrong.push(format!("ctrl+right over {text}: {got:?}, node {fwd:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} disagree with node:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// EXT-113: the mixed line from the pinned node output, `日本語のモデル foo_bar ½x`, end to end —
+/// node's UTF-16 stops 17, 16, 8, 4, 3, 0 backward and 3, 4, 7, 15, 17, 18 forward, in bytes.
+/// RED before the shared helper (Ctrl+Left also stopped at 6 and 3, inside `日本語`).
+#[test]
+fn search_input_word_motion_over_the_mixed_line_matches_node() {
+    let text = "日本語のモデル foo_bar ½x";
+    assert_eq!(
+        word_stops(text, &ctrl_arrow(OverlayKeyCode::Left), false),
+        vec![32, 30, 22, 12, 9, 0]
+    );
+    assert_eq!(
+        word_stops(text, &ctrl_arrow(OverlayKeyCode::Right), true),
+        vec![9, 12, 21, 29, 32, 33]
+    );
+}
+
 #[test]
 fn input_kill_ring_undo_and_yank() {
     let keys = LlamaKeys::default();

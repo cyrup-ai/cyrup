@@ -186,6 +186,7 @@ pub mod replaceable;
 pub mod subscriber;
 pub mod ui_prompt;
 pub mod virtual_model;
+pub mod word_nav;
 pub mod wrapper;
 
 #[cfg(test)]

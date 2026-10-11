@@ -1114,7 +1114,7 @@ struct WordSegment {
 /// `getWordSelection` (`tui-alt-screen.ts:836-871`).
 ///
 /// Upstream segments with `Intl.Segmenter`'s word iterator and asks each segment for `isWordLike`,
-/// so this uses the editor's [`icu_word_segments`](crate::editor::word_nav::icu_word_segments) —
+/// so this uses the shared [`icu_word_segments`](cyrup_ext::word_nav::icu_word_segments) —
 /// the same ICU segmenter, reporting ICU's own `isWordLike`. A bare UAX #29 iterator would also
 /// break here on unspaced scripts, where double-clicking a Chinese word would select one character
 /// of it rather than the word (TUI-048).
@@ -1127,7 +1127,7 @@ fn word_selection(text: &str, point: Point) -> Option<Range> {
     let mut start = 0usize;
     // Columns here are DISPLAY WIDTHS, not the segmenter's byte offsets, so each segment's span is
     // re-measured as it is walked.
-    for (byte_start, byte_len, word_like) in crate::editor::word_nav::icu_word_segments(text) {
+    for (byte_start, byte_len, word_like) in cyrup_ext::word_nav::icu_word_segments(text) {
         let segment = text
             .get(byte_start..byte_start.saturating_add(byte_len))
             .unwrap_or_default();

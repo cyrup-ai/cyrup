@@ -1,28 +1,43 @@
-//! The index-unit-agnostic half of pi's word navigation
-//! (`pi/packages/tui/src/word-navigation.ts` @v0.83.0), shared by the multi-line
-//! [`InputEditor`](super::InputEditor) and the single-line [`crate::text_input::Input`].
+//! pi's word navigation (`pi/packages/tui/src/word-navigation.ts` @v0.83.0) and the ONE word
+//! segmenter behind it, shared by every cyrup text field that moves or deletes by word: the
+//! multi-line `InputEditor` and the single-line `text_input::Input` in `cyrup-tui`, the double-click
+//! word selection of `cyrup-tui`'s alt screen, and the `/llama` overlay's search box
+//! (`cyrup-llama`'s `TextInput`).
+//!
+//! **Why this lives in `cyrup-ext` (EXT-113).** It was born in `cyrup-tui` (TUI-048), but
+//! `cyrup-llama` may not depend on `cyrup-tui` (extension UI crosses the overlay seam, ADR-0001
+//! R-ARCH-TUI-014), so the `/llama` search box kept a second, UAX#29-only copy that broke CJK and
+//! `isWordLike` differently from the editor. `cyrup-ext` is the lowest crate that every consumer
+//! already depends on and that already owns the overlay input seam (`OverlayKey`, and `KeySpec`
+//! since EXT-103), so moving it here adds no dependency edge. `cyrup-core` was rejected
+//! deliberately: it is the bottom of the graph (25 dependents, none but these UI crates navigating
+//! by word) and carries no text code, and putting `icu_segmenter`'s dictionary payload under it
+//! would put that build on the critical path of every crate in the workspace for no consumer.
+//! Not behind `wasm-host`: it is pure text.
 //!
 //! Upstream's `findWordBackward`/`findWordForward` take `(text, cursor)` and segment the text
-//! themselves. cyrup cannot: the editor is **char-indexed** by design (`editor/mod.rs`, no-panic
-//! policy R-00-009) and merges `[paste #N …]` markers into atomic segments, while a selector search
-//! field is a plain `String` addressed by **byte** offset with no markers. So the split here is one
-//! level lower than pi's — the caller supplies the already-computed [`WordSeg`] list plus the two
-//! text predicates (`isWhitespaceChar` and the `PUNCTUATION_REGEX` probe), and the walks below are
-//! the shared part: whichever unit `start`/`len` are counted in, the arithmetic is the same.
+//! themselves. cyrup cannot: the editor is **char-indexed** by design (`cyrup-tui` `editor/mod.rs`,
+//! no-panic policy R-00-009) and merges `[paste #N …]` markers into atomic segments, while a
+//! single-line field is a plain `String` addressed by **byte** offset with no markers. So the split
+//! here is one level lower than pi's — the caller supplies the already-computed [`WordSeg`] list
+//! plus the two text predicates (`isWhitespaceChar` and the `PUNCTUATION_REGEX` probe), and the
+//! walks below are the shared part: whichever unit `start`/`len` are counted in, the arithmetic is
+//! the same. A byte-indexed field with no markers can call [`byte_find_word_backward`] /
+//! [`byte_find_word_forward`], which are pi's two functions whole.
 
 /// One segment of a line for word navigation — pi's `Intl.SegmentData` after `segmentWithMarkers`
 /// has merged the paste markers (`editor.ts:37-90`). `start`/`len` are in whatever index unit the
-/// caller segmented with: **char columns** for [`InputEditor`](super::InputEditor), **byte offsets**
-/// for [`crate::text_input::Input`].
+/// caller segmented with: **char columns** for `cyrup-tui`'s `InputEditor`, **byte offsets** for
+/// [`byte_word_segments`] (the single-line fields).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct WordSeg {
-    pub(crate) start: usize,
-    pub(crate) len: usize,
+pub struct WordSeg {
+    pub start: usize,
+    pub len: usize,
     /// `Intl.SegmentData.isWordLike` — ICU's own flag, via [`icu_word_segments`].
-    pub(crate) word_like: bool,
+    pub word_like: bool,
     /// `isAtomicSegment(segment)` — a whole `[paste #N …]` marker (`isPasteMarker`, `editor.ts:27`).
     /// Always `false` for a single-line field, which carries no markers.
-    pub(crate) atomic: bool,
+    pub atomic: bool,
 }
 
 /// `findWordBackward`'s walk (`word-navigation.ts:22-68` @v0.83.0). `segs` are the segments of the
@@ -38,7 +53,7 @@ pub(crate) struct WordSeg {
 /// `is_ws` is pi's `isWhitespaceChar(segment)`; `last_punct_end` returns the offset just **past**
 /// the last `PUNCTUATION_REGEX` match inside the segment, segment-local (`:53-56`'s
 /// `lastMatch.index + lastMatch[0].length`), and `None` when the segment holds no punctuation.
-pub(crate) fn find_word_backward(
+pub fn find_word_backward(
     mut segs: Vec<WordSeg>,
     cursor: usize,
     is_ws: &dyn Fn(&WordSeg) -> bool,
@@ -89,7 +104,7 @@ pub(crate) fn find_word_backward(
 /// taking the FIRST punctuation match (`:102`, `PUNCTUATION_REGEX.exec(segment)?.index ??
 /// segment.length`) — hence `first_punct` returning a segment-local offset, or `None` for "no
 /// match", which means the whole segment.
-pub(crate) fn find_word_forward(
+pub fn find_word_forward(
     segs: &[WordSeg],
     cursor: usize,
     is_ws: &dyn Fn(&WordSeg) -> bool,
@@ -139,7 +154,7 @@ pub(crate) fn find_word_forward(
 /// different sets (that test rejects every non-alphanumeric; this one names 31 specific ASCII
 /// characters), and word navigation must use pi's. The old class-run word motion used the former and
 /// was replaced wholesale (TUI-043 / TUI-048).
-pub(crate) fn is_punctuation(c: char) -> bool {
+pub fn is_punctuation(c: char) -> bool {
     matches!(
         c,
         '(' | ')'
@@ -179,9 +194,9 @@ pub(crate) fn is_punctuation(c: char) -> bool {
 /// `wordSegmenter.segment(text)` (`word-navigation.ts:3`), with `start`/`len` as **byte** offsets
 /// into `text` so the caller can slice with them directly.
 ///
-/// The editor's marker-aware twin is `InputEditor::word_segments` (`editor/motion.rs`), which is
-/// char-indexed and merges `[paste #N …]` runs; a search field has neither concern.
-pub(crate) fn byte_word_segments(text: &str) -> Vec<WordSeg> {
+/// The editor's marker-aware twin is `InputEditor::word_segments` (`cyrup-tui` `editor/motion.rs`),
+/// which is char-indexed and merges `[paste #N …]` runs; a search field has neither concern.
+pub fn byte_word_segments(text: &str) -> Vec<WordSeg> {
     icu_word_segments(text)
         .into_iter()
         .map(|(start, len, word_like)| WordSeg {
@@ -209,7 +224,15 @@ pub(crate) fn byte_word_segments(text: &str) -> Vec<WordSeg> {
 /// `new_auto` returns a `WordSegmenterBorrowed<'static>` — a handle over baked data, so it neither
 /// allocates nor parses — but it does resolve five payloads out of the baked provider (the CJ
 /// dictionary and the four LSTMs), so it is built once in a `OnceLock` rather than per word motion.
-pub(crate) fn icu_word_segments(text: &str) -> Vec<(usize, usize, bool)> {
+///
+/// [CYRUP-DELTA] (recorded, not chosen — a downward residue, EXT-113): ICU4X is not byte-identical
+/// to the ICU4C inside node. For a lone `々`/`〻` (Han, not Ideographic) ICU4X reports word-like
+/// where ICU4C reports not (ICU4X tags every dictionary-pass segment `Letter`; ICU4C takes the
+/// rule pass's status, and `word.txt` gives one non-Ideographic Han character none), `〆` is the
+/// reverse, and `々々` is one segment here and two in node. Pinned as a known divergence by
+/// `tests::word_nav::a_lone_iteration_mark_is_word_like_under_icu4x_unlike_node`; every other
+/// string pinned against node 22.22.0 / ICU 77.1 there agrees.
+pub fn icu_word_segments(text: &str) -> Vec<(usize, usize, bool)> {
     use icu_segmenter::WordSegmenter;
     use icu_segmenter::options::WordBreakInvariantOptions;
     use std::sync::OnceLock;
@@ -236,14 +259,14 @@ pub(crate) fn icu_word_segments(text: &str) -> Vec<(usize, usize, bool)> {
 
 /// `isWhitespaceChar(segment)` = `/\s/.test(segment)` (`utils.ts:826-829`) over a byte-indexed
 /// segment of `text` — *contains* whitespace, hence `any`.
-pub(crate) fn byte_seg_is_whitespace(text: &str, seg: &WordSeg) -> bool {
+pub fn byte_seg_is_whitespace(text: &str, seg: &WordSeg) -> bool {
     text.get(seg.start..seg.start.saturating_add(seg.len))
         .is_some_and(|s| s.chars().any(char::is_whitespace))
 }
 
 /// The byte offset just past the last [`is_punctuation`] char in a byte-indexed segment of `text`
 /// (`word-navigation.ts:53-56`), or `None` when the segment holds none.
-pub(crate) fn byte_seg_last_punct_end(text: &str, seg: &WordSeg) -> Option<usize> {
+pub fn byte_seg_last_punct_end(text: &str, seg: &WordSeg) -> Option<usize> {
     let s = text.get(seg.start..seg.start.saturating_add(seg.len))?;
     s.char_indices()
         .rev()
@@ -254,9 +277,49 @@ pub(crate) fn byte_seg_last_punct_end(text: &str, seg: &WordSeg) -> Option<usize
 /// The byte offset of the first [`is_punctuation`] char in a byte-indexed segment of `text`
 /// (`word-navigation.ts:102`'s `PUNCTUATION_REGEX.exec(segment)?.index`), or `None` when the
 /// segment holds none.
-pub(crate) fn byte_seg_first_punct(text: &str, seg: &WordSeg) -> Option<usize> {
+pub fn byte_seg_first_punct(text: &str, seg: &WordSeg) -> Option<usize> {
     let s = text.get(seg.start..seg.start.saturating_add(seg.len))?;
     s.char_indices()
         .find(|&(_, c)| is_punctuation(c))
         .map(|(i, _)| i)
+}
+
+/// pi's `findWordBackward(text, cursor)` (`word-navigation.ts:22-68`) whole, for a plain
+/// single-line string addressed by **byte** offset (no paste markers): segment the prefix with
+/// [`byte_word_segments`] and run [`find_word_backward`]. `cursor` off a char boundary (or past the
+/// end) leaves the cursor where it is rather than panicking.
+#[must_use]
+pub fn byte_find_word_backward(text: &str, cursor: usize) -> usize {
+    if cursor == 0 {
+        return 0;
+    }
+    let Some(before) = text.get(..cursor) else {
+        return cursor;
+    };
+    find_word_backward(
+        byte_word_segments(before),
+        cursor,
+        &|seg| byte_seg_is_whitespace(before, seg),
+        &|seg| byte_seg_last_punct_end(before, seg),
+    )
+}
+
+/// pi's `findWordForward(text, cursor)` (`word-navigation.ts:76-114`) whole, over **byte**
+/// offsets — the mirror of [`byte_find_word_backward`]. A cursor at or past the end returns
+/// `text.len()` (`if (cursor >= text.length) return text.length`).
+#[must_use]
+pub fn byte_find_word_forward(text: &str, cursor: usize) -> usize {
+    let len = text.len();
+    if cursor >= len {
+        return len;
+    }
+    let Some(after) = text.get(cursor..) else {
+        return cursor;
+    };
+    find_word_forward(
+        &byte_word_segments(after),
+        cursor,
+        &|seg| byte_seg_is_whitespace(after, seg),
+        &|seg| byte_seg_first_punct(after, seg),
+    )
 }
