@@ -1228,8 +1228,10 @@ async fn a_call_with_no_id_sends_the_server_no_tool_call_id_key() {
 /// behaviour asked for. `session_launch.rs`'s `mcp_search_loads_a_search_mode_tool_for_the_next_request`
 /// asserts the same over a cached world with no server; this is the live half.
 ///
-/// A non-regression guard: the search-mode load was already correct at the base, and this test is
-/// green there. The mutation that makes the load report nothing turns it red.
+/// For MCP-614 this is a non-regression guard: the search-mode load was already correct at the
+/// base, where every assertion up to the last passes and the run fails only on the final `_meta`
+/// one (MCP-609's). The mutation that reports the load but never applies it to the active set
+/// turns the next-request assertion red.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_live_search_loads_the_tool_for_the_next_request() {
     let fx = fixture_with("search");
