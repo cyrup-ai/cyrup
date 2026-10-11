@@ -611,7 +611,7 @@ impl LlamaKeys {
         // does not know (`tui.altScreen.*`) are dropped by `from_user_bindings`.
         let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
         if let serde_json::Value::Object(map) = host.effective_keybindings("tui") {
-            pairs.extend(map.into_iter());
+            pairs.extend(map);
         }
         if pairs.is_empty() {
             return Self::from_agent_dir(agent_dir);

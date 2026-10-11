@@ -2485,10 +2485,7 @@ impl AltScreenKeymap {
 /// how upstream's table reads — `app.suspend` is unbound on `win32` (`keybindings.ts:96-99`) — and
 /// the platform-conditional defaults are already merged in by each `for_platform`, so a caller
 /// sees the keys for ITS platform without reimplementing that table.
-fn bindings_table<A: Copy>(bindings: &[(Key, A)]) -> serde_json::Value
-where
-    A: KeyActionId,
-{
+fn bindings_table<A: Copy + KeyActionId>(bindings: &[(Key, A)]) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for (key, action) in bindings {
         let entry = out

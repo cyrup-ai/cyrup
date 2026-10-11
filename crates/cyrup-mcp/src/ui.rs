@@ -684,6 +684,10 @@ impl Style {
             italic: self.italic,
             underlined: false,
             reversed: self.reversed,
+            // `OverlaySpan`'s own doc promises that anything a future renderer wants is an
+            // ADDITIVE field, so take the rest from `Default` rather than respelling the struct
+            // here — TUI-123's `cursor` broke this site precisely because it did not.
+            ..OverlaySpan::default()
         }
     }
 }
