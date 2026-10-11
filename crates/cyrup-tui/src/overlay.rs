@@ -83,6 +83,15 @@ pub trait Overlay: Send {
     fn painted_rect(&self) -> Option<Rect> {
         None
     }
+    /// The absolute terminal cell the real cursor belongs in, as of the last paint, or `None` when
+    /// this overlay wants none — pi's `extractCursorPosition` result (`tui.ts:1442-1459`). TUI-123.
+    ///
+    /// Computed during [`Self::render`] and read after it, exactly as [`Self::painted_rect`] is, so
+    /// the cell and the rectangle it sits in cannot disagree.
+    fn cursor_cell(&self) -> Option<(u16, u16)> {
+        None
+    }
+
     /// Route one pointer event that landed inside [`Self::painted_rect`], `event` local to it. The
     /// event never reaches anything beneath the overlay; an answer of
     /// [`OverlayPointerOutcome::Unhandled`] (the default) leaves it to the text selection, so the
@@ -142,6 +151,9 @@ pub struct ExtensionOverlay {
     /// The box the last [`Overlay::render`] painted, which is what a pointer event is hit-tested
     /// against.
     painted: Option<Rect>,
+    /// Where the component asked for the cursor last paint — see
+    /// [`InteractiveOverlay::cursor_cell`].
+    cursor: Option<(u16, u16)>,
 }
 
 impl ExtensionOverlay {
@@ -152,6 +164,7 @@ impl ExtensionOverlay {
             inner,
             done: Some(done),
             painted: None,
+            cursor: None,
         }
     }
 
@@ -229,12 +242,27 @@ impl Overlay for ExtensionOverlay {
             .render(probe.width as usize, area.height as usize);
         let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let rect = Self::box_rect(area, rows, options);
+        // Only the rows actually painted are scanned, which is upstream's "only scan the bottom
+        // `height` lines (visible viewport)" (`tui.ts:1443-1444`) applied to the rows this host
+        // shows; and the LAST marker wins, matching its bottom-up scan (`:1445`).
+        let mut cursor = None;
         let painted: Vec<Line<'static>> = lines
             .into_iter()
             .take(rect.height as usize)
-            .map(|line| to_ratatui_line(line, theme))
+            .enumerate()
+            .map(|(row, line)| {
+                if let Some(col) = cursor_column(&line) {
+                    cursor = Some((
+                        rect.x.saturating_add(col),
+                        rect.y
+                            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
+                    ));
+                }
+                to_ratatui_line(line, theme)
+            })
             .collect();
         self.painted = Some(rect);
+        self.cursor = cursor;
         frame.render_widget(Clear, rect);
         frame.render_widget(Paragraph::new(painted), rect);
     }
@@ -254,6 +282,10 @@ impl Overlay for ExtensionOverlay {
 
     fn painted_rect(&self) -> Option<Rect> {
         self.painted
+    }
+
+    fn cursor_cell(&self) -> Option<(u16, u16)> {
+        self.cursor
     }
 
     fn pointer(&mut self, event: Pointer) -> OverlayPointerOutcome {
@@ -311,6 +343,22 @@ pub fn to_overlay_mouse(event: Pointer) -> OverlayMouse {
 
 /// One backend-free [`OverlayLine`] as painted ratatui spans, theme roles resolved against `theme`.
 #[must_use]
+/// The display column of the cursor marker in `line`, or `None` when it carries none — pi's
+/// `visibleWidth(line.slice(0, markerIndex))` (`tui.ts:1452`). TUI-123.
+///
+/// Measured in DISPLAY columns, not bytes or chars, because that is what a terminal cursor address
+/// is: a CJK name in a field before the caret advances it by two per ideograph.
+fn cursor_column(line: &OverlayLine) -> Option<u16> {
+    let mut col = 0usize;
+    for span in &line.spans {
+        if span.cursor {
+            return Some(u16::try_from(col).unwrap_or(u16::MAX));
+        }
+        col = col.saturating_add(crate::text_width::str_width(&span.text));
+    }
+    None
+}
+
 pub fn to_ratatui_line(line: OverlayLine, theme: &UiTheme) -> Line<'static> {
     Line::from(
         line.spans
@@ -707,6 +755,9 @@ mod tests {
                 italic: true,
                 underlined: true,
                 reversed: true,
+                // TUI-123's flag is NOT a style, so it is deliberately not asserted by this
+                // modifier test; `tests::overlay_cursor` owns it.
+                cursor: false,
             },
             &UiTheme::default(),
         );
