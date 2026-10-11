@@ -22,14 +22,17 @@ use cyrup_core::CancelToken;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-/// One provider's persisted catalog plus its HTTP validators (Pi `ModelsStoreEntry`,
-/// `models-store.ts:3-14`).
+/// One provider's persisted CHAT rows plus its HTTP validators (Pi `ModelsStoreEntry`,
+/// `models-store.ts:3-14`). pi's entry holds one `models` array of every type; the image and
+/// classifier rows of the same entry persist through the [`ModelsStore`] sibling methods
+/// (PROV-107 is the fold back into one array).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsStoreEntry {
-    /// The catalog body as last fetched. Empty means "no cached body" — which is exactly why the
-    /// `If-None-Match` validator is suppressed in that state (a 304 against no body would leave the
-    /// overlay empty).
+    /// The CHAT rows of the catalog body as last fetched. Empty does NOT mean "no cached body": a
+    /// classifier-only or image-only provider persists its rows through the sibling halves, and
+    /// those back the `If-None-Match` validator too (`RemoteCatalog`'s `revalidation_etag`,
+    /// PROV-159).
     #[serde(default)]
     pub models: Vec<Model>,
     /// Unix milliseconds from the remote catalog's `Last-Modified` header (`0` when absent or
@@ -106,6 +109,12 @@ pub trait ModelsStore: Send + Sync {
         provider_id: &str,
         options: Option<&ModelsStoreOperationOptions>,
     ) -> Result<Option<ModelsStoreEntry>, ProviderError>;
+    /// Replace the chat rows and the entry's `lastModified`, `checkedAt` and `etag` for
+    /// `provider_id`, and NOTHING else: the image and classifier halves (the sibling methods below)
+    /// survive it. The catalog refresh's `304` branch relies on this to be pi's
+    /// `persist: { ...stored, checkedAt }` over the whole array (`remote-catalog-provider.ts:117-122`
+    /// @f1b2e77f5); a store whose `write` cleared the siblings would lose a classifier-only
+    /// provider's rows on every revalidation (PROV-159).
     async fn write(
         &self,
         provider_id: &str,

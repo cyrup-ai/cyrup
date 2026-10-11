@@ -494,6 +494,8 @@ impl ModelsStore for FileModelsStore {
         // The non-chat models already stored stay: `write` replaces the CHAT half only
         // (`write_image_models` / `write_classifier_models` own the others). PROV-128 widened this
         // from "classifier models" to "every non-chat member" with `members()`.
+        // The stored non-chat members survive a chat `write` (the `ModelsStore::write` contract):
+        // the catalog refresh's `304` rewrites a classifier-only entry through here (PROV-159).
         let kept = all
             .get(provider_id)
             .map_or_else(Vec::new, |stored| Self::members(stored).1);

@@ -16,12 +16,13 @@
 //! observable as "fewer models". Every branch below is written to preserve that:
 //!
 //! - [`merge_models`] starts from the baseline and only replaces-by-id or pushes (Pi
-//!   `mergeModels`, `remote-catalog-provider.ts:8-16`). It is the whole floor guarantee, in five
+//!   `mergeModels`, `remote-catalog-provider.ts:31-35` @f1b2e77f5). It is the whole floor guarantee, in five
 //!   lines, and it is exercised directly by `tests/remote_catalog.rs`.
 //! - Every store read is `.ok().flatten()`: a corrupt or unreadable cache degrades to "no overlay",
 //!   never to an error and never to a smaller catalog.
-//! - A `304 Not Modified` can only be *asked for* when a cached body backs the validator, so it can
-//!   never leave the overlay empty (Pi's own load-bearing comment, `:68-69`).
+//! - A `304 Not Modified` can only be *asked for* when a cached body of ANY model type backs the
+//!   validator, so it can never leave the overlay empty (Pi's own load-bearing comment, `:98-100`
+//!   @f1b2e77f5; PROV-159).
 //! - A transport failure, a non-OK status, an unparseable body, a disabled/offline run and a
 //!   missing agent dir all end with the built-in catalogs unchanged.
 //!
@@ -955,13 +956,49 @@ impl RemoteCatalog {
         }
     }
 
-    /// The refresh body, 1:1 with Pi `refreshModels` (`remote-catalog-provider.ts:55-118`).
+    /// Pi's revalidation validator (`remote-catalog-provider.ts:98-100`, `:109` @f1b2e77f5):
+    /// `const validator = stored && stored.models.length > 0 ? stored.etag : undefined`, sent only
+    /// when truthy (`...(validator ? { "if-none-match": validator } : {})`), so an empty `ETag`
+    /// stored verbatim (`:147`) is never sent. PROV-159.
+    ///
+    /// `[CYRUP-DELTA, mechanism]` PROV-107: pi asks the length of ONE persisted array of every
+    /// model type; cyrup's [`ModelsStoreEntry`] carries chat rows only, and the image and classifier
+    /// halves persist through the store's sibling reads, so the one question is asked of three
+    /// halves — chat first, then image, then classifier, so a chat provider pays no extra read.
+    /// Two residuals, both removed by the PROV-107 fold: a persisted row of a known type that no
+    /// longer deserializes is not counted (pi counts it), which costs at most one full download;
+    /// and the three reads are not one snapshot, which at worst builds one validator from a mixed
+    /// view and heals within one window. A failed sibling read counts as "not cached", the trait's
+    /// posture, so it can only cost the validator, never the overlay.
+    async fn revalidation_etag(
+        &self,
+        provider_id: &str,
+        stored: Option<&ModelsStoreEntry>,
+    ) -> Option<String> {
+        let entry = stored?;
+        let etag = entry.etag.as_ref().filter(|etag| !etag.is_empty())?;
+        let has_body = !entry.models.is_empty()
+            || self
+                .store
+                .read_image_models(provider_id, None)
+                .await
+                .is_ok_and(|rows| !rows.is_empty())
+            || self
+                .store
+                .read_classifier_models(provider_id, None)
+                .await
+                .is_ok_and(|rows| !rows.is_empty());
+        has_body.then(|| etag.clone())
+    }
+
+    /// The refresh body, 1:1 with Pi `refreshModels` (`remote-catalog-provider.ts:76-156`
+    /// @f1b2e77f5).
     async fn refresh_once(
         &self,
         provider_id: &str,
         options: RefreshOptions,
     ) -> Result<(), ProviderError> {
-        // Pi reads the store FIRST, before the network gate (`:58-60`). cyrup's overlay is
+        // Pi reads the store FIRST, before the network gate (`:77-87`). cyrup's overlay is
         // materialized by `load_overlay`, so the read here exists for the freshness window and the
         // validator — but the ordering matters for the same reason: nothing below can make an
         // offline run lose its persisted overlay.
@@ -972,7 +1009,7 @@ impl RemoteCatalog {
         }
 
         // `!force && stored.checkedAt !== undefined && stored.lastModified !== undefined &&
-        //  Date.now() - stored.checkedAt < REMOTE_CATALOG_REFRESH_INTERVAL_MS` (`:61-67`).
+        //  Date.now() - stored.checkedAt < REMOTE_CATALOG_REFRESH_INTERVAL_MS` (`:89-96`).
         if !options.force
             && let Some(entry) = &stored
             && let (Some(checked_at), Some(_)) = (entry.checked_at, entry.last_modified)
@@ -982,11 +1019,8 @@ impl RemoteCatalog {
         }
 
         // "Only revalidate when a cached body backs the validator, so a 304 can never leave the
-        // overlay empty." (Pi's own comment, `:68-69`.)
-        let validator = stored
-            .as_ref()
-            .filter(|entry| !entry.models.is_empty())
-            .and_then(|entry| entry.etag.clone());
+        // overlay empty." (Pi's own comment, `:98-99`.) A body of any model type (PROV-159).
+        let validator = self.revalidation_etag(provider_id, stored.as_ref()).await;
 
         // `url.searchParams.set("types", REMOTE_CATALOG_MODEL_TYPES.join(","))`
         // (`remote-catalog-provider.ts:101-102`) — PROV-128. Without it pi.dev serves the
@@ -1025,7 +1059,11 @@ impl RemoteCatalog {
         let checked_at = now_ms();
         let status = response.status().as_u16();
 
-        // 304: the cached body is still current, so ONLY the freshness window moves (`:83-88`).
+        // 304: the cached body is still current, so ONLY the freshness window moves (`:117-122`).
+        // `write` replaces the chat rows and the entry's `lastModified`/`checkedAt`/`etag` and
+        // leaves the image and classifier halves alone (the `ModelsStore::write` contract), so this
+        // is pi's `persist: { ...stored, checkedAt }` over the whole array — which is what keeps a
+        // classifier-only entry's rows (PROV-159).
         if status == 304
             && let Some(entry) = stored.clone()
         {
@@ -1044,7 +1082,7 @@ impl RemoteCatalog {
         }
 
         // 404/501: the route is unimplemented, so the overlay is unavailable — clear the validators
-        // and the last-modified stamp, but never error (`:89-97`).
+        // and the last-modified stamp, but never error (`:123-133`).
         if status == 404 || status == 501 {
             let _ = self
                 .store
@@ -1065,7 +1103,7 @@ impl RemoteCatalog {
         if !(200..300).contains(&status) {
             // Transient failure: the cached body AND its validator stay valid, so the etag is KEPT
             // and only `checkedAt` moves — the next attempt revalidates instead of re-downloading
-            // (`:98-104`).
+            // (`:134-139`).
             let _ = self
                 .store
                 .write(
@@ -1107,7 +1145,7 @@ impl RemoteCatalog {
         })?;
         let refreshed = parse_catalog(provider_id, &value)?;
         // PROV-128 — the body now carries every type, so all three halves are persisted, as ONE
-        // store operation: pi writes one `models: AnyModel[]` array (`:143`), and a reader must
+        // store operation: pi writes one `models: AnyModel[]` array (`:143-148`), and a reader must
         // never see new chat rows beside the previous refresh's image rows. cyrup's entry carries
         // chat rows only (the EXT-027 seam), so `write_all_types` is what makes the three halves
         // one write.
@@ -1428,6 +1466,116 @@ mod tests {
         assert_eq!(overlay.models_for("groq")[0].id.as_str(), "ok");
         assert!(overlay.models_for("xai").is_empty());
         assert!(!overlay.is_empty());
+    }
+
+    /// PROV-159 — the truth table of pi's validator (`remote-catalog-provider.ts:98-100`, `:109`
+    /// @f1b2e77f5) against the helper directly, no network: the etag goes out exactly when it is
+    /// non-empty AND a persisted row of any type backs it. New in PROV-159, so it cannot be red at
+    /// the base; mutation-proved (drop either sibling read, drop the empty-etag filter, or answer
+    /// `stored?.etag.clone()` unconditionally, and a row here fails).
+    #[tokio::test]
+    async fn revalidation_etag_asks_every_persisted_half() {
+        let chat = model("q", "c", 1000);
+        let image: ImageModel = serde_json::from_value(serde_json::json!({
+            "type": "image", "id": "i", "name": "i", "api": "openrouter-images",
+            "provider": "q", "baseUrl": "https://x/", "input": ["text"], "output": ["image"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+        }))
+        .unwrap();
+        let classifier: ClassifierModel = serde_json::from_value(serde_json::json!({
+            "type": "classifier", "id": "k", "name": "k", "api": "typesafe-system-one",
+            "provider": "q", "baseUrl": "https://x/", "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000
+        }))
+        .unwrap();
+        let entry = |models: Vec<Model>, etag: Option<&str>| ModelsStoreEntry {
+            models,
+            last_modified: Some(1),
+            checked_at: Some(1),
+            etag: etag.map(str::to_string),
+        };
+        /// (case, the chat entry, its image half, its classifier half, the validator expected)
+        type Case<'a> = (
+            &'a str,
+            ModelsStoreEntry,
+            Vec<ImageModel>,
+            Vec<ClassifierModel>,
+            Option<&'a str>,
+        );
+        let cases: [Case; 7] = [
+            (
+                "no rows of any type",
+                entry(Vec::new(), Some("e")),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            (
+                "a classifier row alone",
+                entry(Vec::new(), Some("e")),
+                Vec::new(),
+                vec![classifier.clone()],
+                Some("e"),
+            ),
+            (
+                "an image row alone",
+                entry(Vec::new(), Some("e")),
+                vec![image.clone()],
+                Vec::new(),
+                Some("e"),
+            ),
+            (
+                "a chat row",
+                entry(vec![chat.clone()], Some("e")),
+                Vec::new(),
+                Vec::new(),
+                Some("e"),
+            ),
+            (
+                "rows but no etag",
+                entry(vec![chat.clone()], None),
+                vec![image.clone()],
+                vec![classifier.clone()],
+                None,
+            ),
+            (
+                "an empty etag",
+                entry(vec![chat.clone()], Some("")),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            (
+                "an empty etag on a classifier entry",
+                entry(Vec::new(), Some("")),
+                Vec::new(),
+                vec![classifier],
+                None,
+            ),
+        ];
+        for (case, stored, images, classifiers, expected) in cases {
+            let store = Arc::new(InMemoryModelsStore::new());
+            store
+                .write_all_types("q", stored.clone(), images, classifiers, None)
+                .await
+                .unwrap();
+            let catalog = RemoteCatalog::new(store);
+            assert_eq!(
+                catalog
+                    .revalidation_etag("q", Some(&stored))
+                    .await
+                    .as_deref(),
+                expected,
+                "{case}"
+            );
+        }
+        let catalog = RemoteCatalog::new(Arc::new(InMemoryModelsStore::new()));
+        assert_eq!(
+            catalog.revalidation_etag("q", None).await,
+            None,
+            "nothing stored"
+        );
     }
 
     #[test]
