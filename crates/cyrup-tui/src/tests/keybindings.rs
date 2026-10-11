@@ -218,10 +218,9 @@ fn malformed_keybindings_json_errors_cleanly() {
         km.merge_json("[1,2,3]").is_err(),
         "a non-object document should error"
     );
-    // CFG-038 — an invalid key SPEC is no longer a document-level error. Pi cannot fail one here at
-    // all: a `KeyId` is a plain string, so `"ctrl+nope+bad+"` survives into `keysById` and simply
-    // never matches (`packages/tui/src/keybindings.ts:198-204` @v0.83.0). The action ends up
-    // unbound, and the entry is REPORTED rather than thrown.
+    // CFG-038 — an invalid key SPEC is no longer a document-level error: the entry is REPORTED
+    // rather than thrown. (CFG-103 — since pi `7f9e1198f` the entry is also dropped whole, so the
+    // action keeps its default; see `cfg103_*` below.)
     let issues = km
         .merge_json(r#"{ "app.exit": "ctrl+nope+bad+" }"#)
         .unwrap();
@@ -251,11 +250,11 @@ fn malformed_keybindings_json_errors_cleanly() {
 /// `serde_json::Map` iteration order — which is *sorted*, not file order — already applied. The
 /// binary then printed `warning: ignoring <path>`, a claim the code had already falsified.
 ///
-/// The two rejected shapes have different outcomes, and both are Pi's:
-///   * a value that is not a string / array-of-strings is dropped from the config, so the action
-///     keeps its DEFAULT (`toKeybindingsConfig` never assigns it);
-///   * a well-shaped but unparseable spec is kept upstream as a never-matching `KeyId`, so the
-///     action is UNBOUND — which is what dropping the key and calling `set_action(a, vec![])` does.
+/// CFG-103 — SUPERSEDES the second bullet this test used to pin. At v0.83.0 the two rejected
+/// shapes had different outcomes (an off-shape value kept the DEFAULT; an unparseable spec was a
+/// never-matching `KeyId`, so the action was UNBOUND). pi `7f9e1198f` validates every value against
+/// `KeybindingValueSchema` in `toKeybindingsConfig` (`core/keybindings.ts:267-276` @f1b2e77f5), so
+/// both shapes now drop the entry and the action keeps its DEFAULT.
 #[test]
 fn one_bad_entry_does_not_discard_or_half_apply_the_document() {
     let mut km = Keymap::default();
@@ -284,12 +283,12 @@ fn one_bad_entry_does_not_discard_or_half_apply_the_document() {
         Some(Action::Suspend)
     );
 
-    // The unparseable spec leaves `app.interrupt` unbound (Pi: bound to a `KeyId` nothing matches),
-    // NOT sitting on its `esc` default.
+    // CFG-103 — the unparseable spec drops the `app.interrupt` entry, so it keeps its `escape`
+    // default (pi `7f9e1198f`; under CFG-038's rule it was left unbound).
     assert_eq!(
         km.action_for(&key(KeyCode::Esc, KeyModifiers::NONE)),
-        None,
-        "an unparseable spec still replaces the default, exactly as a never-matching KeyId does"
+        Some(Action::Interrupt),
+        "an entry with an invalid spec is dropped whole, so the action keeps its default"
     );
     // The off-shape value is dropped from the config entirely, so `app.clear` keeps its Ctrl+C
     // default — `toKeybindingsConfig`'s missing `else`.
@@ -864,3 +863,205 @@ fn a_modern_id_beats_its_legacy_twin_regardless_of_map_order() {
         None
     );
 }
+
+// ---- CFG-103: an entry with an invalid key keeps the action's default --------------------------
+
+/// CFG-103 Verify, clause 1 — **non-regression guard, passes at HEAD `4fa902b0` too.**
+/// `app.session.tree`'s default is UNBOUND (`"app.session.tree": { defaultKeys: [] }`,
+/// `core/keybindings.ts:80` @f1b2e77f5), so "dropping the bad key and binding nothing" and "keeping
+/// the default" are the same map: this clause cannot tell the old rule from pi's. It pins the issue
+/// count and the default; the per-keymap tests below are the ones that are red without the fix.
+#[test]
+fn cfg103_a_single_invalid_key_leaves_the_action_on_its_default_and_is_reported() {
+    let default = Keymap::default();
+    let mut km = Keymap::default();
+    let issues = km
+        .merge_json(r#"{"app.session.tree":"ctrl+nope"}"#)
+        .unwrap();
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(issues[0].id, "app.session.tree");
+    assert_eq!(
+        km.keys_for(Action::SessionTree),
+        default.keys_for(Action::SessionTree)
+    );
+    assert_eq!(format!("{km:?}"), format!("{default:?}"));
+}
+
+/// CFG-103 Verify, clause 2 — **non-regression guard, passes at HEAD `4fa902b0` too.**
+/// `app.model.select`'s default IS `ctrl+l` (`core/keybindings.ts:49` @f1b2e77f5), so the old
+/// drop-one rule's survivor `[ctrl+l]` is behaviourally the default. The red form of this clause
+/// is [`cfg103_keymap_typo_entry_keeps_the_default`], which uses a non-default good key.
+#[test]
+fn cfg103_a_typo_in_a_list_leaves_the_default_not_the_survivors() {
+    let default = Keymap::default();
+    let mut km = Keymap::default();
+    let issues = km
+        .merge_json(r#"{"app.model.select":["ctrl+l","ctrl+nope"]}"#)
+        .unwrap();
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(
+        km.keys_for(Action::ModelSelect),
+        default.keys_for(Action::ModelSelect)
+    );
+}
+
+/// CFG-103 Verify, clause 3. `"Ctrl+L"` is RED at HEAD `4fa902b0`: `Key::parse` lowercases (pi's
+/// runtime `parseKeyId` does too), but `KeyIdSchema` (`core/key-id-schema.ts:10-15` @f1b2e77f5)
+/// is lowercase-only and `toKeybindingsConfig` checks it before anything is parsed, so pi drops the
+/// entry. `"ctrl+ctrl+x"` is a **non-regression guard**: TUI-177 already rejects a repeated
+/// modifier in `Key::parse`. Both entries keep their defaults.
+#[test]
+fn cfg103_schema_invalid_spellings_are_reported_and_keep_the_default() {
+    let default = Keymap::default();
+    for (doc, id) in [
+        (r#"{"app.exit":"Ctrl+L"}"#, "app.exit"),
+        (r#"{"app.exit":"ctrl+ctrl+x"}"#, "app.exit"),
+    ] {
+        let mut km = Keymap::default();
+        let issues = km.merge_json(doc).unwrap();
+        assert_eq!(issues.len(), 1, "{doc}: {issues:?}");
+        assert_eq!(issues[0].id, id, "{doc}");
+        assert_eq!(format!("{km:?}"), format!("{default:?}"), "{doc}");
+    }
+}
+
+/// CFG-103 — every spelling `KeyIdSchema` rejects but `Key::parse` accepted at HEAD `4fa902b0`
+/// (established by probe, not taken from the row): an uppercase modifier or key, the lowercase
+/// `pageup` (the schema's base-key list is `Object.values(Key)`, which spells `pageUp`), a
+/// zero-padded `f01`, a non-ASCII character and the two ASCII characters outside the schema's
+/// `[a-z0-9]` + `SYMBOL_KEYS` set (`"` and a literal space). RED at HEAD: each bound its key.
+#[test]
+fn cfg103_every_spelling_the_schema_rejects_is_reported() {
+    let default = Keymap::default();
+    for spec in [
+        "Ctrl+L", "CTRL+l", "ctrl+L", "Escape", "F5", "pageup", "PAGEUP", "f01", "é", "ctrl+é",
+        "\\\"", " ",
+    ] {
+        let doc = format!(r#"{{"app.exit":"{spec}"}}"#);
+        let mut km = Keymap::default();
+        let issues = km.merge_json(&doc).unwrap();
+        assert_eq!(issues.len(), 1, "{doc}: {issues:?}");
+        assert_eq!(format!("{km:?}"), format!("{default:?}"), "{doc}");
+    }
+    // The schema's own spellings still bind: camelCase `pageUp`, four distinct modifiers, `+`.
+    for spec in [
+        "pageUp",
+        "ctrl+shift+alt+super+x",
+        "ctrl++",
+        "+",
+        "f12",
+        "\\\\",
+        "`",
+    ] {
+        let doc = format!(r#"{{"app.exit":"{spec}"}}"#);
+        let mut km = Keymap::default();
+        assert_eq!(km.merge_json(&doc).unwrap(), Vec::new(), "{doc}");
+        assert_ne!(format!("{km:?}"), format!("{default:?}"), "{doc}");
+    }
+}
+
+/// CFG-103 Verify, clause 4 — **non-regression guard, passes at HEAD `4fa902b0` too** (`$schema`
+/// is no action id, so `from_id` skips it). pi: `if (key === "$schema") continue;`
+/// (`core/keybindings.ts:272` @f1b2e77f5).
+#[test]
+fn cfg103_a_schema_key_is_no_issue() {
+    let mut km = Keymap::default();
+    let issues = km
+        .merge_json(
+            r#"{"$schema":"https://example.invalid/keybindings.schema.json","app.exit":"ctrl+q"}"#,
+        )
+        .unwrap();
+    assert_eq!(issues, Vec::new());
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        Some(Action::Quit)
+    );
+}
+
+/// CFG-103, one test per keymap type: `[<a valid non-default key>, "ctrl+nope"]` must leave the
+/// WHOLE map exactly as it was (compared through `Debug`, so binding order counts too), and
+/// report one issue. Each test first proves the good key alone WOULD change the map, so the
+/// assertion cannot pass vacuously. RED at HEAD `4fa902b0` for all nine: the old rule dropped only
+/// `ctrl+nope` and bound the good key.
+macro_rules! cfg103_typo_keeps_default {
+    ($name:ident, $ty:ty, $id:literal, $good:literal) => {
+        #[test]
+        fn $name() {
+            let default = <$ty>::default();
+            let mut rebound = <$ty>::default();
+            let good = format!(r#"{{"{}": "{}"}}"#, $id, $good);
+            assert_eq!(rebound.merge_json(&good).unwrap(), Vec::new());
+            assert_ne!(
+                format!("{rebound:?}"),
+                format!("{default:?}"),
+                "{good} must change the map, or the test below proves nothing"
+            );
+
+            let mut km = <$ty>::default();
+            let typo = format!(r#"{{"{}": ["{}", "ctrl+nope"]}}"#, $id, $good);
+            let issues = km.merge_json(&typo).unwrap();
+            assert_eq!(issues.len(), 1, "{typo}: {issues:?}");
+            assert_eq!(issues[0].id, $id);
+            assert_eq!(
+                format!("{km:?}"),
+                format!("{default:?}"),
+                "{typo} must leave the action on its default"
+            );
+        }
+    };
+}
+
+cfg103_typo_keeps_default!(
+    cfg103_keymap_typo_entry_keeps_the_default,
+    crate::Keymap,
+    "app.model.select",
+    "ctrl+q"
+);
+cfg103_typo_keeps_default!(
+    cfg103_editor_keymap_typo_entry_keeps_the_default,
+    crate::EditorKeymap,
+    "tui.editor.cursorLeft",
+    "ctrl+q"
+);
+cfg103_typo_keeps_default!(
+    cfg103_select_keymap_typo_entry_keeps_the_default,
+    crate::SelectKeymap,
+    "tui.select.up",
+    "ctrl+q"
+);
+cfg103_typo_keeps_default!(
+    cfg103_tree_keymap_typo_entry_keeps_the_default,
+    crate::TreeKeymap,
+    "app.tree.foldOrUp",
+    "ctrl+q"
+);
+cfg103_typo_keeps_default!(
+    cfg103_models_keymap_typo_entry_keeps_the_default,
+    crate::ModelsKeymap,
+    "app.models.save",
+    "ctrl+q"
+);
+cfg103_typo_keeps_default!(
+    cfg103_session_keymap_typo_entry_keeps_the_default,
+    crate::SessionKeymap,
+    "app.session.toggleSort",
+    "ctrl+q"
+);
+cfg103_typo_keeps_default!(
+    cfg103_thinking_keymap_typo_entry_keeps_the_default,
+    crate::ThinkingKeymap,
+    "app.thinking.save",
+    "ctrl+q"
+);
+cfg103_typo_keeps_default!(
+    cfg103_alt_screen_keymap_typo_entry_keeps_the_default,
+    crate::AltScreenKeymap,
+    "tui.altScreen.pageUp",
+    "ctrl+q"
+);
+cfg103_typo_keeps_default!(
+    cfg103_autocomplete_keymap_typo_entry_keeps_the_default,
+    crate::AutocompleteKeymap,
+    "tui.select.down",
+    "ctrl+q"
+);

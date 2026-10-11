@@ -23,10 +23,19 @@ use super::overlay::{OverlayKey, OverlayKeyCode};
 /// Shares `cyrup-tui`'s `Key::parse` token table (`crates/cyrup-tui/src/keymap.rs`), including the
 /// `enter`/`return` and `esc`/`escape` aliases, over [`OverlayKeyCode`] rather than crossterm's
 /// `KeyCode`, but still uses the pre-pi-1.1 grammar: split on every `+`, skip empty tokens, let the
-/// last key token win and OR the modifiers together. So `"+"` and `"ctrl++"` name no key here,
-/// `"a+b"` parses as `b` and `"ctrl+ctrl+a"` as ctrl+a. pi 1.1's stricter `parseKeyId` grammar
-/// (TUI-177) lives in `Key::parse` only. Pi source: `pi/packages/tui/src/keys.ts` `parseKeyId` /
-/// `matchesKey`.
+/// last key token win and OR the modifiers together. So `"a+b"` parses as `b` and `"ctrl+ctrl+a"`
+/// as ctrl+a here, where pi 1.1's stricter `parseKeyId` grammar (TUI-177, in `Key::parse`) rejects
+/// both. Pi source: `pi/packages/tui/src/keys.ts` `parseKeyId` / `matchesKey`.
+///
+/// **CFG-103 — why that no longer lets a user's file mean two things.** Every spec read from
+/// `keybindings.json` reaches this parser through [`parse_user_bindings`], which now drops any entry
+/// whose value fails pi's `KeybindingValueSchema` ([`cyrup_config::is_keybinding_value`]) — the
+/// same gate the TUI's keymaps apply — so `a+b`, `ctrl+ctrl+a`, `Ctrl+L` and the cyrup-only
+/// aliases never get here from a user file. Within the schema's language the old grammar differed
+/// from `Key::parse` only on the `+` key (`"+"`, `"ctrl++"` named no key), which this parser now
+/// reads as pi's `parseKeyId` does: a spec ending in `++`, or exactly `+`, names `+`. The one
+/// difference left is `super+…`, which names no key here because [`OverlayKey`] has no super bit
+/// and so could never match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeySpec {
     /// The key itself.
@@ -48,7 +57,21 @@ impl KeySpec {
         let mut alt = false;
         let mut shift = false;
         let mut code: Option<OverlayKeyCode> = None;
-        for part in spec.split('+') {
+        // CFG-103 / TUI-177 — the `+` key: pi's `parseKeyId` accepts a key token containing `+`
+        // only when it is exactly `+` (`keys.ts:832` @f1b2e77f5), so `"+"` and `"<mods>++"` name
+        // `+` and `"++"` / `"a++"` name nothing. The modifiers are what precedes the final `++`.
+        let (modifiers, plus_key) = if spec == "+" {
+            ("", true)
+        } else if let Some(head) = spec.strip_suffix("++") {
+            // `++` and `ctrl+++`: the key token would be `++`, which is not `+`.
+            if head.is_empty() || head.ends_with('+') {
+                return None;
+            }
+            (head, true)
+        } else {
+            (spec, false)
+        };
+        for part in modifiers.split('+') {
             let token = part.trim();
             if token.is_empty() {
                 continue;
@@ -92,6 +115,13 @@ impl KeySpec {
                     }
                 }
             }
+        }
+        if plus_key {
+            // `a++` — a key token before the `+` key is two keys, not a modifier.
+            if code.is_some() {
+                return None;
+            }
+            code = Some(OverlayKeyCode::Char('+'));
         }
         code.map(|code| Self {
             code,
@@ -201,7 +231,9 @@ pub fn key_ids(value: &serde_json::Value) -> Option<Vec<String>> {
 
 /// Resolve a `keybindings.json` document's text as `keybindings.getUserBindings()`: the user's raw
 /// map with legacy ids migrated by [`cyrup_config::migrate_keybindings_config`] exactly as the TUI
-/// does, so no overlay can disagree with the TUI about what `tui.select.up` means.
+/// does, so no overlay can disagree with the TUI about what `tui.select.up` means. `$schema` and
+/// every entry pi's `KeybindingValueSchema` rejects are left out (CFG-103), as pi's
+/// `toKeybindingsConfig` leaves them out.
 ///
 /// `None` for malformed JSON and for a document that is not an object: the caller then resolves
 /// from its defaults, pi's "no manager" arm. An empty object is `Some(vec![])`, which also resolves
@@ -213,7 +245,17 @@ pub fn parse_user_bindings(raw: &str) -> Option<Vec<(String, serde_json::Value)>
         return None;
     };
     let (migrated, _) = cyrup_config::migrate_keybindings_config(&map);
-    Some(migrated)
+    // CFG-103 — pi `7f9e1198f`'s `toKeybindingsConfig` (`core/keybindings.ts:267-276` @f1b2e77f5),
+    // which is what `getUserBindings()` returns: `if (key === "$schema") continue;` and
+    // `if (validateKeybindingValue.Check(binding)) config[key] = binding;`. An entry with any
+    // invalid key is dropped whole, so the overlay resolves that id from its default — the same
+    // outcome the TUI's keymaps reach for the same file (`cyrup-tui` `merge_entries`).
+    Some(
+        migrated
+            .into_iter()
+            .filter(|(id, value)| id != "$schema" && cyrup_config::is_keybinding_value(value))
+            .collect(),
+    )
 }
 
 /// Read `<agent_dir>/keybindings.json` and [`parse_user_bindings`] it. `None` for every failure

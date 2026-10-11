@@ -299,6 +299,140 @@ pub fn stringify_keybindings(config: &[(String, Value)]) -> String {
     out
 }
 
+/// The base keys pi's `KeyIdSchema` names besides `[a-z0-9]`: every string value of pi-tui's `Key`
+/// helper object (`packages/tui/src/keys.ts:163-232` @f1b2e77f5) — the special keys, then the 31
+/// `SYMBOL_KEYS`. Case-sensitive, so `pageUp` / `pageDown` are camelCase and `pageup` is not here.
+const KEY_ID_BASE_KEYS: [&str; 61] = [
+    "escape",
+    "esc",
+    "enter",
+    "return",
+    "tab",
+    "space",
+    "backspace",
+    "delete",
+    "insert",
+    "clear",
+    "home",
+    "end",
+    "pageUp",
+    "pageDown",
+    "up",
+    "down",
+    "left",
+    "right",
+    "f1",
+    "f2",
+    "f3",
+    "f4",
+    "f5",
+    "f6",
+    "f7",
+    "f8",
+    "f9",
+    "f10",
+    "f11",
+    "f12",
+    "`",
+    "-",
+    "=",
+    "[",
+    "]",
+    "\\",
+    ";",
+    "'",
+    ",",
+    ".",
+    "/",
+    "!",
+    "@",
+    "#",
+    "$",
+    "%",
+    "^",
+    "&",
+    "*",
+    "(",
+    ")",
+    "_",
+    "+",
+    "|",
+    "~",
+    "{",
+    "}",
+    ":",
+    "<",
+    ">",
+    "?",
+];
+
+/// Whether `spec` is a valid `KeyId` for `keybindings.json` — CFG-103, a port of pi's
+/// `KeyIdSchema` (`packages/coding-agent/src/core/key-id-schema.ts:4-15` @f1b2e77f5, added by
+/// `7f9e1198f`):
+///
+/// ```ts
+/// const modifiers = ["ctrl", "shift", "alt", "super"] as const;
+/// const baseKeyPattern = `(?:[a-z0-9]|${Object.values(Key)…join("|")})`;
+/// const duplicateModifierPattern = modifiers.map((modifier) => `${modifier}\\+.*${modifier}\\+`).join("|");
+/// pattern: `^(?!.*(?:${duplicateModifierPattern}))(?:(?:${modifiers.join("|")})\\+){0,4}${baseKeyPattern}$`
+/// ```
+///
+/// So: zero to four of the lowercase `ctrl+` / `shift+` / `alt+` / `super+` prefixes in any order,
+/// none repeated, then exactly one base key — a lowercase ASCII letter or digit, or one of
+/// [`KEY_ID_BASE_KEYS`], all case-sensitive. Peeling the prefixes greedily is equivalent to the
+/// regex: no base key starts with a modifier name followed by `+` (`+` alone is a base key, and
+/// `ctrl++` is `ctrl+` then `+`), and four distinct modifiers is every modifier, so the `{0,4}`
+/// bound is implied by the duplicate rule.
+///
+/// This is the LOAD-time grammar, deliberately stricter than the runtime one: pi's `parseKeyId`
+/// (`packages/tui/src/keys.ts:820-840`) lowercases and takes any base token, and pi applies the
+/// schema only where it reads `keybindings.json` (`core/keybindings.ts:267-276`, its one runtime
+/// user). cyrup keeps the same split — `cyrup_tui::Key::parse` is `parseKeyId`; this is the gate
+/// in front of it for the user's file, shared by the TUI keymaps and `cyrup-ext`'s overlay reader.
+#[must_use]
+pub fn is_key_id(spec: &str) -> bool {
+    const MODIFIERS: [&str; 4] = ["ctrl+", "shift+", "alt+", "super+"];
+    let mut seen = [false; 4];
+    let mut rest = spec;
+    'peel: loop {
+        for (index, prefix) in MODIFIERS.iter().enumerate() {
+            if let Some(tail) = rest.strip_prefix(prefix) {
+                // `(?!.*ctrl\+.*ctrl\+)` — a repeated modifier rejects the whole spec.
+                match seen.get_mut(index) {
+                    Some(flag) if !*flag => *flag = true,
+                    _ => return false,
+                }
+                rest = tail;
+                continue 'peel;
+            }
+        }
+        break;
+    }
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii_lowercase() || c.is_ascii_digit() => true,
+        _ => KEY_ID_BASE_KEYS.contains(&rest),
+    }
+}
+
+/// Whether a `keybindings.json` value is one pi keeps — CFG-103, pi's `KeybindingValueSchema`
+/// (`Type.Union([KeyIdSchema, Type.Array(KeyIdSchema)])`, `core/key-id-schema.ts:17-21`
+/// @f1b2e77f5), checked per entry by `toKeybindingsConfig`
+/// (`if (validateKeybindingValue.Check(binding)) config[key] = binding;`, `core/keybindings.ts:273`).
+/// A string, or an array whose every element is a string [`is_key_id`] accepts; an empty array is
+/// valid (it unbinds the action). Anything else drops the WHOLE entry, so the action keeps its
+/// default.
+#[must_use]
+pub fn is_keybinding_value(value: &Value) -> bool {
+    match value {
+        Value::String(spec) => is_key_id(spec),
+        Value::Array(items) => items
+            .iter()
+            .all(|item| item.as_str().is_some_and(is_key_id)),
+        _ => false,
+    }
+}
+
 /// Migrate `<agent_dir>/keybindings.json` in place, renaming legacy ids.
 ///
 /// Port of `migrateKeybindingsConfigFile` (`pi/packages/coding-agent/src/migrations.ts:157-172`
@@ -581,5 +715,96 @@ mod tests {
                 "{key} is still a legacy name after migration"
             );
         }
+    }
+
+    /// CFG-103 — `is_key_id` is pi's `KeyIdSchema` pattern (`core/key-id-schema.ts:10-15`
+    /// @f1b2e77f5), case by case: each row is what the regex answers.
+    #[test]
+    fn is_key_id_matches_pis_key_id_schema() {
+        for ok in [
+            "a",
+            "z",
+            "0",
+            "9",
+            "ctrl+l",
+            "shift+tab",
+            "alt+enter",
+            "super+k",
+            "escape",
+            "esc",
+            "return",
+            "pageUp",
+            "pageDown",
+            "insert",
+            "clear",
+            "f1",
+            "f12",
+            "+",
+            "ctrl++",
+            "shift+?",
+            "`",
+            "\\",
+            "ctrl+shift+alt+super+x",
+            "super+alt+shift+ctrl+x",
+        ] {
+            assert!(is_key_id(ok), "{ok:?} must be a KeyId");
+        }
+        for bad in [
+            "",
+            "ctrl",
+            "ctrl+",
+            "ctrl+nope",
+            "nope",
+            "Ctrl+L",
+            "CTRL+l",
+            "ctrl+L",
+            "L",
+            "Escape",
+            "pageup",
+            "PAGEUP",
+            "F5",
+            "f0",
+            "f13",
+            "f01",
+            "\u{e9}",
+            "ctrl+\u{e9}",
+            "\"",
+            " ",
+            "\t",
+            "ctrl+ctrl+x",
+            "ctrl+shift+ctrl+x",
+            "ctrl+shift+alt+super+ctrl+x",
+            "a+b",
+            "ctrl + c",
+            " ctrl+c",
+            "ctrl+c\n",
+            "control+c",
+            "cmd+k",
+            "meta+b",
+            "option+b",
+            "backtab",
+            "del",
+            "pgup",
+            "++",
+        ] {
+            assert!(!is_key_id(bad), "{bad:?} must not be a KeyId");
+        }
+    }
+
+    /// CFG-103 — `KeybindingValueSchema`: a KeyId, or an array of them (empty included).
+    #[test]
+    fn is_keybinding_value_matches_pis_keybinding_value_schema() {
+        assert!(is_keybinding_value(&serde_json::json!("ctrl+l")));
+        assert!(is_keybinding_value(&serde_json::json!(["ctrl+l", "f5"])));
+        assert!(is_keybinding_value(&serde_json::json!([])));
+        assert!(!is_keybinding_value(&serde_json::json!("ctrl+nope")));
+        assert!(!is_keybinding_value(&serde_json::json!([
+            "ctrl+l",
+            "ctrl+nope"
+        ])));
+        assert!(!is_keybinding_value(&serde_json::json!(["ctrl+l", 7])));
+        assert!(!is_keybinding_value(&serde_json::json!(7)));
+        assert!(!is_keybinding_value(&serde_json::json!(null)));
+        assert!(!is_keybinding_value(&serde_json::json!({"key": "ctrl+l"})));
     }
 }

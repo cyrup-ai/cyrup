@@ -55,8 +55,9 @@ pub use env::{CacheRetention, CliConfigOverrides, ConfigDirs, EnvVars};
 pub use env_keys::{api_key_env_vars, find_env_keys, get_env_api_key};
 pub use error::{AuthError, ConfigError, ScopedError, SettingsLoadError};
 pub use keybindings::{
-    KEYBINDING_IDS, KEYBINDING_NAME_MIGRATIONS, OrderedKeybindings, migrate_keybindings_config,
-    migrate_keybindings_config_file, migrated_keybinding_name, stringify_keybindings,
+    KEYBINDING_IDS, KEYBINDING_NAME_MIGRATIONS, OrderedKeybindings, is_key_id, is_keybinding_value,
+    migrate_keybindings_config, migrate_keybindings_config_file, migrated_keybinding_name,
+    stringify_keybindings,
 };
 pub use model::{
     CliModelResult, InitialModelResult, ModelCostOverride, ModelCycler, ModelDefinition, ModelFile,
