@@ -7,15 +7,14 @@
 
 use std::sync::atomic::Ordering;
 
-use cyrup_agent::AgentMessage;
 use cyrup_core::{EntryId, ModelId, ProviderId};
 use cyrup_ext::host::ControlOp;
 
 use crate::error::SessionServiceError;
 use crate::event::{InputSource, PromptOptions, StreamingBehavior, UserInput};
 
+use super::AgentSession;
 use super::types::NavigateTreeOptions;
-use super::{AgentSession, now_ms};
 
 /// pi's `sendUserMessage` options bag — `options?: { deliverAs?: "steer" | "followUp";
 /// expandPromptTemplates?: boolean }` (`core/agent-session.ts:2008` @v0.87.1), the typed shape of
@@ -376,9 +375,6 @@ impl AgentSession {
             Some("nextTurn") => Some(crate::event::DeliverAs::NextTurn),
             _ => None,
         };
-        // Pi's `triggerTurn` runs a fresh turn OVER the custom message when idle
-        // (`_runAgentPrompt(appMessage)`); `deliverAs` takes precedence, exactly as in
-        // `send_custom_message`/`inject_message`.
         // SEAM-127 — kept as the RAW `Option<bool>`: pi's `sendCustomMessage` tests
         // `options?.triggerTurn !== false` in its streaming branch (agent-session.ts:1949
         // @v0.87.1) and plain truthiness in the branch below it, so an ABSENT key and an explicit
@@ -386,32 +382,11 @@ impl AgentSession {
         // `triggerTurn: false` then took the streaming steer arm — the one shape it exists to
         // avoid.
         let trigger_turn = opts.get("triggerTurn").and_then(Value::as_bool);
-        // AGENT-030 — pi's `sendMessage` tests `this.isStreaming`, the session latch
-        // `_isAgentRunActive` (agent-session.ts:900-901, :1477-1483): a trigger-turn message landing
-        // in the post-`agent_end` gap steers the active loop rather than starting a second run.
-        if trigger_turn == Some(true) && deliver_as.is_none() && !self.is_run_active() {
-            let msg = AgentMessage::Custom {
-                kind: custom_type,
-                payload: content,
-                // The guest's `pi.sendMessage({… details})` payload, read just above and previously
-                // discarded on this branch only — the trigger-turn arm now carries it like the
-                // `send_custom_message` tail below.
-                details: details.clone(),
-                // SUBA-094 — likewise `display`, read just above and dropped here until now: pi
-                // hands `_runAgentPrompt` the same `appMessage` that carries it
-                // (`agent-session.ts:1488-1505` @v0.84.4), so a guest's
-                // `sendMessage({display:false}, {triggerTurn:true})` is a model-only message.
-                display,
-                timestamp: Some(now_ms()),
-            };
-            // SEAM-129 — pi defers this `_runAgentPrompt(appMessage)` while `agent_settled` is
-            // being emitted (`agent-session.ts:1956-1958` @v0.87.1), exactly as it defers `prompt`.
-            if self.is_emitting_settled() {
-                self.defer_settled(super::run::DeferredSettled::Run(vec![msg]));
-                return Ok(());
-            }
-            return self.spawn_run(vec![msg]).await;
-        }
+        // SUBA-229 — every one of pi's branches, the idle trigger-turn run (`_runAgentPrompt`,
+        // with its SEAM-129 `agent_settled` deferral) included, is `send_custom_message`'s
+        // `route` decision. This arm used to start that run itself, and only with `deliverAs`
+        // absent, so a guest's `{ deliverAs: "steer", triggerTurn: true }` on an idle session was
+        // appended with no turn where pi's branch 3 runs one.
         self.send_custom_message(
             &custom_type,
             content,

@@ -41,7 +41,9 @@ mod nested;
 pub(crate) mod prompt_images;
 mod prompt_update;
 mod queue;
+mod queued_turn;
 mod retry;
+mod route;
 mod run;
 mod stats;
 mod thinking;
@@ -97,6 +99,7 @@ use crate::subscriber::Fanout;
 use crate::tools::DynamicToolState;
 use cyrup_ext::host::InjectOutcome;
 use inject::{CompactionGate, SteeredInjection, merge_injection_batch, split_by_group_trigger};
+use queued_turn::{QueuedTurn, TurnIds};
 use run::InjectionOffer;
 
 use adapters::{SessionActivityHandle, SessionCatalogHandle};
@@ -433,6 +436,10 @@ pub struct AgentSession {
     /// not a guess about scheduling.
     #[cfg(test)]
     pub(crate) wakes_dropped_on_active_run: std::sync::atomic::AtomicUsize,
+    /// SUBA-229 test probe: what the injection pump holds queued onto a live run, and a hook into
+    /// the window between its routing read and its push.
+    #[cfg(test)]
+    pub(crate) live_turn_probe: queued_turn::LiveTurnProbe,
     /// Pi `_isEmittingAgentSettled` (`agent-session.ts:378` @v0.87.1): set for the length of the
     /// `agent_settled` emit, during which a prompt or a trigger-turn message is deferred.
     emitting_settled: AtomicBool,
@@ -572,6 +579,8 @@ impl AgentSession {
             run_released: AtomicBool::new(false),
             #[cfg(test)]
             wakes_dropped_on_active_run: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            live_turn_probe: queued_turn::LiveTurnProbe::default(),
             emitting_settled: AtomicBool::new(false),
             deferred_settled: Mutex::new(Vec::new()),
             compaction_settled: tokio::sync::watch::channel(0).0,
@@ -918,7 +927,24 @@ impl Drop for AgentSession {
 /// the moment it arrives. It keeps each one (with its ack) in `steered`, and at
 /// the idle edge [`AgentSession::append_no_turn_messages`] takes back any the run never drained —
 /// the stranded steer this task was built to prevent — and appends them to the tree and transcript
-/// instead. A turn-triggering message still waits for the idle edge, as it always has.
+/// instead.
+///
+/// # A turn-triggering message joins the live run too (SUBA-229)
+///
+/// pi's `sendCustomMessage` routes `{ triggerTurn: true }` onto a streaming session with
+/// `agent.steer` (or `agent.followUp` for `deliverAs: "followUp"`), the post-`agent_end` gap
+/// included (branch 2, `agent-session.ts:1949-1954` @v0.87.1). So while a run is active this task
+/// merges the turn half of its inbox (SUBA-017) and queues it onto that run through the same
+/// [`route::route`] decision `send_custom_message` makes
+/// ([`AgentSession::queue_turn_injections_onto_live_run`]). Each queued message stays owned in
+/// `queued` as a [`QueuedTurn`]; at the idle edge one the run drained is answered as delivered and
+/// one still in the agent's queue (the run ended between the routing read and the push) is taken
+/// back and run as this task's own turn — never lost, never delivered twice. It used to hold
+/// every such message for the idle edge and start a run of its own. The SUBA-187 count
+/// ([`crate::host_services::PendingTurnInjections`]) rides in each request's ack, so
+/// [`AgentSession::wait_for_idle`] keeps waiting for a queued turn until it is settled, and for a
+/// message that arrives after the run fully ended (the backstop) until the pump's own run holds
+/// the latch.
 ///
 /// ICOM-063 — while a run is active the producer now makes that steer itself, synchronously
 /// (`LiveHostServices::inject_message_steer`), because a steer from a `turn_end` handler must reach
@@ -952,10 +978,19 @@ async fn drive_injections(
     let mut steered: Vec<SteeredInjection> = Vec::new();
     let mut wakes: Vec<String> = Vec::new();
     let mut user_messages: Vec<PendingUserMessage> = Vec::new();
+    // SUBA-229 — turn-triggering requests queued onto a live run, owned until it is known whether
+    // the run drained them, and the ids that tell their messages apart in the agent's queues.
+    let mut queued: Vec<QueuedTurn> = Vec::new();
+    let mut turn_ids = TurnIds::default();
     // `false` once every producer is gone; what is already owned is still delivered.
     let mut open = true;
     loop {
-        if inbox.is_empty() && steered.is_empty() && wakes.is_empty() && user_messages.is_empty() {
+        if inbox.is_empty()
+            && steered.is_empty()
+            && wakes.is_empty()
+            && user_messages.is_empty()
+            && queued.is_empty()
+        {
             if !open {
                 return;
             }
@@ -993,6 +1028,9 @@ async fn drive_injections(
             for s in steered.drain(..) {
                 s.ack.answer(InjectOutcome::SessionUnavailable);
             }
+            for turn in queued.drain(..) {
+                turn.abandon(InjectOutcome::SessionUnavailable);
+            }
             return;
         };
         // The busy phase: steer what can be steered, keep receiving, and wait for the idle edge.
@@ -1001,6 +1039,9 @@ async fn drive_injections(
         // check-then-act — and it returns at once when the session is already idle.
         loop {
             session.steer_injections_onto_live_run(&mut inbox, &mut steered);
+            // SUBA-229 — a turn-triggering request joins the live run (pi `sendCustomMessage`
+            // branch 2) instead of waiting for the idle edge and starting a run of its own.
+            session.queue_turn_injections_onto_live_run(&mut inbox, &mut queued, &mut turn_ids);
             // A `sendUserMessage` that names a delivery is queued onto the live run NOW (pi
             // `prompt` → `_queueSteer` / `_queueFollowUp`), after its `input` handlers ran.
             if session.is_run_active() {
@@ -1060,6 +1101,10 @@ async fn drive_injections(
                 &mut user_messages,
             );
         }
+        // SUBA-229 — settle what was queued onto the run that just ended: a message it drained is
+        // delivered (answered inside); one still in the agent's queue landed past the run's last
+        // poll and is taken back, ahead of later arrivals, to run as this pump's own turn.
+        inbox = session.settle_queued_turns(&mut queued, std::mem::take(&mut inbox));
         let (durable, turn) = split_by_group_trigger(std::mem::take(&mut inbox));
         // The no-turn half first: it is independent of the turn, and answering it before a possible
         // `AgentBusy` on the turn below is what keeps a re-offered batch from appending it twice.

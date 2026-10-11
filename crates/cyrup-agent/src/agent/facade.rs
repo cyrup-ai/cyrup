@@ -281,6 +281,19 @@ impl Agent {
         lock(&self.steering).take_where(pred)
     }
 
+    /// [`Self::take_steering_where`] for the follow-up queue, under that queue's lock.
+    ///
+    /// SUBA-229 — the session's injection pump queues a turn-triggering message onto a live run
+    /// with [`Self::follow_up`] when it was sent with pi's `deliverAs: "followUp"`, and takes it
+    /// back this way if the run ended without draining it. The take is one critical section, so a
+    /// message is either drained by the run's `poll_follow_up` or taken here, never both.
+    pub fn take_follow_up_where(
+        &self,
+        pred: impl FnMut(&AgentMessage) -> bool,
+    ) -> Vec<AgentMessage> {
+        lock(&self.follow_up).take_where(pred)
+    }
+
     /// Put a batch previously taken with [`Self::take_steering_where`] back at the HEAD of the
     /// steering queue, in its own order — the undo for a take whose follow-up could not happen.
     pub fn restore_steering_front(&self, batch: Vec<AgentMessage>) {

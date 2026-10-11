@@ -227,6 +227,13 @@ async fn an_unarmed_childs_auto_drain_runs_and_is_not_cut_by_the_dispatch_budget
 /// RED at HEAD: the drain returned as soon as the run was terminal, the completion still had the
 /// results watcher's 500 ms poll and the batcher's 650 ms debounce ahead of it, and `run_print`
 /// returned without it — the result stayed on disk and the provider was called once.
+///
+/// SUBA-229 — and the completion turn runs INSIDE the print run, as pi's does ("Pi runs the queued
+/// completion turn after agent_end", `extension/index.ts:724-728` @ad11b7ab): the message sent
+/// during `agent_end` is queued onto the live loop (`sendCustomMessage` branch 2,
+/// `this.agent.steer(appMessage)`), so ONE `agent_settled` covers both turns. Before SUBA-229 the
+/// injection pump held it to the idle edge and started a second run (two `agent_settled`), which
+/// only SUBA-187's wait kept `run_print` from returning ahead of.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_result_that_lands_during_the_headless_drain_is_delivered_before_print_mode_returns() {
     use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
@@ -287,6 +294,7 @@ async fn a_result_that_lands_during_the_headless_drain_is_delivered_before_print
         }
     });
 
+    let mut events = runtime.session().await.subscribe();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     cyrup_sdk::run_print(
         &runtime,
@@ -321,6 +329,18 @@ async fn a_result_that_lands_during_the_headless_drain_is_delivered_before_print
         faux.call_count(),
         2,
         "and the completion turn it triggers has run before print mode returns"
+    );
+    let mut settles = 0;
+    while let Some(Some(event)) =
+        futures::FutureExt::now_or_never(futures::StreamExt::next(&mut events))
+    {
+        if matches!(event, cyrup_sdk::AgentSessionEvent::AgentSettled { .. }) {
+            settles += 1;
+        }
+    }
+    assert_eq!(
+        settles, 1,
+        "SUBA-229: the completion turn joins the print run (one agent_settled), not a second run"
     );
 }
 

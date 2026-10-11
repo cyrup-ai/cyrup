@@ -43,6 +43,7 @@ mod get_commands_source_info;
 mod host_flag_value;
 mod inject_message_details;
 mod inject_message_display;
+mod inject_pump_live_run;
 mod inject_pump_redrain;
 mod install_noop;
 mod integration;
