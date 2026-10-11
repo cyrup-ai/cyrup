@@ -449,14 +449,15 @@ async fn a_chat_row_still_becomes_a_chat_model_and_resolution_is_unchanged() {
     assert_eq!(chat.len(), merged.len());
 }
 
-/// **A classifier row still resolves**, because the same parameter brings ten of those. cyrup
-/// implements no `typesafe-system-one` api (PROV-104 owns it), so the row must LIST and RESOLVE —
-/// which is what PROV-128 is responsible for — and `classify()` on it must answer pi's
-/// no-implementation message rather than vanishing.
+/// **A classifier row still resolves**, because the same parameter brings ten of those. Since
+/// PROV-155 `openrouter` embeds its own classifier rows as a floor, and the overlay merges over it:
+/// the listed ids are the embedded ids together with the overlay's, and every overlay row wins its
+/// id verbatim. A merge where the overlay REPLACED the floor would lose the embedded ids.
 #[tokio::test]
 async fn a_classifier_row_from_the_catalog_still_resolves() {
     let (_origin, _store, overlay) = refresh_and_load(ALL_TYPES_BODY).await;
-    assert_eq!(overlay.classifier_models_for(OPENROUTER).len(), 10);
+    let overlaid = overlay.classifier_models_for(OPENROUTER);
+    assert_eq!(overlaid.len(), 10);
 
     let providers = all_providers_with_overlay(
         Arc::new(crate::auth::InMemoryCredentialStore::new()),
@@ -468,7 +469,37 @@ async fn a_classifier_row_from_the_catalog_still_resolves() {
         models.set_provider(provider);
     }
     let classifiers = models.get_classifier_models(Some(OPENROUTER));
-    assert_eq!(classifiers.len(), 10);
+    let embedded = crate::providers::classifiers::builtin_classifier_models(OPENROUTER);
+    assert!(
+        !embedded.is_empty(),
+        "PROV-155: openrouter embeds a classifier floor"
+    );
+    let listed: std::collections::BTreeSet<&str> =
+        classifiers.iter().map(|m| m.id.as_str()).collect();
+    let expected: std::collections::BTreeSet<&str> = embedded
+        .iter()
+        .chain(overlaid)
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(
+        listed, expected,
+        "the floor never shrinks; the overlay adds"
+    );
+    for row in overlaid {
+        assert_eq!(
+            models
+                .get_classifier_model(OPENROUTER, row.id.as_str())
+                .as_ref(),
+            Some(row),
+            "an overlay row wins its id verbatim"
+        );
+    }
+    assert!(
+        models
+            .get_provider(OPENROUTER)
+            .expect("registered")
+            .supports_classification()
+    );
     let one = &classifiers[0];
     assert!(
         models

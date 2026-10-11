@@ -248,7 +248,9 @@ pub fn anthropic_provider() -> WireProvider {
 // ---------------------------------------------------------------------------
 // The Anthropic-compatible provider fleet (Pi providers/{kimi-coding,minimax,minimax-cn,
 // vercel-ai-gateway}.ts). Every one speaks the `anthropic-messages` wire protocol with a single
-// env-key auth and a verbatim generated catalog; they differ only in id/name/base URL/env-key.
+// env-key auth and a verbatim generated catalog; they differ only in id/name/base URL/env-key,
+// except that `vercel-ai-gateway` also classifies (`classifiers: { typesafe-system-one }`,
+// `vercel-ai-gateway.ts:15-16`, PROV-155).
 // ---------------------------------------------------------------------------
 
 /// Static metadata for one `anthropic-messages` fleet provider (Pi provider factory `id`/`name`/
@@ -317,15 +319,20 @@ impl AnthropicFleetSpec {
         store: Arc<dyn CredentialStore>,
         registry: Arc<ApiRegistry>,
     ) -> WireProvider {
-        WireProvider::new(
+        // PROV-155 — the per-id classifier leg (pi `classifiers:`): `vercel-ai-gateway` is the only
+        // member with one (`vercel-ai-gateway.ts:13`, `:15-16`); every other id comes back untouched.
+        super::classifiers::with_builtin_classifiers(
             self.id,
-            self.name,
-            self.models(),
-            self.auth(),
-            store,
-            registry,
+            WireProvider::new(
+                self.id,
+                self.name,
+                self.models(),
+                self.auth(),
+                store,
+                registry,
+            )
+            .with_base_url(self.base_url),
         )
-        .with_base_url(self.base_url)
     }
 
     /// Build this provider with an in-memory store + the built-in api registry.

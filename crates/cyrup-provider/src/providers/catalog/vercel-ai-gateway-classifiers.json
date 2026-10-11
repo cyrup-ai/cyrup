@@ -1,0 +1,92 @@
+[
+	{
+		"type": "classifier",
+		"id": "convaiinnovations/laya",
+		"name": "Laya",
+		"api": "typesafe-system-one",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh/typesafe/v1",
+		"input": [
+			"text"
+		],
+		"cost": {
+			"input": 0,
+			"output": 0,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"contextWindow": 8192
+	},
+	{
+		"type": "classifier",
+		"id": "convaiinnovations/laya-free",
+		"name": "Laya (Free)",
+		"api": "typesafe-system-one",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh/typesafe/v1",
+		"input": [
+			"text"
+		],
+		"cost": {
+			"input": 0,
+			"output": 0,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"contextWindow": 8192
+	},
+	{
+		"type": "classifier",
+		"id": "liquid/d1",
+		"name": "Liquid d1",
+		"api": "typesafe-system-one",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh/typesafe/v1",
+		"input": [
+			"text"
+		],
+		"cost": {
+			"input": 0.04,
+			"output": 0,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"contextWindow": 65536
+	},
+	{
+		"type": "classifier",
+		"id": "openai/gpt-6-luna-decisions",
+		"name": "GPT-6 Luna Decisions",
+		"api": "typesafe-system-one",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh/typesafe/v1",
+		"input": [
+			"text"
+		],
+		"cost": {
+			"input": 0.1,
+			"output": 0,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"contextWindow": 1050000
+	},
+	{
+		"type": "classifier",
+		"id": "typesafe-ai/jev",
+		"name": "Jev",
+		"api": "typesafe-system-one",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh/typesafe/v1",
+		"input": [
+			"text"
+		],
+		"cost": {
+			"input": 0.042,
+			"output": 0,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"contextWindow": 32000
+	}
+]

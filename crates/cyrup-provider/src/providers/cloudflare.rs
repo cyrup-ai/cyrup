@@ -307,30 +307,17 @@ pub fn cloudflare_workers_ai_provider_with(
     store: Arc<dyn CredentialStore>,
     registry: Arc<ApiRegistry>,
 ) -> WireProvider {
-    WireProvider::new(
+    // PROV-104 / PROV-155 — Clef, Clef Flash and Jev, and the `cloudflare-workers-ai-system-one` map
+    // (pi `cloudflare-workers-ai.ts:18`, `:21-23`), from the classifier table; see that leg for how
+    // `{CLOUDFLARE_ACCOUNT_ID}` is resolved.
+    super::classifiers::CLOUDFLARE_WORKERS_AI_CLASSIFIERS.attach(WireProvider::new(
         CLOUDFLARE_WORKERS_AI_PROVIDER_ID,
         "Cloudflare Workers AI",
         cloudflare_workers_ai_models(),
         cloudflare_workers_ai_auth(),
         store,
         registry,
-    )
-    .with_classifiers(Arc::new(cloudflare_workers_ai_classifiers_registry()))
-}
-
-/// The Workers AI provider's `classifiers` dispatch map (pi `classifiers: {
-/// "cloudflare-workers-ai-system-one": cloudflareClassifier(cloudflareWorkersAISystemOneApi()) }`,
-/// `providers/cloudflare-workers-ai.ts:21-23`). pi's `cloudflareClassifier` wrapper substitutes
-/// `{CLOUDFLARE_ACCOUNT_ID}` into the model's base URL from the resolved env; here
-/// [`cloudflare_workers_ai_auth`]'s `resolve` already returns the substituted base URL, which
-/// `Models::classify` applies before dispatch (`apply_classifier_auth`), so the api is registered
-/// bare. The live catalog's `cloudflare-workers-ai` classifier rows (`@cf/cloudflare/clef`, ...)
-/// arrive through the remote catalog overlay; the embedded catalog holds none. PROV-104.
-pub fn cloudflare_workers_ai_classifiers_registry() -> crate::classifier::ClassifierApiRegistry {
-    let kind = crate::classifier::KnownClassifierApi::CloudflareWorkersAiSystemOne;
-    let mut registry = crate::classifier::ClassifierApiRegistry::new();
-    registry.register(kind, kind.implementation());
-    registry
+    ))
 }
 
 /// Convenience constructor: an in-memory credential store + the built-in api registry.

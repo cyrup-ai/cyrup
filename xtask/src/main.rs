@@ -245,6 +245,16 @@ const LIVE_CATALOGS: &[live_catalog::LiveCatalogSpec] = &[
     // `generate-models.ts:2586-2617` @f1b2e77f5). `typesafe` has no chat rows at all, so this is
     // its only catalog.
     live("typesafe-classifiers", "PROV-153"),
+    // PROV-155 — the other four providers pi's generator writes classifier rows for
+    // (`generate-models.ts:3381-3392` @f1b2e77f5), each a provider whose `createProvider` carries a
+    // `classifiers` map: Workers AI's hardcoded `CLOUDFLARE_WORKERS_AI_CLASSIFIER_MODELS`
+    // (`:2649-2687`), the hardcoded `OPENCODE_CLASSIFIER_MODELS` (`:2618-2647`), OpenRouter's
+    // decision models (`openrouter-catalog.ts:152-170`) and AI Gateway's `type: "evaluation"` rows
+    // at `AI_GATEWAY_TYPESAFE_BASE_URL` (`:1381-1396`). pi.dev serves all four already shaped.
+    live("cloudflare-workers-ai-classifiers", "PROV-155"),
+    live("opencode-classifiers", "PROV-155"),
+    live("openrouter-classifiers", "PROV-155"),
+    live("vercel-ai-gateway-classifiers", "PROV-155"),
 ];
 
 /// One [`LIVE_CATALOGS`] entry. Everything but the ledger id is derived from the stem
@@ -1039,8 +1049,9 @@ fn account_for_roster(upstream_stems: &[String]) -> Result<Roster, String> {
         {
             embedded.push(spec);
         } else if let Some(l) = LIVE_CATALOGS.iter().find(|l| l.provider() == stem) {
-            // A provider with a chat AND a classifier catalog (`openai`) is one module upstream;
-            // the first spec naming it accounts for the stem.
+            // A provider with a chat AND a classifier catalog (cloudflare-workers-ai, openai,
+            // opencode, openrouter, vercel-ai-gateway) is one module upstream; the first spec
+            // naming it accounts for the stem.
             live.push(l);
         } else if let Some(u) = UNPORTED.iter().find(|u| u.stem == stem) {
             unported_present.push(u);
@@ -1339,6 +1350,16 @@ fn manifest_json(
         .collect();
     let classifier_count = classifier_files.len();
     let classifier_files = classifier_files.join(", ");
+    // The ledger ids behind the classifier catalogs, derived like the counts so the sentence cannot
+    // drift from the table.
+    let classifier_items = LIVE_CATALOGS
+        .iter()
+        .filter(|l| l.kind() == live_catalog::LiveCatalogKind::Classifier)
+        .map(|l| l.item)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
     let catalog_count = pinned_count + live_count; // D5 — 39, one file per catalog on disk
     let generated_at = if args.rev == DEFAULT_REV {
         DEFAULT_REV_TIMESTAMP.to_string()
@@ -1383,9 +1404,13 @@ fn manifest_json(
          `catalogs` below. {classifier_count} of those ({classifier_files}) hold a provider's \
          CLASSIFIER rows: they are fetched from {endpoint}<id>?types=classifier, keep only the \
          `type: \"classifier\"` rows of that array, and are read as ClassifierModel rows, never as \
-         chat models (PROV-147, PROV-153). {pinned_count} (openrouter-images) is read at its OWN pinned revision, \
-         pi@{IMAGES_REV}, named by its `catalogs` entry (PROV-089), and neither `generatedAt` nor \
-         any `fetchedAt` is a floor for it because the pi.dev overlay never serves image rows. \
+         chat models ({classifier_items}). A provider's chat and classifier catalogs sit on ONE \
+         pi.dev revision (`check_one_revision_per_provider`), and its overlay floor is its chat \
+         catalog's fetchedAt — the classifier catalog's only for a provider with no chat rows. \
+         {pinned_count} (openrouter-images) is read at its OWN pinned revision, pi@{IMAGES_REV}, \
+         named by its `catalogs` entry (PROV-089); the pi.dev overlay serves image rows too since \
+         PROV-128 (`?types=chat,image,classifier`), and openrouter's floor is its chat catalog's, \
+         so a same-revision overlay keeps the live image rows over these older pinned ones. \
          Top-level `generatedAt` and `source` ({source}, {generated_at}) therefore describe no \
          embedded catalog's rows any more; they remain the global overlay floor described below. \
          PROV-071: the pinned path is DEAD for provider modules and always was — every \
@@ -1433,6 +1458,7 @@ fn manifest_json(
             ]),
         ));
     }
+    let mut revisions: Vec<RevisionEntry> = Vec::new();
     for (spec, outcome) in live {
         let (fetched_at, revision) = match outcome {
             live_catalog::LiveOutcome::Fetched {
@@ -1447,6 +1473,14 @@ fn manifest_json(
             // on: carry the previous manifest's entry forward instead.
             live_catalog::LiveOutcome::Skipped { .. } => carry_forward(&args.out, spec.file),
         };
+        revisions.push(RevisionEntry {
+            file: spec.file,
+            revision: revision.as_str().map(str::to_string),
+            skipped: match outcome {
+                live_catalog::LiveOutcome::Skipped { why } => Some(why.clone()),
+                live_catalog::LiveOutcome::Fetched { .. } => None,
+            },
+        });
         catalogs.push((
             spec.file.to_string(),
             Val::Obj(vec![
@@ -1457,6 +1491,7 @@ fn manifest_json(
             ]),
         ));
     }
+    check_one_revision_per_provider(&revisions)?;
 
     let manifest = Val::Obj(vec![
         ("generatedAt".to_string(), Val::Str(generated_at)),
@@ -1467,6 +1502,76 @@ fn manifest_json(
     let mut body = manifest.to_json();
     body.push('\n');
     Ok(body)
+}
+
+/// One live catalog's pi.dev revision as the manifest will record it, and why it was not fetched
+/// on this run when it was carried forward instead (`LiveOutcome::Skipped`).
+struct RevisionEntry {
+    file: &'static str,
+    revision: Option<String>,
+    skipped: Option<String>,
+}
+
+/// `[CYRUP-DELTA, mechanism]` PROV-155 — one pi.dev revision per provider.
+///
+/// pi generates a provider's chat, image and classifier rows into ONE file
+/// (`packages/ai/src/providers/data/<id>.json`), so they cannot sit on two revisions. cyrup splits
+/// the classifier rows into `<id>-classifiers.json` (PROV-147), and `cyrup-provider` takes ONE
+/// overlay floor per provider from the chat catalog's `fetchedAt`
+/// (`builtin_model_data_generated_at_by_provider`). That floor speaks for the classifier rows only
+/// if both files hold the same revision, so a manifest that would record a provider on two
+/// revisions is refused here, before anything is written.
+///
+/// This narrows D6's "a skipped fetch is non-fatal": a skip is still non-fatal on its own, but not
+/// when it would leave its sibling on a newer revision. The message names the actual cause — a
+/// catalog `--only` did not select, a fetch that failed, or pi.dev publishing between two fetches.
+/// A catalog with no recorded revision (never fetched) constrains nothing.
+fn check_one_revision_per_provider(entries: &[RevisionEntry]) -> Result<(), String> {
+    let provider_of = |file: &str| {
+        file.strip_suffix(live_catalog::CLASSIFIER_CATALOG_SUFFIX)
+            .unwrap_or(file)
+            .to_string()
+    };
+    for (i, a) in entries.iter().enumerate() {
+        let Some(rev_a) = a.revision.as_deref() else {
+            continue;
+        };
+        for b in entries.iter().skip(i + 1) {
+            let Some(rev_b) = b.revision.as_deref() else {
+                continue;
+            };
+            if provider_of(a.file) != provider_of(b.file) || rev_a == rev_b {
+                continue;
+            }
+            let remedy = match (a.skipped.as_deref(), b.skipped.as_deref()) {
+                (None, None) => {
+                    "pi.dev published a new revision between the two fetches; run gen-catalogs \
+                     again"
+                        .to_string()
+                }
+                (Some(why), _) | (_, Some(why)) => {
+                    let carried = if a.skipped.is_some() { a.file } else { b.file };
+                    if why == "not named by --only" {
+                        format!("re-run with `--only {},{}`", a.file, b.file)
+                    } else {
+                        format!(
+                            "{carried}.json was carried forward because its fetch was skipped \
+                             ({why}); fetch both again"
+                        )
+                    }
+                }
+            };
+            return Err(format!(
+                "{provider}: {}.json would sit on pi.dev revision {rev_a} but {}.json on {rev_b}. \
+                 Both are one provider's rows and share one overlay floor, so they must come from \
+                 one revision — {remedy}.",
+                a.file,
+                b.file,
+                provider = provider_of(a.file),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A live catalog's manifest provenance, carried forward from the manifest already on disk when
@@ -1732,9 +1837,10 @@ mod tests {
     /// file moving between the tables, which a total alone cannot see.
     ///
     /// PROV-080 / PROV-147 / PROV-153 grew it to 42: `meta`'s chat catalog, and the first two
-    /// classifier catalogs (`openai-classifiers`, `typesafe-classifiers`).
+    /// classifier catalogs (`openai-classifiers`, `typesafe-classifiers`). PROV-155 to 46: the
+    /// classifier catalogs of the other four providers with a pi `classifiers` map.
     #[test]
-    fn the_catalog_roster_is_the_42_embedded_files() {
+    fn the_catalog_roster_is_the_46_embedded_files() {
         assert_eq!(
             CATALOGS.len(),
             1,
@@ -1743,16 +1849,16 @@ mod tests {
         );
         assert_eq!(
             LIVE_CATALOGS.len(),
-            41,
+            45,
             "every `packages/ai/src/providers/<p>.models.ts` pi ships except `together` (hand-\
              ported), `radius` (catalog from its gateway) and `typesafe` (no chat rows), with \
              `azure` still fetched under its pre-rename id `azure-openai-responses` (PROV-145), \
-             plus two classifier catalogs (`openai-classifiers`, `typesafe-classifiers`)"
+             plus six classifier catalogs, one per pi `classifiers` map"
         );
         assert_eq!(
             CATALOGS.len() + LIVE_CATALOGS.len(),
-            42,
-            "the roster is 42 embedded catalog files across the two tables"
+            46,
+            "the roster is 46 embedded catalog files across the two tables"
         );
         // Every live spec derives its endpoint and module from its stem, so a mismatched pair is
         // unspellable rather than merely detected — the reason `LiveCatalogSpec` collapsed three
@@ -1794,6 +1900,10 @@ mod tests {
             [
                 ("openai-classifiers", "PROV-147"),
                 ("typesafe-classifiers", "PROV-153"),
+                ("cloudflare-workers-ai-classifiers", "PROV-155"),
+                ("opencode-classifiers", "PROV-155"),
+                ("openrouter-classifiers", "PROV-155"),
+                ("vercel-ai-gateway-classifiers", "PROV-155"),
             ]
         );
         // Every name is a real file on disk. This is what catches a table entry whose catalog was
@@ -2133,8 +2243,8 @@ mod tests {
     /// Everything at the pin but PROV-145's rename IS accounted for: **0 embedded + 40 live + 2
     /// unported**. `meta` (PROV-080) moved from `UNPORTED` to [`LIVE_CATALOGS`] when its provider
     /// was ported; `typesafe` (PROV-153) is accounted for by its classifier catalog alone, because
-    /// it has no chat rows; `openai` is ONE module with two live catalogs (chat, and PROV-147's
-    /// classifiers), and counts once.
+    /// it has no chat rows; `openai` (PROV-147) and the four PROV-155 providers are each ONE module
+    /// with two live catalogs (chat and classifiers), and each counts once.
     #[test]
     fn the_pin_roster_is_otherwise_fully_accounted_for() {
         let stems = upstream_stems_at_pin_with_cyrups_azure_id();
@@ -2158,6 +2268,23 @@ mod tests {
             .map(|l| l.file)
             .collect();
         assert_eq!(openai, ["openai", "openai-classifiers"]);
+        for provider in [
+            "cloudflare-workers-ai",
+            "opencode",
+            "openrouter",
+            "vercel-ai-gateway",
+        ] {
+            let files: Vec<&str> = LIVE_CATALOGS
+                .iter()
+                .filter(|l| l.provider() == provider)
+                .map(|l| l.file)
+                .collect();
+            assert_eq!(
+                files,
+                [provider.to_string(), format!("{provider}-classifiers")],
+                "PROV-155"
+            );
+        }
 
         // Asserted as the whole unported set, in upstream stem order, with each one's owner: a
         // provider quietly moving in or out of this list is the failure the audit exists for.
@@ -2225,9 +2352,9 @@ mod tests {
         }
         assert_eq!(
             LIVE_CATALOGS.len(),
-            41,
+            45,
             "the four, plus xai (XAI_1), plus the 33 PROV-071 moved across, plus meta (PROV-080) \
-             and the openai (PROV-147) and typesafe (PROV-153) classifier catalogs"
+             and the openai (PROV-147), typesafe (PROV-153) and four PROV-155 classifier catalogs"
         );
         assert_eq!(
             LIVE_CATALOGS
@@ -2347,6 +2474,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn rev(file: &'static str, revision: Option<&str>, skipped: Option<&str>) -> RevisionEntry {
+        RevisionEntry {
+            file,
+            revision: revision.map(str::to_string),
+            skipped: skipped.map(str::to_string),
+        }
+    }
+
+    /// PROV-155 — a provider whose chat and classifier catalogs would be recorded on two pi.dev
+    /// revisions is refused, and the message names the cause: a catalog `--only` left out (re-run
+    /// with both), a skipped fetch (its reason), or pi.dev publishing between two fetches.
+    #[test]
+    fn a_provider_split_across_two_pi_dev_revisions_is_a_hard_error() {
+        let err = check_one_revision_per_provider(&[
+            rev("opencode", Some("sha256-a"), None),
+            rev("opencode-classifiers", Some("sha256-b"), None),
+        ])
+        .unwrap_err();
+        assert!(err.contains("opencode.json"), "{err}");
+        assert!(err.contains("opencode-classifiers.json"), "{err}");
+        assert!(err.contains("published a new revision"), "{err}");
+
+        let err = check_one_revision_per_provider(&[
+            rev("opencode", Some("sha256-a"), Some("not named by --only")),
+            rev("opencode-classifiers", Some("sha256-b"), None),
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("--only opencode,opencode-classifiers"),
+            "{err}"
+        );
+
+        let err = check_one_revision_per_provider(&[
+            rev("opencode", Some("sha256-a"), None),
+            rev(
+                "opencode-classifiers",
+                Some("sha256-b"),
+                Some("curl: (6) Could not resolve host"),
+            ),
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("opencode-classifiers.json was carried forward"),
+            "{err}"
+        );
+        assert!(err.contains("Could not resolve host"), "{err}");
+        assert!(!err.contains("--only"), "{err}");
+    }
+
+    /// PROV-155 — the guard refuses only a real split: one provider on one revision, different
+    /// providers on different revisions, a classifier-only provider, and a catalog with no recorded
+    /// revision (openrouter-images, a never-fetched catalog) all pass. Non-regression guard against
+    /// false positives; red if it compared across providers or counted a missing revision.
+    #[test]
+    fn one_revision_per_provider_accepts_what_cannot_disagree() {
+        assert!(
+            check_one_revision_per_provider(&[
+                rev("openai", Some("sha256-a"), None),
+                rev("openai-classifiers", Some("sha256-a"), None),
+                rev("opencode", Some("sha256-b"), Some("not named by --only")),
+                rev("typesafe-classifiers", Some("sha256-c"), None),
+                rev("openrouter", Some("sha256-b"), None),
+                rev("openrouter-classifiers", None, None),
+            ])
+            .is_ok()
+        );
     }
 
     /// PROV-147 / PROV-153 — a classifier catalog keeps exactly the `type: "classifier"` rows of the

@@ -15,7 +15,7 @@
 			"cacheRead": 0.014,
 			"cacheWrite": 0
 		},
-		"contextWindow": 1310720,
+		"contextWindow": 1048576,
 		"maxTokens": 1048576,
 		"compat": {
 			"supportsStore": false,
@@ -85,7 +85,7 @@
 		"cost": {
 			"input": 0.1,
 			"output": 0.3,
-			"cacheRead": 0,
+			"cacheRead": 0.05,
 			"cacheWrite": 0
 		},
 		"contextWindow": 256000,
@@ -218,7 +218,8 @@
 		"baseUrl": "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1",
 		"reasoning": false,
 		"input": [
-			"text"
+			"text",
+			"image"
 		],
 		"cost": {
 			"input": 0.351,
@@ -234,6 +235,16 @@
 			"supportsStrictMode": true,
 			"supportsLongCacheRetention": false,
 			"sendSessionAffinityHeaders": true
+		},
+		"inputLimits": {
+			"images": {
+				"resize": {
+					"maxWidth": 2000,
+					"maxHeight": 2000,
+					"maxBytes": 4718592,
+					"jpegQuality": 80
+				}
+			}
 		},
 		"type": "chat"
 	},
@@ -583,7 +594,7 @@
 			"cacheRead": 0.26,
 			"cacheWrite": 0
 		},
-		"contextWindow": 1310720,
+		"contextWindow": 1048576,
 		"maxTokens": 1048576,
 		"compat": {
 			"supportsStore": false,
@@ -620,7 +631,7 @@
 			"cacheRead": 0.03,
 			"cacheWrite": 0
 		},
-		"contextWindow": 1310720,
+		"contextWindow": 1048576,
 		"maxTokens": 1048576,
 		"compat": {
 			"supportsStore": false,

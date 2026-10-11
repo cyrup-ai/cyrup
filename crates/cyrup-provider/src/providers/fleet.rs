@@ -288,7 +288,10 @@ impl FleetSpec {
         // PROV-128 — the per-id image leg, shaped exactly like `auth()`'s `builtin_provider_oauth`
         // clause: `openrouter` is the only fleet member upstream gives an `images` map
         // (`providers/openrouter.ts:33`), and every other id comes back untouched.
-        super::openrouter::with_builtin_images(self.id, provider)
+        let provider = super::openrouter::with_builtin_images(self.id, provider);
+        // PROV-155 — the per-id classifier leg (pi `classifiers:`): `openrouter` is the only fleet
+        // member with one; every other id comes back untouched.
+        super::classifiers::with_builtin_classifiers(self.id, provider)
     }
 
     /// Build this provider with an in-memory store + the built-in api registry.
