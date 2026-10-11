@@ -11,6 +11,8 @@ use cyrup_ext::host::HostServices;
 use crate::error::SessionServiceError;
 use crate::event::{AgentSessionEvent, PromptAccepted, StreamingBehavior, UserInput};
 
+use super::queued_turn::{Lane, QueuedTurn, TurnIds, settle_all};
+use super::route::{Route, route};
 use super::run::InjectionOffer;
 use super::{AgentSession, now_ms};
 use crate::host_services::{InjectAck, InjectMessage, InjectRequest};
@@ -81,6 +83,13 @@ impl AgentSession {
     /// branch 2 tests `!== false` and its branch 3 tests truthiness — an ABSENT key and an explicit
     /// `false` take different branches, so collapsing them to one `bool` is what made a
     /// `triggerTurn: false` message steer the live loop and be answered (SEAM-127).
+    ///
+    /// SUBA-229 — all five of pi's branches, chosen by [`route`]; a turn-triggering message on an
+    /// idle session (pi's branch 3) starts its run here for every `deliver_as` but `NextTurn`.
+    ///
+    /// # Errors
+    ///
+    /// A tree append failure (the append arm), or a run that could not be started (branch 3).
     pub async fn send_custom_message(
         &self,
         custom_type: &str,
@@ -90,14 +99,13 @@ impl AgentSession {
         deliver_as: Option<crate::event::DeliverAs>,
         trigger_turn: Option<bool>,
     ) -> Result<(), SessionServiceError> {
-        use crate::event::DeliverAs;
         let ts = now_ms();
         let msg = AgentMessage::Custom {
             kind: custom_type.to_string(),
-            payload: content.clone(),
+            payload: content,
             // Carried on the live message too, not just the durable arm below: the steer, follow-up
             // and next-turn arms surface through `message_end`, which is the renderer's surface.
-            details: details.clone(),
+            details,
             // SUBA-094 — same reason, and the same line of pi: `sendCustomMessage` puts `display` on
             // the ONE `appMessage` it builds (`agent-session.ts:1488-1496` @v0.84.4) and hands that
             // object to all five branches. Every arm below surfaces through `message_end`, so a
@@ -106,58 +114,68 @@ impl AgentSession {
             display,
             timestamp: Some(ts),
         };
-        match deliver_as {
-            Some(DeliverAs::NextTurn) => {
-                Self::lock(&self.pending_next_turn).push(msg);
-            }
-            // AGENT-030 — pi routes on `this.isStreaming`, the session latch `_isAgentRunActive`
-            // (agent-session.ts:900-901, consulted at :1477): in the post-`agent_end` gap the
-            // message queues onto the active loop instead of being appended between runs.
-            _ if self.is_run_active() && trigger_turn != Some(false) => match deliver_as {
-                Some(DeliverAs::FollowUp) => self.agent.follow_up(msg),
-                _ => self.agent.steer(msg),
-            },
-            // pi branch 4 (agent-session.ts:1961-1966 @v0.87.1), reached when a run is live and
-            // `triggerTurn` is explicitly `false`. pi's own comment, verbatim in substance:
-            // "Appending now would put the message between an assistant tool call and its result,
-            // which providers that validate message order reject on replay. Defer to the end of the
-            // turn. Nothing is emitted yet: message events must not describe messages the session
-            // tree does not contain."
-            //
-            // This arm sits AFTER the `NextTurn` arm (pi's branch 1 likewise precedes every
-            // `triggerTurn` test) and BEFORE the not-streaming arm below, exactly as pi orders its
-            // branches 4 and 5. It is reachable for any other `deliver_as`: pi's branch 2 requires
-            // `triggerTurn !== false`, so `deliverAs: "steer"` with `triggerTurn: false` falls
-            // through to here and is DEFERRED, not queued. SEAM-127.
-            _ if self.is_run_active() => {
-                Self::lock(&self.pending_custom_messages).push(msg);
-            }
-            // ICOM-068 — pi's not-streaming, no-trigger arm (branch 5, `agent-session.ts:1967-1969`)
-            // is `_appendCustomMessage`: the tree append AND `_refreshFinalizedContext()`, which
-            // re-seeds `agent.state.messages` from the session projection (`:1972-1982`, `:730-736`
-            // @v0.87.1), so the model sees the message on the next prompt. This arm used to do the
-            // tree append alone: the message was drawn and persisted and never sent to the model
-            // until a resume, fork or compaction re-seeded the transcript from the tree.
-            _ => {
-                match self
-                    .append_no_turn_messages(vec![msg.clone()], &[], CompactionGate::Ignore)
-                    .await?
-                {
-                    InjectionOffer::Taken => {}
-                    // A run claimed the latch between the routing read above and the append's
-                    // critical section. It is streaming now, so re-route as pi routes a streaming
-                    // session — which is a TWO-way decision, not one: branch 2 steers only when
-                    // `triggerTurn !== false`, and an explicit `false` is branch 4's deferral
-                    // (SEAM-127). Steering it here would hand the model a message that asked for no
-                    // turn, and land it between a tool call and its result.
-                    InjectionOffer::AgentBusy if trigger_turn == Some(false) => {
-                        Self::lock(&self.pending_custom_messages).push(msg);
+        // SUBA-229 — the decision is [`route`], the one function the injection pump's busy phase
+        // also routes through, so the two cannot disagree again. The loop runs at most twice: the
+        // append arm re-routes ONCE, as a streaming session, if a run claimed the latch between
+        // this read and its critical section, and a streaming route never appends.
+        let mut run_active = self.is_run_active();
+        loop {
+            match route(deliver_as, trigger_turn, run_active) {
+                Route::NextTurn => Self::lock(&self.pending_next_turn).push(msg),
+                // AGENT-030 — pi routes on `this.isStreaming`, the session latch
+                // `_isAgentRunActive` (agent-session.ts:900-901, consulted at :1477): in the
+                // post-`agent_end` gap the message queues onto the active loop instead of being
+                // appended between runs.
+                Route::FollowUp => self.agent.follow_up(msg),
+                Route::Steer => self.agent.steer(msg),
+                // pi branch 3: `_runAgentPrompt(appMessage)`, deferred while `agent_settled` is
+                // being emitted (SEAM-129, `agent-session.ts:1956-1959` @v0.87.1), exactly as it
+                // defers `prompt`. For ANY `deliverAs` but `nextTurn`: pi's branch 3 tests only
+                // `triggerTurn`. Until SUBA-229 only the control-op caller started this run (and
+                // only with `deliverAs` absent); this method appended the message with no turn.
+                Route::RunTurn => {
+                    if self.is_emitting_settled() {
+                        self.defer_settled(super::run::DeferredSettled::Run(vec![msg]));
+                    } else {
+                        self.spawn_run(vec![msg]).await?;
                     }
-                    InjectionOffer::AgentBusy => self.agent.steer(msg),
+                }
+                // pi branch 4 (agent-session.ts:1961-1966 @v0.87.1), reached when a run is live and
+                // `triggerTurn` is explicitly `false`. pi's own comment, verbatim in substance:
+                // "Appending now would put the message between an assistant tool call and its
+                // result, which providers that validate message order reject on replay. Defer to
+                // the end of the turn. Nothing is emitted yet: message events must not describe
+                // messages the session tree does not contain."
+                //
+                // Reachable for any `deliver_as` but `NextTurn`: pi's branch 2 requires
+                // `triggerTurn !== false`, so `deliverAs: "steer"` with `triggerTurn: false` falls
+                // through to here and is DEFERRED, not queued. SEAM-127.
+                Route::Defer => Self::lock(&self.pending_custom_messages).push(msg),
+                // ICOM-068 — pi's not-streaming, no-trigger arm (branch 5,
+                // `agent-session.ts:1967-1969`) is `_appendCustomMessage`: the tree append AND
+                // `_refreshFinalizedContext()`, which re-seeds `agent.state.messages` from the
+                // session projection (`:1972-1982`, `:730-736` @v0.87.1), so the model sees the
+                // message on the next prompt.
+                Route::AppendIdle => {
+                    match self
+                        .append_no_turn_messages(vec![msg.clone()], &[], CompactionGate::Ignore)
+                        .await?
+                    {
+                        InjectionOffer::Taken => {}
+                        // A run claimed the latch between the routing read above and the append's
+                        // critical section. It is streaming now, so route again as pi routes a
+                        // streaming session — a TWO-way decision: branch 2 queues only when
+                        // `triggerTurn !== false`, and an explicit `false` is branch 4's deferral
+                        // (SEAM-127).
+                        InjectionOffer::AgentBusy => {
+                            run_active = true;
+                            continue;
+                        }
+                    }
                 }
             }
+            return Ok(());
         }
-        Ok(())
     }
 
     /// Pi `_appendCustomMessage` (agent-session.ts:1972-1982 @v0.87.1), in pi's order: persist the
@@ -277,9 +295,9 @@ impl AgentSession {
     /// by the run (delivered), or still queued (taken back and appended then).
     ///
     /// Only messages injected with pi's `deliverAs: "steer"`
-    /// ([`cyrup_ext::host::HostServices::inject_message_steer`]) steer. A turn-triggering one keeps
-    /// waiting for the idle edge (the pump's documented turn-boundary contract), and so does a
-    /// plain no-turn message: pi defers `{ triggerTurn: false }` on a streaming session instead of
+    /// ([`cyrup_ext::host::HostServices::inject_message_steer`]) steer here. A turn-triggering one
+    /// is queued onto the run by [`Self::queue_turn_injections_onto_live_run`] (SUBA-229). A plain
+    /// no-turn message keeps waiting for the idle edge: pi defers `{ triggerTurn: false }` on a streaming session instead of
     /// steering it (`_pendingCustomMessages`, `agent-session.ts:1962-1967`), because a steer the
     /// model answers can extend the run — which a notice that asked for no turn must never do.
     pub(super) fn steer_injections_onto_live_run(
@@ -320,6 +338,86 @@ impl AgentSession {
         let msg = steer_message(message)?;
         self.agent.steer(msg.clone());
         Some(msg)
+    }
+
+    /// SUBA-229 — queue the turn-triggering injections in `inbox` onto the LIVE run, as pi's
+    /// `sendCustomMessage` does while `isStreaming` (branch 2 of [`Route`]): a completion or an
+    /// intercom message that asks for a turn joins the run that is going — at its next steering
+    /// boundary, or in the post-`agent_end` gap through the continuation `_handlePostAgentRun`
+    /// starts for queued messages (`agent-session.ts:1009-1012` @v0.87.1). pi-subagents' completion
+    /// is `pi.sendMessage({ customType: "subagent-notify", … }, { triggerTurn })` with no
+    /// `deliverAs` (`sendCompletion`, `src/runs/background/notify.ts:631-639` @ad11b7ab), so it
+    /// steers. The pump used to hold every such message until the session was idle and then start
+    /// a run of its own: one extra run per completion that arrived mid-run.
+    ///
+    /// The turn half of the inbox ([`split_by_group_trigger`]) is merged exactly as at the idle
+    /// edge (SUBA-017: a fan-out is ONE message), routed through [`route`] and queued, and each
+    /// merged message stays owned with its requests in `queued` ([`QueuedTurn`]) until its fate is
+    /// settled. The no-turn half stays in `inbox`, handled as before.
+    ///
+    /// [CYRUP-DELTA] coalescing across arrivals: pi steers each `sendMessage` as it is made
+    /// (pi-subagents batches its own completions before sending). Here, when more arrive before
+    /// the run has drained what this pump queued, the undrained turns are taken back
+    /// ([`settle_all`]) and merged again with the new arrivals, so a fan-out whose completions land
+    /// one by one while the model is busy still reaches the run's next boundary as one message.
+    /// Nothing is taken back when the inbox holds nothing that would merge into the turn.
+    pub(super) fn queue_turn_injections_onto_live_run(
+        &self,
+        inbox: &mut Vec<InjectRequest>,
+        queued: &mut Vec<QueuedTurn>,
+        ids: &mut TurnIds,
+    ) {
+        let joins_turn = |req: &InjectRequest| {
+            req.message.trigger_turn || queued.iter().any(|turn| turn.merges_with(&req.message))
+        };
+        if !inbox.iter().any(joins_turn) {
+            return;
+        }
+        let run_active = self.is_run_active();
+        if !run_active {
+            return;
+        }
+        let mut all = settle_all(queued, &self.agent);
+        all.append(inbox);
+        let (durable, turn) = split_by_group_trigger(all);
+        *inbox = durable;
+        for TurnGroup { message, requests } in merge_turn_groups(turn) {
+            // A group's `deliverAs`: the pump's producers have no `followUp` or `nextTurn`, and a
+            // member injected with pi's `deliverAs: "steer"` steers its group.
+            let deliver_as = requests
+                .iter()
+                .any(|req| req.message.steer)
+                .then_some(crate::event::DeliverAs::Steer);
+            let lane = match route(deliver_as, Some(true), run_active) {
+                Route::Steer => Lane::Steer,
+                Route::FollowUp => Lane::FollowUp,
+                // Not a live-run route: the idle edge delivers it, as before SUBA-229.
+                Route::NextTurn | Route::RunTurn | Route::Defer | Route::AppendIdle => {
+                    inbox.extend(requests);
+                    continue;
+                }
+            };
+            #[cfg(test)]
+            self.live_turn_probe.fire_before_queue(self);
+            queued.push(QueuedTurn::queue(&self.agent, lane, message, requests, ids));
+        }
+        #[cfg(test)]
+        self.live_turn_probe.publish(queued);
+    }
+
+    /// SUBA-229 — settle every turn this pump queued onto a run ([`settle_all`]): drained ones are
+    /// answered as delivered, and the requests of any still queued are returned, ahead of
+    /// `later` (they arrived first), for the pump to deliver itself.
+    pub(super) fn settle_queued_turns(
+        &self,
+        queued: &mut Vec<QueuedTurn>,
+        later: Vec<InjectRequest>,
+    ) -> Vec<InjectRequest> {
+        let mut reclaimed = settle_all(queued, &self.agent);
+        reclaimed.extend(later);
+        #[cfg(test)]
+        self.live_turn_probe.publish(queued);
+        reclaimed
     }
 
     /// Append no-turn custom messages to the session tree AND the agent's transcript, as ONE
@@ -511,6 +609,49 @@ impl MergeGroup {
         self.trigger_turn = self.trigger_turn || message.trigger_turn;
         self.bodies.push(message.content.clone());
     }
+
+    /// The index of the group in `groups` that `message` merges into, if any: the first-arrival
+    /// detail-free group of its [`merge_key`]. A group formed by a message that carries `details`
+    /// has `details: Some` and so is never joined: `merge_key` is `None` for it, and only same-key,
+    /// detail-free groups match. The ONE grouping rule, shared by [`merge_injection_batch`] and
+    /// [`merge_turn_groups`].
+    fn position_in<'a>(
+        groups: impl IntoIterator<Item = &'a Self>,
+        message: &crate::host_services::InjectMessage,
+    ) -> Option<usize> {
+        let key = merge_key(message)?;
+        groups
+            .into_iter()
+            .position(|group| group.details.is_none() && group.custom_type.as_deref() == Some(key))
+    }
+
+    /// The single message this group becomes, and whether its group asked for a turn.
+    fn into_message(self) -> (AgentMessage, bool) {
+        let Self {
+            custom_type,
+            display,
+            trigger_turn,
+            bodies,
+            details,
+        } = self;
+        let content = bodies.join("\n\n");
+        let msg = match custom_type {
+            Some(kind) => AgentMessage::Custom {
+                kind,
+                payload: serde_json::Value::String(content),
+                details,
+                // SUBA-094 — pi's `_runAgentPrompt(appMessage)` (`agent-session.ts:1505` @v0.84.4)
+                // runs the turn over the SAME object that carries `display`, and the interactive
+                // host gates drawing on `message.display` (`interactive-mode.ts:3609`), so a
+                // background completion whose predicate said `display: false` (`pi-subagents
+                // notify.ts:402` @v0.64.0) reaches the model and not the screen.
+                display,
+                timestamp: Some(now_ms()),
+            },
+            None => AgentMessage::user_text(content),
+        };
+        (msg, trigger_turn)
+    }
 }
 
 /// The key a message merges under, or `None` when it must stay its own message.
@@ -522,7 +663,7 @@ impl MergeGroup {
 /// without drawing every other member's body under the first member's card. Upstream never has to
 /// choose: each `pi.sendMessage` is its own message. The subagent completion batches this merging
 /// exists for carry no `details`, so they merge exactly as before.
-fn merge_key(message: &crate::host_services::InjectMessage) -> Option<&str> {
+pub(super) fn merge_key(message: &crate::host_services::InjectMessage) -> Option<&str> {
     if message.details.is_some() {
         return None;
     }
@@ -621,14 +762,7 @@ pub(super) fn merge_injection_batch(
     let mut groups: Vec<MergeGroup> = Vec::new();
     for req in inbox {
         let message = &req.message;
-        // A group formed by a message that carries `details` has `details: Some` and so is never
-        // joined: `merge_key` is `None` for it, and only same-key, detail-free groups match.
-        let existing = merge_key(message).and_then(|key| {
-            groups.iter().position(|group| {
-                group.details.is_none() && group.custom_type.as_deref() == Some(key)
-            })
-        });
-        match existing.and_then(|index| groups.get_mut(index)) {
+        match MergeGroup::position_in(&groups, message).and_then(|index| groups.get_mut(index)) {
             Some(group) => group.absorb(message),
             None => groups.push(MergeGroup::new(message)),
         }
@@ -636,29 +770,7 @@ pub(super) fn merge_injection_batch(
 
     let mut plan = InjectionPlan::default();
     for group in groups {
-        let MergeGroup {
-            custom_type,
-            display,
-            trigger_turn,
-            bodies,
-            details,
-        } = group;
-        let content = bodies.join("\n\n");
-        let msg = match custom_type {
-            Some(kind) => AgentMessage::Custom {
-                kind,
-                payload: serde_json::Value::String(content),
-                details,
-                // SUBA-094 — pi's `_runAgentPrompt(appMessage)` (`agent-session.ts:1505` @v0.84.4)
-                // runs the turn over the SAME object that carries `display`, and the interactive
-                // host gates drawing on `message.display` (`interactive-mode.ts:3609`), so a
-                // background completion whose predicate said `display: false` (`pi-subagents
-                // notify.ts:402` @v0.64.0) reaches the model and not the screen.
-                display,
-                timestamp: Some(now_ms()),
-            },
-            None => AgentMessage::user_text(content),
-        };
+        let (msg, trigger_turn) = group.into_message();
         if trigger_turn {
             plan.turn.push(msg);
         } else {
@@ -668,13 +780,51 @@ pub(super) fn merge_injection_batch(
     plan
 }
 
+/// One merge group of a turn half: the merged message and the requests merged into it.
+#[derive(Debug)]
+pub(super) struct TurnGroup {
+    pub(super) message: AgentMessage,
+    pub(super) requests: Vec<InjectRequest>,
+}
+
+/// SUBA-229 — [`merge_injection_batch`] over requests, keeping each merged message WITH the
+/// requests it carries, which a turn queued onto a live run needs ([`QueuedTurn`]). Same grouping
+/// ([`MergeGroup::position_in`]) and same merge ([`MergeGroup::into_message`]), so over a turn half
+/// the messages are exactly `merge_injection_batch(..).turn`, in the same order.
+pub(super) fn merge_turn_groups(requests: Vec<InjectRequest>) -> Vec<TurnGroup> {
+    let mut groups: Vec<(MergeGroup, Vec<InjectRequest>)> = Vec::new();
+    for req in requests {
+        match MergeGroup::position_in(groups.iter().map(|(group, _)| group), &req.message)
+            .and_then(|index| groups.get_mut(index))
+        {
+            Some((group, members)) => {
+                group.absorb(&req.message);
+                members.push(req);
+            }
+            None => groups.push((MergeGroup::new(&req.message), vec![req])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(group, requests)| TurnGroup {
+            message: group.into_message().0,
+            requests,
+        })
+        .collect()
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     //! SUBA-017 — `merge_injection_batch` is the only thing between a fan-out's N completions and
     //! N turns, and it had no test. Each test names the mutation it kills.
 
-    use super::{InjectionPlan, merge_injection_batch, split_by_group_trigger};
+    use super::{InjectionPlan, merge_injection_batch, merge_turn_groups, split_by_group_trigger};
     use crate::host_services::{InjectAck, InjectMessage, InjectRequest};
     use cyrup_agent::AgentMessage;
 
@@ -872,6 +1022,47 @@ mod tests {
                 Some(serde_json::json!({ "card": "m1" })),
                 Some(serde_json::json!({ "card": "m2" })),
                 None
+            ]
+        );
+    }
+    /// SUBA-229 — `merge_turn_groups` yields exactly `merge_injection_batch`'s turn half, with each
+    /// message carrying the requests merged into it. Kills: a grouping rule that differs from the
+    /// merge's (a details-carrying member absorbed, a user message merged, groups reordered).
+    #[test]
+    fn merge_turn_groups_matches_the_merge_and_keeps_each_groups_requests() {
+        let with_details = |body: &str| {
+            let mut r = req(Some("intercom_message"), body, true, true);
+            r.message.details = Some(serde_json::json!({ "card": body }));
+            r
+        };
+        let inbox = vec![
+            req(Some("subagent-notify"), "c1", false, true),
+            with_details("m1"),
+            req(None, "u1", true, true),
+            req(Some("subagent-notify"), "c2", false, false),
+            req(Some("intercom_message"), "plain", true, true),
+            req(Some("subagent-notify"), "c3", false, true),
+        ];
+        let expected = shapes(&merge_injection_batch(&inbox).turn);
+        let groups = merge_turn_groups(inbox);
+        let messages: Vec<_> = groups.iter().map(|g| g.message.clone()).collect();
+        assert_eq!(shapes(&messages), expected);
+        let bodies: Vec<Vec<String>> = groups
+            .iter()
+            .map(|g| {
+                g.requests
+                    .iter()
+                    .map(|r| r.message.content.clone())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                vec!["c1", "c2", "c3"],
+                vec!["m1"],
+                vec!["u1"],
+                vec!["plain"],
             ]
         );
     }
