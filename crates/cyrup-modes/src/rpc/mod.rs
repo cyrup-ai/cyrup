@@ -22,7 +22,7 @@
 //! one it is rejected. While not streaming, `prompt` starts a fresh run. The active session's
 //! `prompt_with` performs this preflight (the `input` ext event + steer/follow-up routing).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -590,6 +590,23 @@ where
     // `agent_end` reordering race that a drain-time set would introduce).
     let mut dispatches = FuturesUnordered::new();
 
+    // SEAM-158: the run-control command (`prompt`/`steer`/`follow_up`) in progress, on a TASK of
+    // its own. Its preparation runs the `before_agent_start` chain, and a handler there may open a
+    // dialog — a synchronous host call that parks whatever thread runs it until the client answers,
+    // and only this loop forwards the dialog (`ui_rx`) and reads the answer (`cmd_rx`). Awaited in
+    // the command arm, or even polled here, it parked the loop itself: the host wrote no line, not
+    // even the `prompt` response, until the dialog gave up. pi's `case "prompt"` is `void
+    // session.prompt(…, { preflightResult })` and returns at once (rpc-mode.ts:394-414 @v1.0.4).
+    //
+    // What inline dispatch protected is kept (see [`is_inline_command`]): while this is `Some`,
+    // `events` and the rebind are NOT polled (their arms are guarded on it), so `in_flight` is still
+    // set before the run's first event is read. And every later line except a dialog answer waits in
+    // `inline_backlog` and is serviced in order afterwards, as it was when the loop simply blocked —
+    // so a `clear_queue` after a `steer`, or a command after an extension's session swap, sees the
+    // state that command left.
+    let mut inline: Option<tokio::task::JoinHandle<(Dispatched, bool)>> = None;
+    let mut inline_backlog: VecDeque<String> = VecDeque::new();
+
     loop {
         tokio::select! {
             maybe_line = cmd_rx.recv(), if reader_open => {
@@ -610,6 +627,13 @@ where
                             }
                             continue;
                         }
+                        // SEAM-158: a run-control command is still preparing — this line waits its
+                        // turn (only a dialog answer, intercepted above, may pass it).
+                        // Ahead of the rebind below, which must not run under the pending command.
+                        if inline.is_some() || !inline_backlog.is_empty() {
+                            inline_backlog.push_back(line);
+                            continue;
+                        }
                         // SEAM-022: a replacement may have landed since this arm last ran (the
                         // generation arm below is one of several ready branches `select!` picks
                         // between at random). Settle it BEFORE the line is serviced so the command
@@ -623,16 +647,15 @@ where
                             ).await;
                         }
                         if is_inline_command(&line) {
-                            // Run-control commands are fast (preflight/enqueue) and own `in_flight`;
-                            // dispatch inline so the flag is set before `events` is next polled.
-                            // They can still REPLACE the session — a `/slash` extension command
-                            // arrives as a `prompt` and its handler may call `ctx.newSession()` —
-                            // which the generation check at the top of the next iteration settles.
-                            let dispatched =
-                                dispatch(runtime, &session, &line, &mut in_flight).await;
-                            let _ = out.send(RpcOut::Response(dispatched.response));
-                            // Pi's post-command `await checkShutdownRequested()` (rpc-mode.ts:786).
-                            shutdown_checkpoint = true;
+                            // Run-control commands own `in_flight`; they run as the loop's one
+                            // `inline` task (see its declaration), which keeps the flag set before
+                            // `events` is next polled. They can still REPLACE the session — a
+                            // `/slash` extension command arrives as a `prompt` and its handler may
+                            // call `ctx.newSession()` — which the generation check settles.
+                            inline = Some(tokio::spawn(dispatch_run_control(
+                                Arc::clone(&session),
+                                line,
+                            )));
                         } else {
                             // Everything else — including the blocking `bash`/`compact`/`export_html`
                             // and the session-replacing `new_session`/`switch_session`/`fork`/`clone`
@@ -666,7 +689,24 @@ where
                 // concurrent-dispatch twin of the inline arm above.
                 shutdown_checkpoint = true;
             }
-            Ok(()) = gen_rx.changed() => {
+            joined = async {
+                match inline.as_mut() {
+                    Some(running) => running.await,
+                    None => std::future::pending().await,
+                }
+            }, if inline.is_some() => {
+                inline = None;
+                // A panicked dispatch has no response to write; the line is lost as it would have
+                // been had the panic unwound through the inline await.
+                if let Ok((dispatched, started_run)) = joined {
+                    // The flag the inline arm used to set through `&mut in_flight`; only ever set.
+                    in_flight |= started_run;
+                    let _ = out.send(RpcOut::Response(dispatched.response));
+                }
+                // Pi's post-command `await checkShutdownRequested()` (rpc-mode.ts:786).
+                shutdown_checkpoint = true;
+            }
+            Ok(()) = gen_rx.changed(), if inline.is_none() => {
                 // SEAM-022: the runtime replaced the active session — Pi's `rebindSession()`
                 // (rpc-mode.ts:316-360), which its runtime invokes from `finishSessionReplacement`
                 // for all six replacement paths. Fires for an extension-triggered swap just as much
@@ -712,7 +752,7 @@ where
                     let _ = out.send(RpcOut::ExtensionUiRequest(wire));
                 }
             }
-            maybe_ev = events.next() => {
+            maybe_ev = events.next(), if inline.is_none() => {
                 if let Some(ev) = maybe_ev {
                     // SEAM-005: a run is "in flight" until it SETTLES, not until its first
                     // `agent_end`. `agent_end` fires once per agent loop, so an auto-retry / post-run
@@ -753,6 +793,26 @@ where
             }
         }
 
+        // SEAM-158: the lines that waited behind a run-control command are serviced, in order, once
+        // it has answered — each after any replacement it caused is settled, exactly as the command
+        // arm does for a fresh line — until the next run-control command takes the slot again.
+        while inline.is_none()
+            && let Some(line) = inline_backlog.pop_front()
+        {
+            if gen_rx.has_changed().unwrap_or(false) {
+                gen_rx.mark_unchanged();
+                rebind_session(runtime, &mut session, &mut events, &sinks, &mut in_flight).await;
+            }
+            if is_inline_command(&line) {
+                inline = Some(tokio::spawn(dispatch_run_control(
+                    Arc::clone(&session),
+                    line,
+                )));
+            } else {
+                dispatches.push(dispatch_owned(runtime, Arc::clone(&session), line));
+            }
+        }
+
         shutdown_requested |= session.shutdown_requested();
         if shutdown_requested && shutdown_checkpoint && !in_flight {
             // Pi `checkShutdownRequested` (rpc-mode.ts:363-372): stop reading, let the loop's own
@@ -760,7 +820,13 @@ where
             reader_open = false;
         }
 
-        if !reader_open && ((!in_flight && dispatches.is_empty()) || eof_expired) {
+        if !reader_open
+            && ((!in_flight
+                && dispatches.is_empty()
+                && inline.is_none()
+                && inline_backlog.is_empty())
+                || eof_expired)
+        {
             // The reader is at EOF and either everything it started has settled (aborted at EOF,
             // SEAM-154: a run in flight and a running `bash` are cut, not waited for) or the
             // [`EOF_SETTLE_TIMEOUT`] for it ran out. Flush any events already buffered on the
@@ -798,6 +864,10 @@ where
     // This reaps the other case: the `ctx.shutdown()` path, where it is still parked on input.
     if let Some(handle) = reader_task {
         handle.abort();
+    }
+    // A run-control command still preparing when the loop gave up on it (the EOF bound ran out).
+    if let Some(running) = inline {
+        running.abort();
     }
     Ok(())
 }
@@ -867,13 +937,52 @@ async fn dispatch(
     line: &str,
     in_flight: &mut bool,
 ) -> Dispatched {
+    match parse_command(line) {
+        // Whether this command REPLACED the active session is deliberately not inferred here
+        // (SEAM-022): the runtime announces every replacement on its generation watch, which the
+        // run loop observes directly.
+        Ok((cmd, raw_id)) => Dispatched {
+            response: handle(runtime, session, cmd, raw_id, in_flight).await,
+        },
+        Err(response) => Dispatched { response },
+    }
+}
+
+/// SEAM-158 — [`dispatch`] for a run-control command (`prompt`/`steer`/`follow_up`, the
+/// [`is_inline_command`] set), on a task of its own. It owns its session handle, needs no runtime
+/// (the three arms never touch it), and reports whether it set the `in_flight` latch instead of
+/// writing through the loop's borrow. See `rpc_driver`'s `inline` for why it must not run on the
+/// loop's task.
+async fn dispatch_run_control(session: Arc<AgentSession>, line: String) -> (Dispatched, bool) {
+    let mut started_run = false;
+    let response = match parse_command(&line) {
+        Ok((cmd, raw_id)) => {
+            match handle_run_control(&session, cmd, raw_id, &mut started_run).await {
+                Ok(response) => response,
+                // Unreachable through `is_inline_command`, which admits only the three run-control
+                // types; answered rather than assumed.
+                Err((_, raw_id)) => {
+                    RpcResponse::err("unknown", raw_id, "not a run-control command".to_string())
+                }
+            }
+        }
+        Err(response) => response,
+    };
+    (Dispatched { response }, started_run)
+}
+
+/// Steps (1)-(3) of [`dispatch`]: parse, recover the id, deserialize. `Err` is the error response
+/// Pi writes for a line that is not a command it can handle.
+fn parse_command(line: &str) -> Result<(SessionCommand, Option<Value>), RpcResponse> {
     // (1) Parse the raw line. A malformed line is Pi's `"parse"` error with NO id.
     let value: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
-            return Dispatched {
-                response: RpcResponse::err("parse", None, format!("Failed to parse command: {e}")),
-            };
+            return Err(RpcResponse::err(
+                "parse",
+                None,
+                format!("Failed to parse command: {e}"),
+            ));
         }
     };
 
@@ -888,30 +997,17 @@ async fn dispatch(
         Ok(SessionCommand::Unknown) => {
             let name = type_str.unwrap_or_default();
             let message = format!("Unknown command: {name}");
-            Dispatched {
-                response: RpcResponse::err(name, raw_id, message),
-            }
+            Err(RpcResponse::err(name, raw_id, message))
         }
-        Ok(cmd) => {
-            // Whether this command REPLACED the active session is deliberately not inferred here
-            // (SEAM-022): the runtime announces every replacement on its generation watch, which the
-            // run loop observes directly.
-            Dispatched {
-                response: handle(runtime, session, cmd, raw_id, in_flight).await,
-            }
-        }
+        Ok(cmd) => Ok((cmd, raw_id)),
         // A known `type` whose payload failed validation (missing/wrong-typed required field): echo
         // the real command name + the runtime error, NOT `"unknown"`. A missing/`null` `type` tag
         // (serde: "missing field `type`") has no command name to echo — fall back to Pi's default
         // `Unknown command` shaping so it still correlates.
-        Err(e) => match type_str {
-            Some(name) => Dispatched {
-                response: RpcResponse::err(name, raw_id, e.to_string()),
-            },
-            None => Dispatched {
-                response: RpcResponse::err(String::new(), raw_id, "Unknown command: undefined"),
-            },
-        },
+        Err(e) => Err(match type_str {
+            Some(name) => RpcResponse::err(name, raw_id, e.to_string()),
+            None => RpcResponse::err(String::new(), raw_id, "Unknown command: undefined"),
+        }),
     }
 }
 
@@ -940,19 +1036,16 @@ fn latch_if_running(session: &AgentSession, in_flight: &mut bool) {
     }
 }
 
-#[allow(clippy::too_many_lines)] // a faithful 1:1 of Pi's `handleCommand` switch (rpc-mode.ts:385).
-async fn handle(
-    runtime: &AgentSessionRuntime,
+/// The run-control arms of [`handle`] (`prompt`/`steer`/`follow_up`) — split out so SEAM-158's
+/// [`dispatch_run_control`] can run them without a runtime. `Err` hands back any other command,
+/// with its id, untouched.
+async fn handle_run_control(
     session: &AgentSession,
     cmd: SessionCommand,
     raw_id: Option<Value>,
     in_flight: &mut bool,
-) -> RpcResponse {
-    // Pi reads the id once at the top of `handleCommand` (`const id = command.id`, rpc-mode.ts:383);
-    // cyrup recovered it in `dispatch` and threads it in as `raw_id`. Each arm clones it into the
-    // reply (string or number, preserved as-sent).
-    match cmd {
-        // -------------------------------------------------------------- Prompting ----
+) -> Result<RpcResponse, (SessionCommand, Option<Value>)> {
+    Ok(match cmd {
         SessionCommand::Prompt {
             message,
             images,
@@ -991,6 +1084,33 @@ async fn handle(
                     RpcResponse::ok("follow_up", id, None)
                 }
                 Err(e) => RpcResponse::err("follow_up", id, e.to_string()),
+            }
+        }
+        other => return Err((other, raw_id)),
+    })
+}
+
+#[allow(clippy::too_many_lines)] // a faithful 1:1 of Pi's `handleCommand` switch (rpc-mode.ts:385).
+async fn handle(
+    runtime: &AgentSessionRuntime,
+    session: &AgentSession,
+    cmd: SessionCommand,
+    raw_id: Option<Value>,
+    in_flight: &mut bool,
+) -> RpcResponse {
+    // Pi reads the id once at the top of `handleCommand` (`const id = command.id`, rpc-mode.ts:383);
+    // cyrup recovered it in `dispatch` and threads it in as `raw_id`. Each arm clones it into the
+    // reply (string or number, preserved as-sent).
+    match cmd {
+        // -------------------------------------------------------------- Prompting ----
+        // `prompt`/`steer`/`follow_up` live in [`handle_run_control`] (SEAM-158: the loop runs them
+        // on a task of their own, where no runtime is in hand); this arm only routes them there.
+        cmd @ (SessionCommand::Prompt { .. }
+        | SessionCommand::Steer { .. }
+        | SessionCommand::FollowUp { .. }) => {
+            match handle_run_control(session, cmd, raw_id, in_flight).await {
+                Ok(response) => response,
+                Err((_, raw_id)) => RpcResponse::err("unknown", raw_id, "unreachable".to_string()),
             }
         }
         SessionCommand::Abort => {
