@@ -8,7 +8,7 @@
 //!
 //! (`packages/coding-agent/src/core/provider-composer.ts:607-608` @f1b2e77f5). No extension layer
 //! composes here, so the chain is the block's value, then the base's, then (for the name) the id.
-//! Before CFG-113 the composed `WireProvider` carried neither from its base: any block renamed
+//! Before CFG-114 the composed `WireProvider` carried neither from its base: any block renamed
 //! `OpenAI` to `openai` and dropped the provider-level `baseUrl` (PROV-154).
 
 #![allow(

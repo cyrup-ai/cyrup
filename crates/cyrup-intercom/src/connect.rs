@@ -143,6 +143,15 @@ pub struct ConnectSupervisor {
     /// pi `reconnectTimer` (`index.ts:439`). Replacing/clearing it aborts the sleeping task, which
     /// is the cancellation path a shutdown uses.
     timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// How many backoff rungs [`schedule_reconnect`] has ever armed — monotonic, never reset.
+    ///
+    /// [`Self::reconnect_armed`] is a TRANSIENT fact: the rung releases its own slot when it fires
+    /// (rung 0 after 1000 ms), and on a multi-threaded runtime [`handle_disconnect`] publishes its
+    /// waiter rejection and `client = None` before it reaches `schedule_reconnect`. pi's handler is
+    /// one synchronous JS callback, so no observer ever sees between those steps; here one can. An
+    /// observer that needs "the disconnect edge armed the ladder" reads this counter instead, which
+    /// cannot be missed by arriving late (ICOM-088).
+    rungs_armed: AtomicU64,
     /// True while a connect attempt is actually running (pi's non-null `reconnectPromise` as seen
     /// by `scheduleReconnect`'s early return, `index.ts:795`).
     connecting: AtomicBool,
@@ -224,6 +233,13 @@ impl ConnectSupervisor {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_some_and(|h| !h.is_finished())
+    }
+
+    /// Total backoff rungs ever armed by [`schedule_reconnect`] (test/observability accessor; see
+    /// the field doc for why this, not [`Self::reconnect_armed`], is what a late observer reads).
+    #[must_use]
+    pub fn rungs_armed(&self) -> u64 {
+        self.rungs_armed.load(Ordering::SeqCst)
     }
 
     /// The current backoff-ladder index (test/observability accessor).
@@ -420,6 +436,7 @@ pub fn schedule_reconnect(state: &Arc<SharedIntercomState>) {
         let _ = ensure_connected(&state, ConnectReason::Background).await;
     });
     sup.set_timer(Some(handle));
+    sup.rungs_armed.fetch_add(1, Ordering::SeqCst);
 }
 
 /// `ensureConnected(reason)` (`index.ts:810-861`): return the live client, or run exactly one
@@ -917,6 +934,57 @@ mod tests {
             "rung 1 backs off 2000ms; it does not retry immediately"
         );
         shutdown(&state);
+    }
+
+    /// ICOM-088: `reconnect_armed()` is true only while a rung sleeps — rung 0 releases its own slot
+    /// when it fires — so "the edge armed the ladder" must be read off the monotonic
+    /// `rungs_armed()` count, which this pins: one per real arm, none for an idempotent re-schedule
+    /// or a refused one, and still counted after the rung has fired and the slot is empty.
+    #[tokio::test(start_paused = true)]
+    async fn the_arm_count_outlives_the_transient_armed_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        schedule_reconnect(&state);
+        assert_eq!(state.connect.rungs_armed(), 0, "no runtime: nothing armed");
+
+        begin_runtime(&state, unreachable_params(&dir));
+        schedule_reconnect(&state);
+        schedule_reconnect(&state);
+        assert_eq!(
+            state.connect.rungs_armed(),
+            1,
+            "a re-schedule while armed is a no-op"
+        );
+
+        // Rung 0 fires at 1000 ms and its failing attempt arms rung 1 (2000 ms). Same two-step
+        // advance as `a_failing_rung_waits_its_backoff_instead_of_busy_looping`.
+        tokio::time::advance(Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1000)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(state.connect.attempt(), 1);
+        assert_eq!(
+            state.connect.rungs_armed(),
+            2,
+            "the failing rung armed the next one"
+        );
+
+        // Abort the sleeping rung (what a late observer of a SUCCESSFUL respawn sees): the slot is
+        // empty, the count is not.
+        state.connect.set_timer(None);
+        assert!(
+            !state.connect.reconnect_armed(),
+            "the transient slot is empty"
+        );
+        assert_eq!(state.connect.rungs_armed(), 2, "the arm count is not");
+
+        shutdown(&state);
+        schedule_reconnect(&state);
+        assert_eq!(
+            state.connect.rungs_armed(),
+            2,
+            "a refused schedule counts nothing"
+        );
     }
 
     /// `begin_runtime` resets the ladder (pi `reconnectAttempt = 0`, `index.ts:936`) so a new

@@ -99,6 +99,13 @@ fn cursor_after_paint(app: &mut App<TestBackend>, overlay: Field) -> Option<(u16
     Some((pos.x, pos.y))
 }
 
+/// [`cursor_after_paint`] plus the thing that distinguishes "positioned" from "shown": the
+/// backend's cursor VISIBILITY, which `TestBackend` tracks separately from its position.
+fn cursor_state_after_paint(app: &mut App<TestBackend>, overlay: Field) -> ((u16, u16), bool) {
+    let pos = cursor_after_paint(app, overlay).expect("a position is always readable");
+    (pos, app.terminal().backend().cursor_visible())
+}
+
 /// The box this overlay paints into, so a test asserts a cell RELATIVE to it rather than a
 /// hard-coded screen coordinate that a layout change would silently invalidate.
 fn overlay_origin(app: &App<TestBackend>) -> (u16, u16) {
@@ -175,26 +182,69 @@ fn an_overlay_with_no_text_field_leaves_the_cursor_hidden() {
     );
 }
 
-/// The `[CYRUP-DELTA]`: upstream positions the cursor every frame and only SHOWS it when
-/// `showHardwareCursor` is on; ratatui cannot express "positioned but hidden", so cyrup gates the
-/// placement on the same flag. With it off, no position is set.
+/// `showHardwareCursor` gates VISIBILITY, not placement — upstream's `positionHardwareCursor`
+/// always writes the move and only then shows or hides (`tui-main-screen.ts:623-653`). That order
+/// is the whole point: IME composition and assistive tech follow the terminal's real cursor, so a
+/// focused extension field has to own it even when no block is drawn for the eye.
+///
+/// This replaces an earlier test of mine that asserted the opposite — that with the flag off the
+/// caret must NOT arrive. That test encoded a claim I had made without checking: that ratatui
+/// "cannot express positioned but hidden". `Frame` cannot, but the `Backend` trait keeps
+/// `set_cursor_position` and `hide_cursor` apart and `TestBackend` tracks `pos` and `cursor` as
+/// independent fields, so the behaviour is both expressible and, here, assertable.
 #[test]
-fn the_hardware_cursor_setting_gates_the_placement() {
-    // With the flag ON the caret lands, which is the positive control for the gate.
-    let mut on = app();
-    let placed = cursor_after_paint(&mut on, Field::new("name: ", "x", ""));
-    let (ox, oy) = overlay_origin(&on);
-    assert_eq!(placed, Some((ox + 6, oy)));
+fn the_setting_gates_visibility_not_placement() {
+    let caret = |app: &App<TestBackend>| {
+        let (ox, oy) = overlay_origin(app);
+        (ox + 6, oy)
+    };
 
-    // With it OFF nothing calls `set_cursor_position`, so the backend keeps whatever position it
-    // already had — which is NOT the caret cell. The exact leftover value is not a contract, so it
-    // is not asserted.
+    // Flag ON: positioned at the caret and visible — the positive control.
+    let mut on = app();
+    let (pos, visible) = cursor_state_after_paint(&mut on, Field::new("name: ", "x", ""));
+    assert_eq!(pos, caret(&on), "positioned at the caret");
+    assert!(visible, "and shown, because the setting is on");
+
+    // Flag OFF: positioned at the SAME cell, and hidden. This is the row's residual, closed.
     let mut off = app();
     off.state_mut().editor.set_show_hardware_cursor(false);
-    let got = cursor_after_paint(&mut off, Field::new("name: ", "x", ""));
-    assert_ne!(
-        got,
-        Some((ox + 6, oy)),
-        "the placement must be gated on the setting, not unconditional"
+    let (pos, visible) = cursor_state_after_paint(&mut off, Field::new("name: ", "x", ""));
+    assert_eq!(
+        pos,
+        caret(&off),
+        "still positioned at the caret, so IME composition follows the field"
     );
+    assert!(!visible, "but hidden, because the setting is off");
+}
+
+/// The alternate screen paints overlays too, through `Chrome::paint` — so it needs the same order,
+/// and covering only the inline path would have left the feature half-wired in the mode a user
+/// reaches with a single keypress.
+#[test]
+fn the_alternate_screen_positions_the_hidden_caret_as_well() {
+    let mut app = app();
+    app.state_mut().editor.set_show_hardware_cursor(false);
+    let _captured = app.enter_fullscreen_captured().unwrap();
+
+    let (done, _released) = tokio::sync::oneshot::channel();
+    app.state_mut()
+        .overlays
+        .push(Box::new(ExtensionOverlay::new(
+            Box::new(Field::new("name: ", "x", "")),
+            done,
+        )));
+    app.draw().unwrap();
+
+    let (ox, oy) = overlay_origin(&app);
+    // The alternate screen draws on its OWN backend — `enter_fullscreen_captured` hands it a
+    // `rebuild()` of the inline one — so the inline terminal is not the surface to read here.
+    let alt = app.altscreen_for_test().expect("fullscreen is live");
+    let backend = alt.backend_for_test();
+    let pos = backend.cursor_position();
+    assert_eq!(
+        (pos.x, pos.y),
+        (ox + 6, oy),
+        "the fullscreen path positions the caret too"
+    );
+    assert!(!backend.cursor_visible(), "and leaves it hidden");
 }

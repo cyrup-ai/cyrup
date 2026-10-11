@@ -377,7 +377,7 @@ impl SubagentsExtension {
     /// The `test concern|blocker <text>` arm additionally SENDS the recorded warning
     /// (`register-main.ts:371`), which is the caller's job here because the delivery capability is
     /// the extension's, not the runtime's.
-    fn execute_watchdog_command(&self, args: &str, ctx: &HostCtx) -> Option<String> {
+    async fn execute_watchdog_command(&self, args: &str, ctx: &HostCtx) -> Option<String> {
         use crate::watchdog::register_main::{
             WatchdogCommandContext, WatchdogCommandOutcome, handle_watchdog_command,
         };
@@ -395,7 +395,7 @@ impl SubagentsExtension {
                 .and_then(watchdog_model_info),
             thinking_level: services.as_ref().and_then(|s| s.thinking_level()),
         };
-        let (outcome, warning) = handle_watchdog_command(&self.watchdog, args, &command_ctx);
+        let (outcome, warning) = handle_watchdog_command(&self.watchdog, args, &command_ctx).await;
         if let (Some(details), Some(services)) = (warning.as_ref(), services.as_ref()) {
             let message =
                 crate::watchdog::warning_format::create_watchdog_warning_message_from_details(

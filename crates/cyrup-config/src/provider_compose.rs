@@ -28,7 +28,7 @@
 //! `model.api`. Every built-in text provider in `cyrup-provider`'s `providers/all.rs` **is** a
 //! `WireProvider` (they differ only in id/name/baseUrl/catalog/auth), so the composed provider is
 //! built the same way, carrying the base's name and baseUrl unless the block sets its own
-//! (provider-composer.ts:607-608, CFG-113). It declares [`ApiDispatch::Global`]: its registry is
+//! (provider-composer.ts:607-608, CFG-114). It declares [`ApiDispatch::Global`]: its registry is
 //! `streamWith`'s process-wide one, and a model on an api its base's chat catalog lists is the base's
 //! to answer (`supportsBaseApi`, `:582`, `:593-596`), which [`WireProvider`] resolves per request
 //! through [`WireProvider::with_operations_from`]. So a miss reports pi's text on both branches
@@ -469,7 +469,7 @@ impl ModelFile {
             // registration is its own provider). The URL is the block's `baseUrl` even under
             // `oauth` — deliberately NOT `model_base_url_override`, which drops it for the ROWS
             // (:326, the block's URL is then the auth gateway); the provider's own `baseUrl` takes
-            // it either way. CFG-113.
+            // it either way. CFG-114.
             //
             // An `oauth` block's base is pi's radius provider, named `config.name ?? providerId`
             // (`model-runtime.ts:263-276`), not the built-in cyrup composes over (`[CYRUP-DELTA]`

@@ -115,6 +115,12 @@ async fn a_broker_drop_reconnects_and_the_session_can_send_again() {
         .register("peer-session".to_string(), "q-inflight".to_string())
         .expect("registers the outbound ask");
 
+    let rungs_before = state.connect.rungs_armed();
+    assert_eq!(
+        rungs_before, 0,
+        "a startup connect that succeeded armed nothing"
+    );
+
     // --- FAILURE: the broker dies underneath the live session. ---
     broker.kill().await.expect("kill the broker");
 
@@ -131,9 +137,18 @@ async fn a_broker_drop_reconnects_and_the_session_can_send_again() {
         reason.starts_with("Disconnected while waiting for reply:"),
         "pi's disconnect reason must survive to the caller, got: {reason}"
     );
+    // ICOM-088: NOT `reconnect_armed()`. That is transient — rung 0 releases its slot when it fires
+    // 1000 ms after the edge (a test task descheduled that long under load saw `false`), and
+    // `handle_disconnect` resolves the waiter and nulls the client BEFORE it arms the rung, so a
+    // poll can land in between on a multi-threaded runtime. The arm count is monotonic: once the
+    // edge has armed, no amount of lateness un-observes it, and it stays 0 for a disconnect that
+    // arms nothing (the pre-ICOM-003 `break`).
     assert!(
-        state.connect.reconnect_armed(),
-        "the disconnect edge armed a backoff rung"
+        within(Duration::from_secs(5), || state.connect.rungs_armed()
+            > rungs_before)
+        .await,
+        "the disconnect edge armed a backoff rung (armed before: {rungs_before}, now: {})",
+        state.connect.rungs_armed()
     );
 
     // --- RECOVERY: the ladder fires (rung 0 = 1000 ms), respawns the broker and re-registers. ---

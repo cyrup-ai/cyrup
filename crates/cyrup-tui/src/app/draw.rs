@@ -251,6 +251,17 @@ impl<B: Backend> App<B> {
             }
             self.debug_previous_lines = new_lines;
         }
+        // TUI-123 — upstream's `positionHardwareCursor` order: the move is always written, then the
+        // cursor is shown or hidden (`tui-main-screen.ts:623-653`). `paint_overlays` placed it
+        // through the frame, which also SHOWED it; hide it again here, on the backend, where
+        // position and visibility are separate. The cursor stays where the overlay put it, so IME
+        // composition follows a focused extension field with no block drawn.
+        if state.cursor_positioned_but_hidden() {
+            terminal
+                .backend_mut()
+                .hide_cursor()
+                .map_err(|e| TuiError::Backend(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -510,6 +521,12 @@ impl crate::altscreen::Chrome for FullscreenChrome<'_> {
                 state.regions.images,
             )
         })
+    }
+
+    /// The same answer the inline path reads, from the same state — so a mode switch cannot
+    /// change whether a focused extension field keeps the real cursor.
+    fn cursor_positioned_but_hidden(&self) -> bool {
+        self.state.cursor_positioned_but_hidden()
     }
 
     fn paint(&mut self, frame: &mut Frame) {

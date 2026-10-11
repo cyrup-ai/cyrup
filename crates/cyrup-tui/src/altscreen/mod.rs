@@ -521,6 +521,13 @@ pub(crate) trait Chrome {
 
     /// Paint the dock (editor, selector, footer, ...), the startup hints and the overlays.
     fn paint(&mut self, frame: &mut Frame);
+
+    /// TUI-123 — did [`Chrome::paint`] just position the terminal cursor for an extension overlay
+    /// while the hardware cursor is turned OFF? Asked after the frame is flushed, because the
+    /// cursor must then be hidden WITHOUT being moved back, and `Frame::set_cursor_position`
+    /// cannot express that. The renderer cannot work this out itself: the overlays and the
+    /// editor's `showHardwareCursor` both live in the chrome's state.
+    fn cursor_positioned_but_hidden(&self) -> bool;
 }
 
 impl<B: Backend> AltScreen<B> {
@@ -1019,6 +1026,16 @@ impl<B: Backend> AltScreen<B> {
                 *painted = screen::ScreenRows::capture(frame.buffer_mut());
             })
             .map_err(|e| TuiError::Backend(e.to_string()))?;
+        // TUI-123 — the alternate screen paints overlays too (`Chrome::paint`), so it needs the
+        // same `positionHardwareCursor` order as the inline path: the move always written, then
+        // shown or hidden (`tui-main-screen.ts:623-653`). Issued on the BACKEND, after the flush,
+        // because the frame API conflates placing with showing.
+        if chrome.cursor_positioned_but_hidden() {
+            term.terminal_mut()
+                .backend_mut()
+                .hide_cursor()
+                .map_err(|e| TuiError::Backend(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -1031,6 +1048,11 @@ impl<B: Backend> AltScreen<B> {
             screen: Rect,
         }
         impl Chrome for Bare<'_> {
+            /// No dock and no overlays, so nothing here ever claims the cursor.
+            fn cursor_positioned_but_hidden(&self) -> bool {
+                false
+            }
+
             fn layout(&mut self, screen: Rect) -> Rect {
                 self.screen = screen;
                 screen

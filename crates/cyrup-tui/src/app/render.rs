@@ -249,15 +249,15 @@ pub(crate) fn paint_overlays(frame: &mut Frame, state: &mut AppState, area: Rect
     // reverse-video cell and the terminal's real cursor stayed wherever the editor left it, which
     // is what IME composition and assistive tech follow.
     //
-    // `[CYRUP-DELTA]` upstream POSITIONS the cursor at the marker on every frame and only SHOWS it
-    // when `showHardwareCursor` is on (`positionHardwareCursor`, `tui-main-screen.ts:623-653`:
-    // it always writes the move, then `showCursor()` or `hideCursor()`). ratatui cannot express
-    // "positioned but hidden" — `Frame::set_cursor_position` both places and shows it, and not
-    // calling it hides it, which is the whole gate the editor relies on
-    // (`editor/render.rs:627-633`). So cyrup gates the PLACEMENT on the same flag. The residual:
-    // with the hardware cursor off, IME composition does not follow an extension's text field,
-    // where upstream's would. Closing that needs a backend-level cursor move outside the frame
-    // abstraction, which is a bigger change than this row.
+    // Upstream POSITIONS the cursor at the marker on every frame and only SHOWS it when
+    // `showHardwareCursor` is on (`positionHardwareCursor`, `tui-main-screen.ts:623-653`: it
+    // always writes the move, then `showCursor()` or `hideCursor()`), which is what lets IME
+    // composition follow a focused field even when no block is drawn. So the placement here is
+    // UNCONDITIONAL, as upstream's is; the hide is issued on the backend after the frame is
+    // flushed, because `Frame::set_cursor_position` conflates placing with showing while the
+    // `Backend` trait keeps them apart. See [`AppState::cursor_positioned_but_hidden`], which both
+    // draw paths read — the inline one and the alternate screen, which paints overlays through
+    // `Chrome::paint`.
     let mut cursor = None;
     for overlay in state.overlays.iter_mut() {
         overlay.render(frame, area, &state.theme);
@@ -265,9 +265,8 @@ pub(crate) fn paint_overlays(frame: &mut Frame, state: &mut AppState, area: Rect
             cursor = Some(cell);
         }
     }
-    if state.editor.show_hardware_cursor()
-        && let Some((x, y)) = cursor
-    {
+    state.overlay_cursor_cell = cursor;
+    if let Some((x, y)) = cursor {
         frame.set_cursor_position((x, y));
     }
 }

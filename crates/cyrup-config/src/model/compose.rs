@@ -130,7 +130,7 @@ pub fn models_json_provider_is_configured(
 /// so `is_none()` is the exact negation of Pi's `=== "radius"`.
 ///
 /// This is the ROWS' override, not the composed provider's own `baseUrl` (pi :608, which takes the
-/// block's value even under `oauth`; see `ModelFile::compose_providers`, CFG-113).
+/// block's value even under `oauth`; see `ModelFile::compose_providers`, CFG-114).
 pub(crate) fn model_base_url_override(config: &ProviderConfig) -> Option<&str> {
     config
         .base_url

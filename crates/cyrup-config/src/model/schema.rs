@@ -42,7 +42,7 @@ pub struct ProviderConfig {
     /// OAuth auth mode (Pi `ProviderConfigSchema.oauth`, model-config.ts:194). Setting it makes
     /// `baseUrl` mandatory (`provider-composer.ts:306-308` @f1b2e77f5) because that URL is the auth
     /// GATEWAY, and for the same reason keeps the block's `baseUrl` off every MODEL row (`:326`),
-    /// though the composed provider's own `baseUrl` still takes it (`:608`, CFG-113), and its name is
+    /// though the composed provider's own `baseUrl` still takes it (`:608`, CFG-114), and its name is
     /// the block's or the id, never the built-in's (pi's radius base, `model-runtime.ts:263-276`).
     /// It also counts as a distinguishing key in the empty-block guard (`:310-323`, the `oauth` key
     /// at `:317`).
