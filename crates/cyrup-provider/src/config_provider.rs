@@ -6,7 +6,7 @@
 //! falls through to the process-wide api registry (`provider-composer.ts:583-603`): this provider
 //! declares [`ApiDispatch::Global`], so a miss reports pi's `No API provider registered for api:
 //! <api>` (PROV-157). A registration over a BUILT-IN id is composed over that base upstream; cyrup's
-//! `ConfigProvider` has no base, which is the EXT-M07 composition gap, not a dispatch question.
+//! `ConfigProvider` has no base, which is the composition gap `PROV-162`, not a dispatch question.
 //!
 //! cyrup streams through a concrete [`Provider`] per provider id, so a guest registration is realized
 //! as a `ConfigProvider`: a static catalog + an api-key auth + an in-memory credential store seeded

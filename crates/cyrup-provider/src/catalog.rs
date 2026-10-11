@@ -142,7 +142,7 @@ pub use cyrup_core::DEFAULT_IMAGE_RESIZE;
 /// [`apply_prompt_cache_metadata`].** Upstream really does inject `inputLimits` at generation
 /// time, at exactly two call sites: once over the chat rows (`:3359`, inside the loop over
 /// `allModels`, which holds chat rows only, `:2723`) and again over the OpenRouter IMAGE rows
-/// (`:3377`). Classifier rows are assembled after both loops (`:3379-3392`) and are never stamped,
+/// (`:3377`). Classifier rows are assembled after both loops (`:3381-3392`) and are never stamped,
 /// so no wrapper here takes a [`ClassifierModel`] (PROV-158). Its numbers are pinned by upstream's
 /// own assertions (`packages/ai/test/providers.test.ts:104-137`).
 ///
@@ -227,7 +227,7 @@ pub(crate) fn apply_image_input_metadata_to_image(model: &mut ImageModel) {
 /// `read.ts:91`, `?? fallbackResizeOptions`) that pi's bare row would leave in charge.
 ///
 /// A classifier row is left VERBATIM (PROV-158). The generator never stamps one — it assembles them
-/// after both loops (`:3379-3392`) — so a replay there is not a no-op: it rewrote pi.dev's own
+/// after both loops (`:3381-3392`) — so a replay there is not a no-op: it rewrote pi.dev's own
 /// image-capable `gpt-6-luna`. Verbatim is also how [`load_classifier_catalog`] reads the floor;
 /// `tests::catalog_data`'s `every_classifier_catalog_reads_identically_through_the_overlay_parser`
 /// holds the two readers together.

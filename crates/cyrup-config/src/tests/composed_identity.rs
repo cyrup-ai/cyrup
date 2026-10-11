@@ -92,16 +92,24 @@ fn the_blocks_name_and_base_url_win_over_the_bases() {
 /// The provider's own `baseUrl` takes the block's value even under `oauth` (`:608` reads
 /// `config?.baseUrl` unconditionally), while the ROWS keep theirs there (`:326`: `config.oauth ===
 /// "radius" ? model.baseUrl : …`). The two URLs differ by design: the block's is the auth gateway.
-/// pi's expected value is the same whatever the base (it replaces the base of an `oauth: "radius"`
-/// block with `radiusProvider`, which has no `baseUrl`, `model-runtime.ts:263-276`; cyrup keeps the
-/// built-in base, `[CYRUP-DELTA]` in `model/schema.rs`), because the block's value comes first.
+///
+/// The NAME is where the base matters: pi replaces an `oauth: "radius"` block's base with
+/// `radiusProvider({ id, name: config.name ?? providerId, … })` (`model-runtime.ts:263-276`
+/// @f1b2e77f5), so `config?.name ?? base?.name` (`:607`) is the block's name or the id — never the
+/// built-in's, which cyrup still composes over (`[CYRUP-DELTA]` in `model/schema.rs`). Red at the
+/// base of the round-2 review fix, which named this provider `OpenRouter`.
 #[test]
 fn under_oauth_the_provider_takes_the_blocks_base_url_and_the_rows_keep_theirs() {
     let json = r#"{ "providers": { "openrouter": { "baseUrl": "https://gateway.example/v1", "oauth": "radius" } } }"#;
     assert_eq!(
-        composed(json, "openrouter").1.as_deref(),
-        Some("https://gateway.example/v1")
+        composed(json, "openrouter"),
+        (
+            "openrouter".to_string(),
+            Some("https://gateway.example/v1".to_string())
+        )
     );
+    let named = r#"{ "providers": { "openrouter": { "name": "Gateway", "baseUrl": "https://gateway.example/v1", "oauth": "radius" } } }"#;
+    assert_eq!(composed(named, "openrouter").0, "Gateway");
     let file = model_file(json);
     let (models, _) = compose_provider_registry(
         &file,

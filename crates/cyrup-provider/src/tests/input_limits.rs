@@ -9,7 +9,7 @@
 //! |---|---|
 //! | the three interfaces, and `inputLimits` on `BaseModel` between `input` and `cost` (v1.0.4) | `packages/ai/src/types.ts:1075-1096`, `:1105` |
 //! | `applyImageInputMetadata` + `DEFAULT_IMAGE_RESIZE` | `packages/ai/scripts/generate-models.ts:994-1020`, `:420-425` |
-//! | its two call sites (chat, then OpenRouter images); classifier rows assembled after, unstamped | `generate-models.ts:3359`, `:3377`; `:3379-3392` |
+//! | its two call sites (chat, then OpenRouter images); classifier rows assembled after, unstamped | `generate-models.ts:3359`, `:3377`; `:3381-3392` |
 //! | the oracle for the stamp's numbers | `packages/ai/test/providers.test.ts:111-136` |
 //! | `maxRequestBytes` / `maxPerMessage` / `maxPerRequest` are DESCRIPTIVE | `packages/coding-agent/docs/models.md:89` |
 //!
@@ -175,7 +175,7 @@ fn the_live_overlay_body_keeps_its_profile_on_chat_and_image_rows_alike() {
 /// the same reason: `merge_models` replaces a baseline entry wholesale by id, so a refreshed row
 /// served without `inputLimits` would land with no profile at all and the resizer would silently
 /// see nothing where the embedded row had something. A CLASSIFIER row is never stamped: the
-/// generator assembles those after its stamp loops (`:3379-3392`) and pi.dev serves them bare, so
+/// generator assembles those after its stamp loops (`:3381-3392`) and pi.dev serves them bare, so
 /// the overlay passes one through verbatim, exactly as the embedded floor does (PROV-158).
 ///
 /// It is a FLOOR, not a mechanism: today's pi.dev body is already stamped on every image-capable

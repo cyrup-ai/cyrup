@@ -267,11 +267,18 @@ impl ProviderRegistration {
     /// the returned provider so a guest `registerProvider` model becomes selectable AND streamable in
     /// the assembled run.
     ///
-    /// Per-model wire fields are folded as pi's `modelFromJson` does (`provider-composer.ts:210-249`
-    /// @f1b2e77f5): `api = definition.api ?? providerConfig.api` (`:216`), `baseUrl =
-    /// definition.baseUrl ?? providerConfig.baseUrl` (`:222`), `contextWindow` defaults to 128000 and
-    /// `maxTokens` to 16384 (`:242-243`). A model that resolves no `api` or `baseUrl` is skipped (pi
-    /// throws at `:218`/`:223`; here it is dropped rather than panicking).
+    /// Per-model wire fields are folded as pi's `extensionModelFromDefinition` does
+    /// (`provider-composer.ts:275-298` @f1b2e77f5, reached through `applyExtension` `:341-351`):
+    /// `api = definition.api ?? config.api` (`:283`), `baseUrl = definition.baseUrl ?? config.baseUrl`
+    /// (`:289`). pi's third fallback, a matching row of the base (`?? defaults?.api`,
+    /// `findExtensionModelDefaults`), needs the base a registration is composed over, which cyrup
+    /// does not have (PROV-162).
+    ///
+    /// `[CYRUP-DELTA, intentional]` A model that resolves no `api` or `baseUrl` is skipped, where pi
+    /// throws (`:284-288`, `:290`) and so rejects the whole registration; and an absent
+    /// `contextWindow`/`maxTokens` takes the `models.json` defaults, 128000 and 16384
+    /// (`modelFromJson`, `:242-243`), where pi's extension type requires both
+    /// (`ProviderChatModelConfig`, `:69-70`) and copies the definition as given.
     pub fn build_provider(&self) -> std::sync::Arc<dyn cyrup_provider::Provider> {
         let name = if self.config.name.is_empty() {
             self.id.clone()
@@ -293,7 +300,7 @@ impl ProviderRegistration {
     }
 
     /// Parse this registration's model catalog into concrete [`cyrup_provider::Model`]s (pi
-    /// `modelFromJson`, `provider-composer.ts:210-249` @f1b2e77f5). Open-shaped fields (`thinkingLevelMap`, `compat`) are deserialized
+    /// `extensionModelFromDefinition`, `provider-composer.ts:275-298` @f1b2e77f5). Open-shaped fields (`thinkingLevelMap`, `compat`) are deserialized
     /// from their carried JSON; a malformed block is dropped (never a panic) rather than failing the
     /// whole registration.
     pub fn build_models(&self) -> Vec<cyrup_provider::Model> {
@@ -301,11 +308,11 @@ impl ProviderRegistration {
 
         let mut out: Vec<Model> = Vec::with_capacity(self.config.models.len());
         for m in &self.config.models {
-            // `api = definition.api ?? providerConfig.api` (pi `provider-composer.ts:216`); required.
+            // `api = definition.api ?? config.api` (pi `provider-composer.ts:283`); required.
             let Some(api) = m.api.clone().or_else(|| self.config.api.clone()) else {
                 continue;
             };
-            // `baseUrl = definition.baseUrl ?? providerConfig.baseUrl` (`:222`); required.
+            // `baseUrl = definition.baseUrl ?? config.baseUrl` (`:289`); required.
             let Some(base_url) = m.base_url.clone().or_else(|| self.config.base_url.clone()) else {
                 continue;
             };
@@ -358,6 +365,8 @@ impl ProviderRegistration {
                             .collect()
                     }),
                 },
+                // `[CYRUP-DELTA, intentional]` (see `build_provider`): pi's extension type requires
+                // both; an absent value takes the `models.json` defaults (`:242-243`).
                 context_window: m.context_window.unwrap_or(128_000),
                 max_tokens: m.max_tokens.unwrap_or(16_384),
                 // AGENT-026 / CFG-104 — pi's `extensionModelFromDefinition` spreads the whole

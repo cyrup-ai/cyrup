@@ -1493,9 +1493,11 @@ fn every_builtin_classifies_exactly_when_pi_gives_it_a_classifier_map() {
     );
 }
 
-/// PROV-155 — every `<provider>-classifiers.json` under `providers/catalog/` is some leg's file. A
-/// leg without its file cannot build (`include_str!`), so this catches the converse: generated rows
-/// that nothing loads, which is the defect PROV-155 was filed for.
+/// PROV-155 — GUARD (no unloaded classifier file existed at the base, which this fails only by not
+/// compiling): every `<provider>-classifiers.json` under `providers/catalog/` is some leg's file. A
+/// leg without its file cannot build (`include_str!`), so this catches the converse: a generated
+/// `<id>-classifiers.json` that no leg loads. PROV-155's own defect (missing maps and rows) is
+/// pinned by `every_builtin_classifies_exactly_when_pi_gives_it_a_classifier_map`.
 #[test]
 fn every_classifier_catalog_on_disk_is_a_builtin_leg() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/catalog");

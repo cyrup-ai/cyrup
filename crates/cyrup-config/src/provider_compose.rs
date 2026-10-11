@@ -470,10 +470,17 @@ impl ModelFile {
             // `oauth` — deliberately NOT `model_base_url_override`, which drops it for the ROWS
             // (:326, the block's URL is then the auth gateway); the provider's own `baseUrl` takes
             // it either way. CFG-113.
+            //
+            // An `oauth` block's base is pi's radius provider, named `config.name ?? providerId`
+            // (`model-runtime.ts:263-276`), not the built-in cyrup composes over (`[CYRUP-DELTA]`
+            // in `model/schema.rs`), so its name never falls back to the built-in's.
             let name = config
                 .name
                 .clone()
-                .or_else(|| base.as_ref().map(|b| b.name().to_string()))
+                .or_else(|| match config.oauth {
+                    Some(_) => None,
+                    None => base.as_ref().map(|b| b.name().to_string()),
+                })
                 .unwrap_or_else(|| provider_id.clone());
             let base_url = config
                 .base_url
