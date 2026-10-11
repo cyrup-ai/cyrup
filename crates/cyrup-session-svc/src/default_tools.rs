@@ -39,6 +39,45 @@ use std::sync::Arc;
 
 use cyrup_core::Tool;
 
+/// SEAM-159 — what a configured `defaultTools` name is "new" against when a session is built. pi
+/// compares the setting before and after an in-process `reload()` (`previousDefaultTools`,
+/// `agent-session.ts:3672` @v1.1.0) and has no other case: its resumed session always starts from
+/// the setting (`sdk.ts:294`). cyrup restores a resumed session's recorded loadout, so it needs a
+/// baseline there too, and each case is named here instead of falling out of an `Option` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultToolsBaseline {
+    /// The `/reload` rebuild: every configured name was already offered; the reload itself then
+    /// activates the names the setting newly adds, against the replaced session's own
+    /// `defaultTools` (`AgentSession::activate_added_default_tools`), over the live active set it
+    /// carries across (`AgentSession::restore_live_tools`).
+    Reload,
+    /// A COLD resume (another process, `--continue`/`--resume`): no earlier load to ask and no live
+    /// set, so the baseline is the loadout the session BEGAN with — its first system message's
+    /// declaration — and not the last one, which already reflects the user's own changes (a name the
+    /// user turned off would read as never offered, and come back).
+    FirstSystemMessage,
+    /// A session with no recorded loadout (new, or a transcript that declares none): every
+    /// configured name is new.
+    Fresh,
+}
+
+impl DefaultToolsBaseline {
+    /// The names [`DefaultToolInputs::started_with`] holds for this baseline. A transcript restored
+    /// as [`Self::FirstSystemMessage`] always has a system message (the restored loadout came from
+    /// one), so `None` there can only mean that message declares nothing, which is [`Self::Fresh`].
+    pub(crate) fn started_with(
+        self,
+        configured: &[String],
+        transcript: &[cyrup_session::AgentMessage],
+    ) -> Option<Vec<String>> {
+        match self {
+            Self::Reload => Some(configured.to_vec()),
+            Self::FirstSystemMessage => declared_at_start(transcript),
+            Self::Fresh => None,
+        }
+    }
+}
+
 /// What [`plan`] reads.
 pub(crate) struct DefaultToolInputs<'a> {
     /// Whether the configured names seed the session at all: the selection that remains after any

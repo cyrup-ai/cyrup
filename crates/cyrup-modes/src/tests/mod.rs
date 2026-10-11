@@ -16,6 +16,7 @@ mod support;
 mod json_event;
 mod modes;
 mod rpc_agent_settled;
+mod rpc_before_agent_start_dialog;
 mod rpc_client;
 mod rpc_eof_shutdown;
 mod rpc_host_seam;

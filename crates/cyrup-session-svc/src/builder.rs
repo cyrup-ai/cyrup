@@ -2297,13 +2297,16 @@ impl SessionBuilder {
             // `previousDefaultTools`), and a name turned off since stays off. A session restored
             // from its transcript elsewhere has no earlier load to ask, so it is what the
             // transcript's first system message declared (see [`crate::default_tools`]).
-            let started_with = if self.reload_rebuild {
-                Some(configured.clone())
+            // SEAM-159 — the three cases, each named rather than reached through an `Option`
+            // chain.
+            let baseline = if self.reload_rebuild {
+                crate::default_tools::DefaultToolsBaseline::Reload
+            } else if restored_loadout.is_some() {
+                crate::default_tools::DefaultToolsBaseline::FirstSystemMessage
             } else {
-                restored_loadout
-                    .as_ref()
-                    .and_then(|_| crate::default_tools::declared_at_start(&existing_raw))
+                crate::default_tools::DefaultToolsBaseline::Fresh
             };
+            let started_with = baseline.started_with(&configured, &existing_raw);
             crate::default_tools::plan(
                 &crate::default_tools::DefaultToolInputs {
                     names_apply,

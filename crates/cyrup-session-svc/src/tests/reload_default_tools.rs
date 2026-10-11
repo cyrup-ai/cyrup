@@ -342,3 +342,75 @@ async fn a_resumed_launch_applies_the_modifiers_over_the_saved_loadout() {
         assert_eq!(active, expected, "--tools {tools:?} on a resumed launch");
     }
 }
+
+// ---- SEAM-159: `/reload` keeps the LIVE active set ---------------------------------------------
+//
+// pi `reload()` rebuilds with `activeToolNames: [...this.getActiveToolNames(), ...addedDefaultTools]`
+// (`core/agent-session.ts:3678-3684` @v1.1.0) — the names active right now, not the ones the
+// transcript last recorded. The tests above all ran a turn after `set_active`, which records the
+// change, so they could not see the difference.
+
+/// The SEAM-159 Verify clause. RED at HEAD: `write` came back, because the rebuild restored the
+/// loadout the transcript recorded at the last run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_turned_off_without_a_run_stays_off_across_reload() {
+    let rig = rig("{}", |_| {}).await;
+    rig.turn().await;
+    rig.set_active(&["read", "bash", "edit"]).await;
+    rig.reload_with("{}").await;
+    assert_eq!(rig.active().await, sorted(&["read", "bash", "edit"]));
+}
+
+/// The other direction. RED at HEAD: `grep` was dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_turned_on_without_a_run_stays_on_across_reload() {
+    let rig = rig("{}", |_| {}).await;
+    rig.turn().await;
+    rig.set_active(&["read", "bash", "edit", "write", "grep"])
+        .await;
+    rig.reload_with("{}").await;
+    assert_eq!(
+        rig.active().await,
+        sorted(&["read", "bash", "edit", "write", "grep"])
+    );
+}
+
+/// A cold resume (a new process) has no live set and no earlier `defaultTools` to compare with: the
+/// transcript's recorded loadout is the active set, and its FIRST system message is the baseline a
+/// configured name is new against (`default_tools`' CYRUP-DELTA). A tool turned off before the
+/// resume stays off; a name the setting adds since the session began activates. Passes at HEAD —
+/// the NON-REGRESSION GUARD for the cold-resume baseline the SEAM-159 change makes explicit
+/// (`DefaultToolsBaseline::FirstSystemMessage`); reading the baseline from the LAST loadout instead
+/// turns it red, because `write` is then the off tool's own record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cold_resume_compares_the_setting_with_the_loadout_the_session_began_with() {
+    let first = rig("{}", |_| {}).await;
+    first.turn().await;
+    first.set_active(&["read", "bash", "edit"]).await;
+    first.turn().await;
+    let file = first.runtime.session().await.session_file().await.unwrap();
+    let root = first._tmp.path().to_path_buf();
+
+    let mut cfg = SessionConfig::new(root.join("project"), root.join("agent"));
+    cfg.trust_override = Some(true);
+    cfg.persist = true;
+    let store = Arc::new(InMemorySettingsStore::new());
+    store.seed(
+        SettingsScope::Global,
+        r#"{ "defaultTools": ["+codemode"] }"#,
+    );
+    let factory = Arc::new(
+        SessionFactory::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
+            .settings_store(store)
+            .with_codemode(CodemodeExtension::new(
+                Default::default(),
+                Arc::new(cyrup_codemode_runtime::tool::EngineSandboxFactory),
+            )),
+    );
+    let resumed = AgentSessionRuntime::create(factory, SessionTarget::Resume(file))
+        .await
+        .unwrap();
+    let mut active = resumed.session().await.active_tool_names();
+    active.sort();
+    assert_eq!(active, sorted(&["read", "bash", "edit", "codemode"]));
+}
