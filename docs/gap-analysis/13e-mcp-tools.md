@@ -443,8 +443,9 @@ Its *cyrup at HEAD* paragraph describes the base, where no `tools/call` carried 
     still forwarded.
   - These call the new API and so do not compile at the base. Each is proved by the mutations
     below.
-- **Mutation-proved.** 21 runs, each restored byte-identical (sha256-checked), and each turned a
-  named test red. Unit tests and `cyrup-it` tests were run separately for each mutation:
+- **Mutation-proved.** 22 red runs, each restored byte-identical (sha256-checked), and each
+  turned a named test red. One first-batch spec was malformed (its `old` string matched four
+  times) and was rewritten and re-run. Unit tests and `cyrup-it` tests were run separately for each mutation:
   - drop the stamp (the wire test, the ungated direct test, and the three `cyrup-it` id tests);
   - drop the id at `call_direct` (the ungated direct test, `cyrup-it` direct and search);
   - drop the id at `McpTool::execute` (the gateway unit test, `cyrup-it` gateway);
