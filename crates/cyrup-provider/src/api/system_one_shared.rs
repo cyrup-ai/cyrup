@@ -24,7 +24,8 @@
 use serde_json::{Map, Value};
 
 use super::classifier_shared::{
-    ClassifyError, format_error, parse_classifier_usage, post_classifier_request, required_number,
+    ClassifyError, format_error, js_key_order_map, parse_classifier_usage, post_classifier_request,
+    required_number,
 };
 use crate::classifier::{
     ClassifierAnswer, ClassifierContext, ClassifierModel, ClassifierOptions, ClassifierQuestion,
@@ -74,7 +75,12 @@ pub(crate) fn wire_request(context: &ClassifierContext) -> Map<String, Value> {
         })
         .collect();
     let mut request = Map::new();
-    request.insert("state".to_string(), Value::Object(context.state.clone()));
+    // `state: context.state` is a JS object, so it is already in own-key order when the payload is
+    // handed to `onPayload` (PROV-110 corner (1)); the body is serialized in that order too.
+    request.insert(
+        "state".to_string(),
+        Value::Object(js_key_order_map(&context.state)),
+    );
     request.insert("questions".to_string(), Value::Object(questions));
     request
 }
@@ -204,7 +210,8 @@ pub(crate) async fn classify_system_one(
         }
         let url = (transport.url)(model)?;
         let payload = (transport.payload)(model, wire_request(context));
-        let body = post_classifier_request(transport.label, &url, model, payload, options).await?;
+        let body =
+            post_classifier_request(transport.label, &url, model, payload, options, &[]).await?;
         let result = (transport.output)(body)?;
         if let Some(usage) = parse_classifier_usage(result.get("usage"), model) {
             output.usage = Some(usage);

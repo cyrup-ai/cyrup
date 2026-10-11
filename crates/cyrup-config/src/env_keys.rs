@@ -93,6 +93,8 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "groq" => &["GROQ_API_KEY"],
         "cerebras" => &["CEREBRAS_API_KEY"],
         "xai" => &["XAI_API_KEY"],
+        // env-api-keys.ts:98 @f1b2e77f5 — the classifier-only TypeSafe provider (PROV-153).
+        "typesafe" => &["TYPESAFE_API_KEY"],
         // env-api-keys.ts:92 @v0.83.0. Also missing, and `radius` is a first-class id in cyrup:
         // `default_model_per_provider` (`model.rs`) maps it to `auto` and `models.json`'s
         // `oauth: Type.Literal("radius")` is the only accepted oauth value there.
@@ -114,6 +116,8 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
         "opencode" => &["OPENCODE_API_KEY"],
         "opencode-go" => &["OPENCODE_API_KEY"],
         "kimi-coding" => &["KIMI_API_KEY"],
+        // env-api-keys.ts:116 @f1b2e77f5 — the Meta Model API key (PROV-080).
+        "meta" => &["META_API_KEY"],
         "cloudflare-workers-ai" => &["CLOUDFLARE_API_KEY"],
         "cloudflare-ai-gateway" => &["CLOUDFLARE_API_KEY"],
         "xiaomi" => &["XIAOMI_API_KEY"],
@@ -261,6 +265,7 @@ mod tests {
             ("groq", &["GROQ_API_KEY"]),
             ("cerebras", &["CEREBRAS_API_KEY"]),
             ("xai", &["XAI_API_KEY"]),
+            ("typesafe", &["TYPESAFE_API_KEY"]),
             ("radius", &["RADIUS_API_KEY"]),
             ("openrouter", &["OPENROUTER_API_KEY"]),
             ("vercel-ai-gateway", &["AI_GATEWAY_API_KEY"]),
@@ -278,6 +283,7 @@ mod tests {
             ("opencode", &["OPENCODE_API_KEY"]),
             ("opencode-go", &["OPENCODE_API_KEY"]),
             ("kimi-coding", &["KIMI_API_KEY"]),
+            ("meta", &["META_API_KEY"]),
             ("cloudflare-workers-ai", &["CLOUDFLARE_API_KEY"]),
             ("cloudflare-ai-gateway", &["CLOUDFLARE_API_KEY"]),
             ("xiaomi", &["XIAOMI_API_KEY"]),

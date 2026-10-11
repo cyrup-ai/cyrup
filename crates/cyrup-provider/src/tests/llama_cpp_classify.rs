@@ -359,6 +359,74 @@ async fn a_failed_label_lookup_leaves_no_cache_entry_and_a_resolved_one_stays() 
     );
 }
 
+/// PROV-110 corner (4): the label-token cache's `[CYRUP-DELTA, mechanism]` (a `OnceCell` per key in
+/// place of pi's shared `Promise`, llama-cpp-classify.ts:316-326) must not let a WAITER that is
+/// dropped mid-lookup — a cancelled `classify` — evict the entry another caller is still resolving.
+/// pi deletes an entry only when its promise rejects. Here one call's lookup of label `A` is held
+/// in flight, a second call that is waiting on it is dropped, and a third call arrives while the
+/// first is still resolving: it must wait for the first lookup, not repeat its `/tokenize`. Red
+/// before PROV-110 (the dropped waiter evicted the entry, so the third call sent `\nA` again: 2
+/// requests, not 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_waiter_does_not_evict_an_in_flight_label_lookup() {
+    use super::llama_cpp_classify_fake_server::Reply;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let held = AtomicBool::new(false);
+    let server = FakeServer::with(Behavior::default().intercept(move |request, _| {
+        let first_a = request.path == "/tokenize"
+            && request.body["content"] == "\nA"
+            && !held.swap(true, Ordering::SeqCst);
+        first_a.then(|| Reply::Delayed(Duration::from_secs(3)))
+    }))
+    .await;
+    let classifier_model = model(&server.base_url);
+    let label_a = |server: &FakeServer| {
+        server
+            .requests_to("/tokenize")
+            .iter()
+            .filter(|request| request.body["content"] == "\nA")
+            .count()
+    };
+
+    let first = {
+        let classifier_model = classifier_model.clone();
+        tokio::spawn(async move { classify(&classifier_model, &pick_context(), &options()).await })
+    };
+    for _ in 0..500 {
+        if label_a(&server) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        label_a(&server),
+        1,
+        "the first call's lookup of `A` is in flight"
+    );
+
+    // A second call joins the lookup and is dropped while it waits.
+    let waiter = tokio::time::timeout(
+        Duration::from_millis(300),
+        classify(&classifier_model, &pick_context(), &options()),
+    )
+    .await;
+    assert!(waiter.is_err(), "the waiter was still waiting when dropped");
+
+    // A third call while the first is still resolving: it waits for that lookup.
+    let third = classify(&classifier_model, &pick_context(), &options()).await;
+    let first = first.await.expect("first call");
+
+    assert_eq!(first.stop_reason, ClassifierStopReason::Stop, "{first:?}");
+    assert_eq!(third.stop_reason, ClassifierStopReason::Stop, "{third:?}");
+    assert_eq!(
+        label_a(&server),
+        1,
+        "the dropped waiter evicted the in-flight entry, so the lookup ran twice"
+    );
+}
+
 /// test:306-323
 #[tokio::test]
 async fn validates_option_counts_before_sending_requests() {
@@ -550,7 +618,8 @@ fn computes_typesafes_confidence_and_expected_scores() {
             },
             &["0".to_string(), "1".to_string(), "2".to_string()],
             &[0.2, 0.3, 0.5],
-        ),
+        )
+        .unwrap(),
         ClassifierAnswer::Score {
             score: 1.3,
             confidence: peak_confidence(&[0.2, 0.3, 0.5]),

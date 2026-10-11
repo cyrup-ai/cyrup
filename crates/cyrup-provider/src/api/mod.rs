@@ -61,6 +61,8 @@ pub mod llama_cpp_classify;
 pub mod mistral_conversations;
 pub mod openai_codex_responses;
 pub mod openai_completions;
+/// PROV-147 — OpenAI's Decisions API, the `openai-decisions` classifier api.
+pub mod openai_decisions;
 pub mod openai_responses;
 pub mod openrouter_images;
 pub mod pi_messages;

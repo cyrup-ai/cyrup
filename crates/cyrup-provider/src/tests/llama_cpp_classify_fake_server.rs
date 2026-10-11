@@ -46,6 +46,9 @@ pub(super) const API: &str = "llama-cpp-classify";
 pub(super) struct Recorded {
     pub path: String,
     pub body: Value,
+    /// The body exactly as it arrived, for assertions on its bytes — number spelling and key order
+    /// that a parsed [`Value`] cannot show (PROV-110).
+    pub raw_body: String,
     /// Lower-cased header names.
     pub headers: Vec<(String, String)>,
 }
@@ -72,6 +75,9 @@ pub(super) enum Reply {
     },
     /// Accept the request and never answer.
     Hang,
+    /// Answer normally, but only after this long (PROV-110: holds a lookup in flight while other
+    /// callers arrive).
+    Delayed(Duration),
 }
 
 impl Reply {
@@ -284,11 +290,18 @@ async fn serve(mut stream: TcpStream, behavior: Behavior, log: Arc<Mutex<Vec<Rec
         log.push(request.clone());
         nth
     };
-    let reply = behavior
+    let reply = match behavior
         .intercept
         .as_ref()
         .and_then(|intercept| intercept(&request, nth))
-        .unwrap_or_else(|| respond(&behavior, &request));
+    {
+        Some(Reply::Delayed(delay)) => {
+            tokio::time::sleep(delay).await;
+            respond(&behavior, &request)
+        }
+        Some(reply) => reply,
+        None => respond(&behavior, &request),
+    };
     let (status, headers, body) = match reply {
         Reply::Json(value) => (200, Vec::new(), value.to_string()),
         Reply::Raw {
@@ -300,6 +313,7 @@ async fn serve(mut stream: TcpStream, behavior: Behavior, log: Arc<Mutex<Vec<Rec
             tokio::time::sleep(Duration::from_secs(60)).await;
             return;
         }
+        Reply::Delayed(_) => panic!("`respond` never answers with a delay"),
     };
     let mut head = format!(
         "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
@@ -348,10 +362,12 @@ async fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
-    let body = serde_json::from_slice(&buffer[head_end..head_end + length]).unwrap_or(Value::Null);
+    let raw = &buffer[head_end..head_end + length];
+    let body = serde_json::from_slice(raw).unwrap_or(Value::Null);
     Some(Recorded {
         path,
         body,
+        raw_body: String::from_utf8_lossy(raw).into_owned(),
         headers,
     })
 }

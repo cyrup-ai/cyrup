@@ -698,6 +698,19 @@ impl Provider for RemoteCatalogProvider {
         self.inner.filter_models(models, credential)
     }
 
+    /// PROV-147 — carried by `...provider` with `filterModels`, for the same reason: the trait
+    /// default is the ABSENT member, so without this an overlaid `openai` (every built-in is
+    /// overlaid once a pi.dev catalog is cached) would drop its OAuth policy and list its Decisions
+    /// classifier rows to a Sign in with ChatGPT credential the Decisions API rejects. The models
+    /// handed on are the caller's slice, as for [`Provider::filter_models`].
+    fn filter_all_models(
+        &self,
+        models: &[AnyModel],
+        credential: Option<&crate::auth::Credential>,
+    ) -> Option<Vec<AnyModel>> {
+        self.inner.filter_all_models(models, credential)
+    }
+
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         self.inner.provider_auth()
     }

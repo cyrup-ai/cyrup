@@ -147,6 +147,7 @@ credential, then the environment variable, then a key configured in `models.json
 | `groq` | `GROQ_API_KEY` |
 | `huggingface` | `HF_TOKEN` |
 | `kimi-coding` | `KIMI_API_KEY` |
+| `meta` | `META_API_KEY`; or `/login meta` (Sign in with Meta, a Muse subscription) |
 | `minimax` | `MINIMAX_API_KEY` |
 | `minimax-cn` | `MINIMAX_CN_API_KEY` |
 | `mistral` | `MISTRAL_API_KEY` |
@@ -159,6 +160,7 @@ credential, then the environment variable, then a key configured in `models.json
 | `opencode-go` | `OPENCODE_API_KEY` — the same variable |
 | `openrouter` | `OPENROUTER_API_KEY` |
 | `together` | `TOGETHER_API_KEY` |
+| `typesafe` | `TYPESAFE_API_KEY` — classifier models only |
 | `vercel-ai-gateway` | `AI_GATEWAY_API_KEY` |
 | `xai` | `XAI_API_KEY` |
 | `xiaomi` | `XIAOMI_API_KEY` |

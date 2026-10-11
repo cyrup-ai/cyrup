@@ -34,7 +34,8 @@ fn known_classifier_api_names_the_llama_api() {
         KnownClassifierApi::from_api("llama-cpp-classify"),
         Some(KnownClassifierApi::LlamaCppClassify)
     );
-    // PROV-104: both System One apis are known now; pi's `openai-decisions` is not ported.
+    // PROV-104: both System One apis are known; PROV-147: so is pi's fourth, `openai-decisions`,
+    // last in pi's declaration order (`types.ts:78-83` @f1b2e77f5).
     assert_eq!(
         KnownClassifierApi::from_api("typesafe-system-one"),
         Some(KnownClassifierApi::TypesafeSystemOne)
@@ -43,7 +44,20 @@ fn known_classifier_api_names_the_llama_api() {
         KnownClassifierApi::from_api("cloudflare-workers-ai-system-one"),
         Some(KnownClassifierApi::CloudflareWorkersAiSystemOne)
     );
-    assert_eq!(KnownClassifierApi::from_api("openai-decisions"), None);
+    assert_eq!(
+        KnownClassifierApi::from_api("openai-decisions"),
+        Some(KnownClassifierApi::OpenAiDecisions)
+    );
+    assert_eq!(
+        KnownClassifierApi::ALL.map(KnownClassifierApi::as_str),
+        [
+            "typesafe-system-one",
+            "cloudflare-workers-ai-system-one",
+            "llama-cpp-classify",
+            "openai-decisions",
+        ]
+    );
+    assert_eq!(KnownClassifierApi::from_api("openai-images"), None);
     assert_eq!(
         ApiId::from(KnownClassifierApi::LlamaCppClassify).as_str(),
         "llama-cpp-classify"

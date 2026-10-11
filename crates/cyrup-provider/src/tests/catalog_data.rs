@@ -73,7 +73,7 @@
     clippy::indexing_slicing
 )]
 
-use crate::classifier::ImageModel;
+use crate::classifier::{ClassifierModel, ImageModel, KnownClassifierApi};
 use crate::collection::{CreateModelsOptions, Models, create_models};
 use crate::{Model, all_providers};
 
@@ -122,6 +122,16 @@ fn catalogs() -> Vec<(String, String)> {
 /// `openrouter-images` resolves through the separate images registry (`images/mod.rs:38`).
 const IMAGES_CATALOGS: &[&str] = &["openrouter-images"];
 
+/// The stem suffix of a provider's CLASSIFIER catalog (PROV-147, PROV-153): `<provider>-classifiers`
+/// holds `type: "classifier"` rows, read with [`crate::catalog::load_classifier_catalog`] and owned
+/// by `<provider>` (xtask's `LiveCatalogKind::Classifier`).
+const CLASSIFIER_SUFFIX: &str = "-classifiers";
+
+/// The provider a classifier catalog's stem belongs to, or `None` for any other catalog.
+fn classifier_catalog_owner(stem: &str) -> Option<&str> {
+    stem.strip_suffix(CLASSIFIER_SUFFIX)
+}
+
 /// The guard. Production loaders swallow a parse error into `Vec::default()`, so without this a
 /// typo'd catalog ships as an empty provider. Here the error is surfaced verbatim — for EVERY file
 /// present, not for a list someone remembered to extend.
@@ -142,6 +152,33 @@ const IMAGES_CATALOGS: &[&str] = &["openrouter-images"];
 #[test]
 fn every_embedded_catalog_parses_non_empty() {
     for (name, blob) in catalogs() {
+        if let Some(owner) = classifier_catalog_owner(&name) {
+            // PROV-147 / PROV-153: a classifier catalog through its production loader, with the
+            // parse error surfaced verbatim. Every row must be a classifier of its owner on an api
+            // this build implements, with an endpoint and a window.
+            let models: Vec<ClassifierModel> = crate::catalog::load_classifier_catalog(&blob)
+                .unwrap_or_else(|e| panic!("classifier catalog {name}.json failed to parse: {e}"));
+            assert!(
+                !models.is_empty(),
+                "classifier catalog {name}.json parsed to ZERO models"
+            );
+            for m in &models {
+                assert_eq!(m.provider.as_str(), owner, "{name}: {} provider tag", m.id);
+                assert!(
+                    KnownClassifierApi::from_api(m.api.as_str()).is_some(),
+                    "{name}: {} names classifier api `{}`, which this build does not implement",
+                    m.id,
+                    m.api
+                );
+                assert!(!m.base_url.is_empty(), "{name}: {} has empty baseUrl", m.id);
+                assert!(
+                    m.context_window > 0,
+                    "{name}: {} has zero contextWindow",
+                    m.id
+                );
+            }
+            continue;
+        }
         if IMAGES_CATALOGS.contains(&name.as_str()) {
             // The images half of the same guard, read through the production loader — which also
             // stamps the `type: "image"` discriminant the v0.87.1 extract predates. The loader
@@ -304,8 +341,10 @@ fn the_catalog_file_set_matches_the_registered_providers() {
     expected.sort();
     expected.dedup();
     for name in &on_disk {
+        // A classifier catalog is owned by the provider its stem names (PROV-147, PROV-153).
+        let owner = classifier_catalog_owner(name).unwrap_or(name);
         assert!(
-            expected.contains(name),
+            expected.iter().any(|id| id == owner),
             "catalog {name}.json has no registered provider and is not an images catalog — \
              register it in providers/all.rs or delete the file"
         );
@@ -324,9 +363,31 @@ fn the_catalog_file_set_matches_the_registered_providers() {
 #[test]
 fn every_catalog_row_names_a_registered_api() {
     let registry = crate::api::builtin_registry();
+    let providers = all_providers();
     for (name, blob) in catalogs() {
         if IMAGES_CATALOGS.contains(&name.as_str()) {
             continue; // resolved through the images registry, not the text one
+        }
+        if let Some(owner) = classifier_catalog_owner(&name) {
+            // A classifier row dispatches through its OWNER's `classifiers` map, not the chat api
+            // registry: the owner must classify, and the api must be one this build implements.
+            let provider = providers
+                .iter()
+                .find(|p| p.id().as_str() == owner)
+                .unwrap_or_else(|| panic!("{name}: owner {owner} is not registered"));
+            assert!(
+                provider.supports_classification(),
+                "{name}: {owner} lists classifier rows but cannot classify"
+            );
+            for m in crate::catalog::load_classifier_catalog(&blob).unwrap_or_default() {
+                assert!(
+                    KnownClassifierApi::from_api(m.api.as_str()).is_some(),
+                    "{name}: {} names classifier api `{}` with no implementation",
+                    m.id,
+                    m.api
+                );
+            }
+            continue;
         }
         let models: Vec<Model> = serde_json::from_str(&blob).unwrap_or_default();
         for m in &models {
@@ -387,6 +448,13 @@ fn the_catalog_manifest_matches_the_file_set() {
 /// so no amount of fetching upstream would produce a floor for it.
 pub(crate) const DYNAMIC_ONLY_PROVIDERS: &[&str] = &["radius"];
 
+/// Registered providers with NO chat model by design, because their whole catalog is classifier
+/// rows (PROV-153): `typesafe` — pi's `typesafeProvider()` passes `models:
+/// Object.values(TYPESAFE_CLASSIFIER_MODELS)` and no `api` (`providers/typesafe.ts:6-17`
+/// @f1b2e77f5). Asserted in both directions below, like [`DYNAMIC_ONLY_PROVIDERS`]: such a provider
+/// must list no chat model and at least one classifier row.
+pub(crate) const CLASSIFIER_ONLY_PROVIDERS: &[&str] = &["typesafe"];
+
 /// The same guard one level up: every *registered* provider must expose a non-empty catalog —
 /// except the [`DYNAMIC_ONLY_PROVIDERS`], which must expose an EMPTY one. Catches a loader wired
 /// to the wrong file as well as a bad blob, and a dynamic member that quietly grew embedded rows
@@ -394,8 +462,25 @@ pub(crate) const DYNAMIC_ONLY_PROVIDERS: &[&str] = &["radius"];
 #[test]
 fn every_registered_provider_has_a_non_empty_catalog() {
     let mut empty: Vec<String> = Vec::new();
+    let mut classifier_only: Vec<String> = Vec::new();
     for p in all_providers() {
         let id = p.id().as_str().to_string();
+        if CLASSIFIER_ONLY_PROVIDERS.contains(&id.as_str()) {
+            assert!(
+                p.models().is_empty(),
+                "provider {id} is listed as classifier-only but ships {} chat rows",
+                p.models().len()
+            );
+            assert!(
+                p.get_all_models()
+                    .iter()
+                    .any(|m| m.as_classifier().is_some()),
+                "provider {id} is classifier-only but lists no classifier row — its catalog \
+                 parse likely failed silently"
+            );
+            classifier_only.push(id);
+            continue;
+        }
         if DYNAMIC_ONLY_PROVIDERS.contains(&id.as_str()) {
             assert!(
                 p.models().is_empty(),
@@ -420,6 +505,11 @@ fn every_registered_provider_has_a_non_empty_catalog() {
     assert_eq!(
         empty, expected,
         "every dynamic-only provider must be registered, and nothing else may be empty"
+    );
+    classifier_only.sort();
+    assert_eq!(
+        classifier_only, CLASSIFIER_ONLY_PROVIDERS,
+        "every classifier-only provider must be registered"
     );
 }
 
@@ -1240,9 +1330,17 @@ fn the_catalog_manifest_names_one_revision_per_provider() {
     for (name, entry) in per_provider {
         if !PINNED.contains(&name.as_str()) {
             seen_live.push(name);
+            // A classifier catalog is its owner's endpoint with `?types=classifier` (PROV-147,
+            // PROV-153); every other live catalog is its own provider's endpoint.
+            let expected = match classifier_catalog_owner(name) {
+                Some(owner) => {
+                    format!("https://pi.dev/api/models/providers/{owner}?types=classifier")
+                }
+                None => format!("https://pi.dev/api/models/providers/{name}"),
+            };
             assert_eq!(
                 entry["source"].as_str(),
-                Some(format!("https://pi.dev/api/models/providers/{name}").as_str()),
+                Some(expected.as_str()),
                 "{name}'s source is its OWN live endpoint, not the pinned revision and not \
                  another provider's URL"
             );
@@ -1284,7 +1382,9 @@ fn the_catalog_manifest_names_one_revision_per_provider() {
         per_provider.len() - PINNED.len(),
         "every catalog but the pinned one must be live-fetched (PROV-071)"
     );
-    assert_eq!(seen_live.len(), 38);
+    // 38 provider catalogs, plus `meta` (PROV-080) and the two classifier catalogs
+    // `openai-classifiers` (PROV-147) and `typesafe-classifiers` (PROV-153).
+    assert_eq!(seen_live.len(), 41);
     for name in PINNED {
         assert!(
             per_provider.contains_key(*name),

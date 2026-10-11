@@ -6,9 +6,9 @@ use cyrup_provider::Model;
 /// Curated default model id per known provider (Pi `defaultModelPerProvider`,
 /// `model-resolver.ts:21-62` @f1b2e77f5, v1.1.0-11). Returns `None` for an unknown provider.
 ///
-/// CFG-102 — every row is pi's f1b2e77f5 value except two, each pinned by name in the test below:
-/// `meta` (`muse-spark-1.3`), a provider cyrup does not ship (PROV-080); and pi's `azure` key,
-/// which cyrup still spells `azure-openai-responses` (the rename is PROV-145).
+/// CFG-102 — every row is pi's f1b2e77f5 value under pi's key, except pi's `azure` key, which
+/// cyrup still spells `azure-openai-responses` (the rename is PROV-145), pinned by name in the test
+/// below. `meta` (`muse-spark-1.3`) was the other exception until PROV-080 shipped the provider.
 pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
     let id = match provider {
         "amazon-bedrock" => "us.anthropic.claude-opus-4-6-v1",
@@ -55,6 +55,9 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "opencode" => "kimi-k2.6",
         "opencode-go" => "kimi-k3",
         "kimi-coding" => "kimi-for-coding",
+        // PROV-080 — `meta: "muse-spark-1.3"` (`model-resolver.ts:52` @f1b2e77f5), between
+        // `kimi-coding` and `cloudflare-workers-ai`; the row is in `catalog/meta.json`.
+        "meta" => "muse-spark-1.3",
         "cloudflare-workers-ai" => "@cf/moonshotai/kimi-k2.6",
         "cloudflare-ai-gateway" => "workers-ai/@cf/moonshotai/kimi-k2.6",
         // Alibaba Cloud Model Studio "Token Plan" — two regions, identical catalogs, separate
@@ -107,6 +110,7 @@ const KNOWN_PROVIDERS: &[&str] = &[
     "opencode",
     "opencode-go",
     "kimi-coding",
+    "meta",
     "cloudflare-workers-ai",
     "cloudflare-ai-gateway",
     // Position is load-bearing: [`first_default_or_first`] returns the FIRST provider in this list
@@ -343,13 +347,14 @@ mod tests {
         /// it does not lead it.
         const KEY_RENAMED: &[(&str, &str)] = &[("azure", "azure-openai-responses")];
         /// Rows cyrup does NOT carry at pi's value: `(provider, what cyrup carries)`, where `None`
-        /// means no row at all.
-        /// - `meta`: the Meta Muse provider (pi v0.86.1) is not shipped — area 01 (PROV-080).
+        /// means no row at all. EMPTY since PROV-080 shipped the Meta Muse provider and its
+        /// catalog, which took `meta` off this list; the type stays so the next deferral is a
+        /// one-line edit.
         ///
         /// Every other row is pi's own value. (`openai-codex` left this list in CFG-102: the scoped
         /// `gen-catalogs --only openai-codex` put pi's `gpt-6.1-sol` in the embedded catalog, so
         /// the guard below resolves it.)
-        const DEFERRED: &[(&str, Option<&str>)] = &[("meta", None)];
+        const DEFERRED: &[(&str, Option<&str>)] = &[];
 
         let expected: Vec<(&str, &str)> = PI
             .iter()
@@ -379,7 +384,7 @@ mod tests {
             .map(|p| (*p, default_model_per_provider(p).unwrap_or("<missing>")))
             .collect();
         assert_eq!(ours, expected);
-        assert_eq!(KNOWN_PROVIDERS.len(), 40);
+        assert_eq!(KNOWN_PROVIDERS.len(), 41);
 
         // A deferred row must still be deferred: catching up with pi without removing it from
         // `DEFERRED` fails here.

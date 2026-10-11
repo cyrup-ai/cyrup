@@ -21,6 +21,8 @@ pub mod openrouter;
 pub mod radius;
 pub mod radius_share;
 pub mod together;
+/// PROV-153 — the classifier-only TypeSafe provider.
+pub mod typesafe;
 
 pub use all::{
     BUILTIN_CATALOG_MANIFEST_JSON, all_providers, all_providers_with, all_providers_with_overlay,
@@ -62,7 +64,8 @@ pub use mistral::{
     mistral_provider_with,
 };
 pub use openai::{
-    OPENAI_BASE_URL, OPENAI_PROVIDER_ID, openai_auth, openai_models, openai_provider,
+    OPENAI_BASE_URL, OPENAI_PROVIDER_ID, filter_openai_all_models, openai_auth,
+    openai_classifier_models, openai_classifiers_registry, openai_models, openai_provider,
     openai_provider_with,
 };
 pub use openai_codex::*;
@@ -82,4 +85,8 @@ pub use radius::{
 };
 pub use together::{
     TOGETHER_BASE_URL, together_auth, together_models, together_provider, together_provider_with,
+};
+pub use typesafe::{
+    TYPESAFE_API_KEY_ENV, TYPESAFE_PROVIDER_ID, typesafe_auth, typesafe_classifier_models,
+    typesafe_classifiers_registry, typesafe_provider, typesafe_provider_with,
 };

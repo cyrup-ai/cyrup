@@ -43,12 +43,14 @@ alongside the key, `cloudflare-ai-gateway` adds a gateway ID, and `google-vertex
 
 ## Which providers do OAuth
 
-Six of them: `anthropic`, `kimi-coding`, `xai`, `openrouter`, `github-copilot` and `openai-codex`.
-Everything else is API key only.
+Nine of them: `anthropic`, `kimi-coding`, `meta`, `openai`, `xai`, `openrouter`, `radius`,
+`github-copilot` and `openai-codex`. Everything else is API key only.
 
-`anthropic`, `kimi-coding` and `xai` sign in against a subscription. `openrouter`'s OAuth is
-metered rather than a subscription. `github-copilot` and `openai-codex` each run their own device
-flow. `openai-codex` is **OAuth only** — it has no API key at all, so it is the one provider you
+`anthropic`, `kimi-coding`, `meta` (Sign in with Meta, a Muse subscription), `openai` (Sign in
+with ChatGPT) and `xai` sign in against a subscription. `openrouter`'s OAuth is metered rather than
+a subscription, and `radius`'s is not a subscription either. `meta`, `github-copilot` and
+`openai-codex` each run a device flow: you enter a code shown in the terminal on the provider's
+site. `openai-codex` is **OAuth only** — it has no API key at all, so it is the one provider you
 cannot reach with an environment variable.
 
 ## Where credentials are stored

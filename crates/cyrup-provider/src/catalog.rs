@@ -47,6 +47,23 @@ pub fn load_catalog(json: &str) -> Result<Vec<Model>, serde_json::Error> {
     Ok(models)
 }
 
+/// Parse a classifier catalog — a JSON array of `type: "classifier"` rows, the
+/// `providers/catalog/<provider>-classifiers.json` files `xtask gen-catalogs` writes from
+/// `pi.dev/api/models/providers/<id>?types=classifier` (PROV-147, PROV-153) — into
+/// [`ClassifierModel`]s.
+///
+/// Rows are taken VERBATIM: no compat, prompt-cache or image-input metadata is stamped. pi's
+/// generator stamps `applyImageInputMetadata` only over the chat rows and the OpenRouter image rows
+/// (`generate-models.ts:3347-3359`, `:3376-3377` @f1b2e77f5); its classifier rows
+/// (`OPENAI_CLASSIFIER_MODELS`, `loadModelsDevClassifierModels`, `:3381-3392`) are merged after
+/// that loop and carry no `inputLimits`, which is also what pi.dev serves for them.
+///
+/// The `type` member is required on every row ([`ClassifierModel`]'s deserializer), so a chat row
+/// cannot be read as a classifier one.
+pub fn load_classifier_catalog(json: &str) -> Result<Vec<ClassifierModel>, serde_json::Error> {
+    serde_json::from_str(json)
+}
+
 /// Pi `applyOpenAICompletionsCompatMetadata` (`generate-models.ts:802-809` @v0.87.1), narrowed to
 /// the one key whose generated value differs from what cyrup's runtime detector derives.
 ///

@@ -28,31 +28,79 @@ use std::process::Command;
 /// into another's catalog file while `rows_from_body`'s provider check compared them against the
 /// same wrong spec and saw nothing. At five entries that was a test; at thirty-eight it would be a
 /// certainty. Deriving them makes the mismatch unspellable instead of merely detected.
+///
+/// # Classifier catalogs (PROV-147, PROV-153)
+///
+/// A provider's classifier rows are a SECOND catalog file, `<provider>-classifiers.json`, and the
+/// suffix is the whole declaration: [`LiveCatalogSpec::kind`], [`LiveCatalogSpec::provider`],
+/// [`LiveCatalogSpec::url`] and [`LiveCatalogSpec::module`] all derive from it, so the one-string
+/// property above survives. pi keeps every model type of a provider in ONE generated data file
+/// (`providers/data/<id>.json`, read by `flattenChatModelCatalog` / `flattenClassifierModelCatalog`
+/// in `<id>.models.ts` @f1b2e77f5); cyrup's chat catalogs are `Vec<Model>` files read by a chat
+/// loader, so the classifier rows get a file of their own rather than a type filter in every chat
+/// loader. The endpoint serves them only under `?types=` — `providers/<id>` alone is chat-only and
+/// answers `{}` for `typesafe`, which has no chat model — and under `?types=` it answers an ARRAY
+/// that still carries the chat rows (measured 2026-10-11: `openai?types=classifier` is 44 chat rows
+/// plus `gpt-6-luna`), so [`rows_from_body`] keeps exactly the `type: "classifier"` rows.
 #[derive(Debug)]
 pub struct LiveCatalogSpec {
-    /// `providers/catalog/<file>.json`, the pi provider id, and the
+    /// `providers/catalog/<file>.json`. For a chat catalog it is also the pi provider id and the
     /// `packages/ai/src/providers/<file>.models.ts` stem — one string, because upstream uses one.
+    /// A classifier catalog is `<provider>-classifiers` (see the type's docs).
     pub file: &'static str,
     /// The gap-analysis item that authorised the live path for this catalog.
     pub item: &'static str,
 }
 
+/// The file-stem suffix that makes a [`LiveCatalogSpec`] a classifier catalog.
+pub const CLASSIFIER_CATALOG_SUFFIX: &str = "-classifiers";
+
+/// Which model type a live catalog holds — derived from its file stem, never declared beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveCatalogKind {
+    /// `providers/<id>`: an id-keyed object of chat rows.
+    Chat,
+    /// `providers/<id>?types=classifier`: an array, of which the `type: "classifier"` rows are kept.
+    Classifier,
+}
+
 impl LiveCatalogSpec {
+    /// The model type this catalog holds.
+    pub fn kind(&self) -> LiveCatalogKind {
+        if self.file.ends_with(CLASSIFIER_CATALOG_SUFFIX) {
+            LiveCatalogKind::Classifier
+        } else {
+            LiveCatalogKind::Chat
+        }
+    }
+
     /// The provider id every row must carry.
     pub fn provider(&self) -> &'static str {
         self.file
+            .strip_suffix(CLASSIFIER_CATALOG_SUFFIX)
+            .unwrap_or(self.file)
     }
 
-    /// The endpoint that serves the rows, already shaped into cyrup's native `Model` JSON.
+    /// The endpoint that serves the rows, already shaped into cyrup's native model JSON.
     pub fn url(&self) -> String {
-        format!("{LIVE_CATALOG_ENDPOINT}{}", self.file)
+        match self.kind() {
+            LiveCatalogKind::Chat => format!("{LIVE_CATALOG_ENDPOINT}{}", self.provider()),
+            LiveCatalogKind::Classifier => {
+                format!(
+                    "{LIVE_CATALOG_ENDPOINT}{}?types=classifier",
+                    self.provider()
+                )
+            }
+        }
     }
 
     /// The upstream module the rows STILL originate from, kept for the manifest's `module` field:
     /// it is a re-export of gitignored data now, but it is what pi ships and what a future
-    /// un-blocking would read.
+    /// un-blocking would read. A classifier catalog originates from the same module as its
+    /// provider's chat rows (`<id>.models.ts` exports both `<ID>_MODELS` and
+    /// `<ID>_CLASSIFIER_MODELS`).
     pub fn module(&self) -> String {
-        format!("packages/ai/src/providers/{}.models.ts", self.file)
+        format!("packages/ai/src/providers/{}.models.ts", self.provider())
     }
 }
 
@@ -153,9 +201,28 @@ fn header_value(dump: &str, name: &str) -> Option<String> {
 pub fn rows_from_body(spec: &LiveCatalogSpec, body: &str) -> Result<Vec<Val>, String> {
     let url = spec.url();
     let doc = tsdata::parse_json(body).map_err(|e| format!("{url}: {e}"))?;
-    // The endpoint binds `id -> Model`, the same shape `remote_catalog::parse_catalog` accepts.
-    let rows = tsdata::object_values(&doc)
-        .map_err(|e| format!("{url}: expected an id-keyed object of models: {e}"))?;
+    let rows = match spec.kind() {
+        // The endpoint binds `id -> Model`, the same shape `remote_catalog::parse_catalog` accepts.
+        LiveCatalogKind::Chat => tsdata::object_values(&doc)
+            .map_err(|e| format!("{url}: expected an id-keyed object of models: {e}"))?,
+        // Under `?types=` the endpoint answers an ARRAY of every requested type plus the chat
+        // rows; only the classifier rows belong in a classifier catalog. A row with no string
+        // `type` is refused rather than guessed at — `?types=` rows always carry one.
+        LiveCatalogKind::Classifier => {
+            let Val::Arr(all) = doc else {
+                return Err(format!("{url}: expected an array of typed models"));
+            };
+            let mut kept = Vec::new();
+            for row in all {
+                match row.get("type").and_then(Val::as_str) {
+                    Some("classifier") => kept.push(row),
+                    Some(_) => {}
+                    None => return Err(format!("{url}: a row carries no string `type`")),
+                }
+            }
+            kept
+        }
+    };
     if rows.is_empty() {
         return Err(format!(
             "{url}: returned zero rows — refusing to write an empty catalog over {}.json",
