@@ -24,3 +24,8 @@ tmp/
 # as a module by tooling that reuses its parser, which drops a __pycache__ beside it).
 __pycache__/
 *.py[cod]
+
+# LLVM coverage profiles. The documented `cargo llvm-cov` procedure in README.md writes its
+# pooled profiles to `target/`, but test processes that do not inherit `LLVM_PROFILE_FILE`
+# drop `default_*.profraw` into whichever crate directory they ran from.
+*.profraw
