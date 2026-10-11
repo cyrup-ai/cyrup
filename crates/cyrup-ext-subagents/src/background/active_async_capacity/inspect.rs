@@ -333,6 +333,22 @@ pub async fn runner_release_verdict(
     // The no-proof FALLBACK ladder — cyrup's own, and the reason it stays is on this function's
     // doc: a runner killed before it could write a proof would otherwise hold its slot forever.
     let proof_reason = match owner.runner_pid {
+        // SUBA-194 — the owner-pid twin of upstream's namespace rung (pi
+        // `active-async-capacity.ts:255-256` @ad11b7ab, quoted on
+        // [`abandoned_runner_release_verdict`]). Upstream's owner has no pid, so this rung is
+        // cyrup's own, and so is the guard: `runner_pid` is the BINDER's view of the runner, and
+        // from another PID namespace both `kill(pid, 0)`'s `ESRCH` and a mismatched
+        // `/proc/<pid>/stat` start identity would read `Dead` while the runner is alive. Neither
+        // probe is consulted; the verdict falls to the abandoned ladder with the liveness unknown,
+        // which is where an `Unknown` probe already sends it.
+        Some(pid)
+            if pid_namespace_differs(owner.runner_pid_namespace_scope.as_deref(), options) =>
+        {
+            format!(
+                "{proof_reason}; runner pid {pid} namespace differs from this process, so \
+                 liveness is unknown"
+            )
+        }
         Some(pid) => {
             // `check_pid_identity_with`, not a bare liveness probe: the owner recorded this pid's
             // start identity at the bind, so a RECYCLED pid answers `Dead` here rather than
@@ -411,6 +427,19 @@ pub fn abandoned_runner_release_verdict(
             "{proof_reason}; runner PID is missing or invalid"
         ));
     };
+    // SUBA-194 — pi `:255-256` @ad11b7ab (`8fb89814`, #2663), verbatim:
+    //
+    //     // A PID from another namespace can look dead here while the runner is alive.
+    //     if (status.pidNamespaceScope !== undefined && status.pidNamespaceScope !== (options.pidNamespaceScope ?? currentPidNamespaceScope)()) return { state: "retained", reason: `${proofReason}; runner PID namespace differs from this process, so liveness is unknown` };
+    //
+    // Before the probe, not after it: from another namespace `ESRCH` is not death, and a probe
+    // answer that cannot be trusted must not be asked for. An observer with no scope of its own
+    // cannot match a recorded one, so it retains too (upstream's `undefined !== scope`).
+    if pid_namespace_differs(status.pid_namespace_scope.as_deref(), options) {
+        return ActiveAsyncCapacityReleaseVerdict::retained(format!(
+            "{proof_reason}; runner PID namespace differs from this process, so liveness is unknown"
+        ));
+    }
     // pi `:244-245` — `liveness !== "dead"`, so BOTH `Alive` and `Unknown` retain.
     let liveness = options.pid_liveness(pid);
     if liveness != Liveness::Dead {
@@ -614,21 +643,39 @@ pub async fn workflow_release_verdict(
                     // The no-proof FALLBACK, for the same reason the runner verdict keeps one: a
                     // workflow child killed before it could write a proof would otherwise pin its
                     // parent's slot forever. A pid the kernel says is gone is the evidence.
-                    if !child_pid_is_gone(&child_status, options) {
-                        return ActiveAsyncCapacityReleaseVerdict::retained(format!(
-                            "async workflow child {label} process-terminal proof is {state}"
-                        ));
+                    match child_pid_fallback(&child_status, options) {
+                        ChildPidFallback::Gone => continue,
+                        ChildPidFallback::NotGone => {
+                            return ActiveAsyncCapacityReleaseVerdict::retained(format!(
+                                "async workflow child {label} process-terminal proof is {state}"
+                            ));
+                        }
+                        ChildPidFallback::ForeignNamespace => {
+                            return ActiveAsyncCapacityReleaseVerdict::retained(format!(
+                                "async workflow child {label} process-terminal proof is \
+                                 {state}; runner PID namespace differs from this process, so \
+                                 liveness is unknown"
+                            ));
+                        }
                     }
-                    continue;
                 }
             }
         }
         // No published identity: the fallback ladder is all there is.
-        if !child_pid_is_gone(&child_status, options) {
-            let child_pid = child_status.pid.unwrap_or_default();
-            return ActiveAsyncCapacityReleaseVerdict::retained(format!(
-                "async workflow child {label} runner pid {child_pid} is not confirmed gone"
-            ));
+        let child_pid = child_status.pid.unwrap_or_default();
+        match child_pid_fallback(&child_status, options) {
+            ChildPidFallback::Gone => {}
+            ChildPidFallback::NotGone => {
+                return ActiveAsyncCapacityReleaseVerdict::retained(format!(
+                    "async workflow child {label} runner pid {child_pid} is not confirmed gone"
+                ));
+            }
+            ChildPidFallback::ForeignNamespace => {
+                return ActiveAsyncCapacityReleaseVerdict::retained(format!(
+                    "async workflow child {label} runner pid {child_pid}: runner PID namespace \
+                     differs from this process, so liveness is unknown"
+                ));
+            }
         }
     }
     // pi `:291`.
@@ -643,10 +690,47 @@ pub async fn workflow_release_verdict(
 /// A child's `status.json` carries a pid but no start identity (that pair lives on the capacity
 /// OWNER record, and a workflow child holds no slot of its own), so this rung is bare liveness and
 /// is honest about it: `Dead` only, never [`Liveness::Unknown`].
-fn child_pid_is_gone(child_status: &RunStatus, options: &CapacityOptions) -> bool {
-    child_status
-        .pid
-        .is_some_and(|pid| options.pid_liveness(pid) == Liveness::Dead)
+///
+/// SUBA-194 — and never a pid the child recorded in another PID namespace. Upstream reaches the
+/// same guard for its async workflow children by running each one through
+/// `abandonedRunnerReleaseVerdict` (pi `active-async-capacity.ts:291-322` @ad11b7ab, `:305`
+/// `const verdict = abandonedRunnerReleaseVerdict(unresolved.status, unresolved.proofState,
+/// options);`), whose `:255-256` namespace rung is quoted on [`abandoned_runner_release_verdict`].
+/// The child's own `status.pid_namespace_scope` is the runner's stamp, so the comparison is the
+/// same one, made before the probe.
+fn child_pid_fallback(child_status: &RunStatus, options: &CapacityOptions) -> ChildPidFallback {
+    let Some(pid) = child_status.pid else {
+        return ChildPidFallback::NotGone;
+    };
+    if pid_namespace_differs(child_status.pid_namespace_scope.as_deref(), options) {
+        return ChildPidFallback::ForeignNamespace;
+    }
+    if options.pid_liveness(pid) == Liveness::Dead {
+        ChildPidFallback::Gone
+    } else {
+        ChildPidFallback::NotGone
+    }
+}
+
+/// [`child_pid_fallback`]'s answer: the namespace case is kept apart from "not gone" so the
+/// parent's retained reason names it, as upstream's `async workflow child <id>: <reason>` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildPidFallback {
+    /// The kernel says the pid is gone, in this observer's own namespace.
+    Gone,
+    /// No pid, or a probe answer other than [`Liveness::Dead`].
+    NotGone,
+    /// The pid was recorded in another PID namespace (or this observer has none); not probed.
+    ForeignNamespace,
+}
+
+/// pi's `status.pidNamespaceScope !== undefined && status.pidNamespaceScope !==
+/// (options.pidNamespaceScope ?? currentPidNamespaceScope)()` (`active-async-capacity.ts:256`
+/// @ad11b7ab): a RECORDED scope that this observer does not share. An unrecorded scope is never a
+/// mismatch (a status or owner written by an older build probes as before), and an observer with
+/// no scope of its own mismatches every recorded one.
+fn pid_namespace_differs(recorded: Option<&str>, options: &CapacityOptions) -> bool {
+    recorded.is_some_and(|recorded| options.pid_namespace_scope().as_deref() != Some(recorded))
 }
 
 /// pi `ownerReleaseVerdict` (`:292-297`) — reads the owner's own `status.json` once and dispatches

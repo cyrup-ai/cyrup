@@ -134,6 +134,7 @@ fn owner_record(
         runner_process_instance_id: None,
         runner_pid: None,
         runner_process_start_identity: None,
+        runner_pid_namespace_scope: None,
         runner_started_at: None,
     }
 }
@@ -1210,6 +1211,86 @@ async fn a_transfer_moves_one_slot_and_bumps_its_generation() {
     );
 }
 
+/// SUBA-223 — pi `transferActiveAsyncCapacity` (`active-async-capacity.ts:539-540` @ad11b7ab):
+/// `delete next.runnerProcessInstanceId; delete next.runnerStartedAt;` — a transferred slot is an
+/// UNSTARTED reservation. The source was bound (instance id, pid, start identity, scope), so a
+/// transfer that clears only the pid and start time leaves the source runner's instance id on the
+/// new owner: `is_started()` stays true, and `rollback` (pi `:450`, `owner.runnerProcessInstanceId
+/// || owner.runnerStartedAt` → `false`) refuses to hand the slot back to the source when the
+/// resumed run fails to launch. Red before the fix: `is_started()` is true and `rollback` is
+/// `false`.
+#[tokio::test]
+async fn a_transferred_slot_is_unstarted_and_its_rollback_restores_the_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = options(tmp.path());
+    let s = session("s");
+    let source = RunId::from_token("source");
+    let resumed = RunId::from_token("resumed");
+    let source_dir = write_run(tmp.path(), &source, &s, RunState::Complete, Some(1)).await;
+    let resumed_dir = write_run(tmp.path(), &resumed, &s, RunState::Running, Some(2)).await;
+
+    let mut handle = acquire(
+        AcquireInput {
+            session_id: &s,
+            limit: Some(1),
+            run_id: &source,
+            kind: ActiveAsyncCapacityKind::Runner,
+            async_dir: &source_dir,
+        },
+        &options,
+    )
+    .await
+    .expect("admitted")
+    .expect("a slot");
+    handle
+        .mark_started(
+            4242,
+            crate::background::process_terminal::RunnerProcessInstanceId::new(),
+        )
+        .await
+        .expect("bind");
+    let slot = slot_dir(&session_pool_dir(options.root_dir(), &s), 0);
+    let bound = read_owner(&slot).await.expect("owner");
+    assert!(
+        bound.runner_process_instance_id.is_some() && bound.is_started(),
+        "precondition: the source is bound"
+    );
+
+    let mut moved = transfer(
+        TransferInput {
+            session_id: &s,
+            limit: Some(1),
+            source_run_id: &source,
+            run_id: &resumed,
+            async_dir: &resumed_dir,
+        },
+        &options,
+    )
+    .await
+    .expect("transferable")
+    .expect("a handle");
+    let on_disk = read_owner(&slot).await.expect("owner");
+    for owner in [moved.owner(), &on_disk] {
+        assert_eq!(owner.run_id, resumed);
+        assert_eq!(
+            owner.runner_process_instance_id, None,
+            "the source runner's identity does not follow the slot"
+        );
+        assert_eq!(owner.runner_pid, None);
+        assert_eq!(owner.runner_process_start_identity, None);
+        assert_eq!(owner.runner_pid_namespace_scope, None);
+        assert_eq!(owner.runner_started_at, None);
+        assert!(!owner.is_started(), "a transferred slot is unstarted");
+    }
+
+    assert!(
+        moved.rollback().await,
+        "the resumed run never launched, so its reservation goes back to the source"
+    );
+    assert_eq!(read_owner(&slot).await.expect("owner"), bound);
+    assert_eq!(pool_slot_count(&options, &s).await, 1);
+}
+
 #[tokio::test]
 async fn a_transfer_with_no_source_slot_is_an_ordinary_admission() {
     // pi `:513`.
@@ -1650,4 +1731,302 @@ async fn seed_observed_proof(
     write_atomic_json(&RunDir::for_existing(async_dir).process_terminal(), &proof)
         .await
         .expect("proof write");
+}
+
+// =================================================================================================
+// SUBA-194 — a runner pid from another PID namespace is not probed (pi `8fb89814` / #2663)
+// =================================================================================================
+
+const RUNNER_SCOPE: &str = "pid:[4026531836]";
+const OTHER_SCOPE: &str = "pid:[4026532999]";
+
+/// pi `abandonedRunnerReleaseVerdict`'s namespace reason (`active-async-capacity.ts:256`
+/// @ad11b7ab), with `proofReason` = `process-terminal proof is missing`.
+const NAMESPACE_RETAINED: &str = "process-terminal proof is missing; runner PID namespace differs \
+                                  from this process, so liveness is unknown";
+
+fn observing_from(scope: Option<&'static str>, options: CapacityOptions) -> CapacityOptions {
+    options.with_pid_namespace_scope(Arc::new(move || scope.map(str::to_string)))
+}
+
+/// A failed run, silent since epoch 0, whose runner recorded `scope` beside pid 4242.
+fn failed_status_in(scope: Option<&str>) -> RunStatus {
+    let mut status = RunStatus::queued(RunId::from_token("ns"), RunMode::Single, Some(4242));
+    status.state = RunState::Failed;
+    status.pid = Some(4242);
+    status.last_update = 0;
+    status.telemetry.last_activity_at = Some(0);
+    status.pid_namespace_scope = scope.map(str::to_string);
+    status
+}
+
+/// Past the threshold, with a probe that says the pid is gone — every other rung of the abandoned
+/// ladder would release.
+fn past_threshold_with_a_dead_probe(tmp: &Path) -> CapacityOptions {
+    probing(
+        Liveness::Dead,
+        at(10 * DEFAULT_ABANDONED_SLOT_RELEASE_AFTER_MS, options(tmp)),
+    )
+}
+
+/// The row's Verify. HEAD probes the foreign pid, reads `Dead`, and releases with
+/// `abandoned-timeout: ...`.
+#[test]
+fn a_failed_run_whose_runner_pid_is_in_another_namespace_is_retained_past_the_threshold() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = observing_from(
+        Some(OTHER_SCOPE),
+        past_threshold_with_a_dead_probe(tmp.path()),
+    );
+    let verdict = abandoned_runner_release_verdict(
+        &failed_status_in(Some(RUNNER_SCOPE)),
+        "process-terminal proof is missing",
+        &options,
+    );
+    assert_eq!(
+        verdict,
+        ActiveAsyncCapacityReleaseVerdict::Retained {
+            reason: NAMESPACE_RETAINED.to_string()
+        }
+    );
+}
+
+/// The counter-case: the SAME scope is probed as before and the dead pid releases. A guard that
+/// retained every recorded scope would pass the test above and fail this one.
+#[test]
+fn a_failed_run_whose_runner_pid_is_in_this_namespace_still_releases() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = observing_from(
+        Some(RUNNER_SCOPE),
+        past_threshold_with_a_dead_probe(tmp.path()),
+    );
+    let verdict = abandoned_runner_release_verdict(
+        &failed_status_in(Some(RUNNER_SCOPE)),
+        "process-terminal proof is missing",
+        &options,
+    );
+    assert!(verdict.is_releasable(), "got {verdict:?}");
+    assert!(
+        verdict.reason().starts_with("abandoned-timeout:"),
+        "got {verdict:?}"
+    );
+
+    // An UNRECORDED scope (a runner from a build older than the stamp) probes as before too —
+    // upstream's `status.pidNamespaceScope !== undefined`.
+    let verdict = abandoned_runner_release_verdict(
+        &failed_status_in(None),
+        "process-terminal proof is missing",
+        &options,
+    );
+    assert!(verdict.is_releasable(), "got {verdict:?}");
+}
+
+/// An observer with no scope of its own (off Linux, or `/proc` unreadable) cannot match a recorded
+/// one — upstream's `scope !== undefined` comparison — so it retains rather than probing.
+#[test]
+fn a_recorded_scope_seen_by_an_observer_without_one_is_retained() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = observing_from(None, past_threshold_with_a_dead_probe(tmp.path()));
+    let verdict = abandoned_runner_release_verdict(
+        &failed_status_in(Some(RUNNER_SCOPE)),
+        "process-terminal proof is missing",
+        &options,
+    );
+    assert_eq!(
+        verdict,
+        ActiveAsyncCapacityReleaseVerdict::Retained {
+            reason: NAMESPACE_RETAINED.to_string()
+        }
+    );
+}
+
+/// The same rung through the public owner verdict: a bound slot whose owner record carries no pid
+/// (pi's own shape), so the run's `status.pid` is what the abandoned ladder reaches.
+#[tokio::test]
+async fn the_owner_release_verdict_retains_a_foreign_namespace_runner_past_the_threshold() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = observing_from(
+        Some(OTHER_SCOPE),
+        past_threshold_with_a_dead_probe(tmp.path()),
+    );
+    let s = session("s");
+    let (owner, dir) = seed_abandoned(tmp.path(), &options, &s, 0).await;
+    patch_status(&dir, |status| {
+        status.pid_namespace_scope = Some(RUNNER_SCOPE.to_string());
+    })
+    .await;
+
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert_eq!(
+        verdict,
+        ActiveAsyncCapacityReleaseVerdict::Retained {
+            reason: "process-terminal proof is missing; runner pid was never recorded; runner \
+                     PID namespace differs from this process, so liveness is unknown"
+                .to_string()
+        }
+    );
+    assert_eq!(
+        reconcile_active_async_capacity(&s, Some(1), &options)
+            .await
+            .expect("reconcile")
+            .used,
+        1,
+        "the slot stays occupied"
+    );
+}
+
+/// cyrup's own owner-pid rung (upstream's owner has no pid). The owner bound pid 4242 in another
+/// namespace, the run is `Complete` (so the abandoned ladder can never take it), and the probe
+/// says `Dead`. HEAD releases with `runner pid 4242 is confirmed gone and the run is terminal`.
+#[tokio::test]
+async fn the_owner_pid_rung_does_not_probe_a_pid_bound_in_another_namespace() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = observing_from(
+        Some(OTHER_SCOPE),
+        past_threshold_with_a_dead_probe(tmp.path()),
+    );
+    let s = session("s");
+    let run_id = RunId::from_token("foreign-owner");
+    let dir = write_run(tmp.path(), &run_id, &s, RunState::Complete, Some(4242)).await;
+
+    let mut owner = owner_record(&s, &run_id, &dir, ActiveAsyncCapacityKind::Runner);
+    owner.runner_pid = Some(4242);
+    owner.runner_pid_namespace_scope = Some(RUNNER_SCOPE.to_string());
+    owner.runner_started_at = Some(1);
+    seed_slot(&options, &owner).await;
+
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert_eq!(
+        verdict,
+        ActiveAsyncCapacityReleaseVerdict::Retained {
+            reason: "process-terminal proof is missing; runner pid 4242 namespace differs from \
+                     this process, so liveness is unknown; abandoned-timeout policy requires a \
+                     failed run, not complete"
+                .to_string()
+        }
+    );
+
+    // Same namespace: the rung probes as it always did, and the dead pid releases.
+    let same = observing_from(
+        Some(RUNNER_SCOPE),
+        past_threshold_with_a_dead_probe(tmp.path()),
+    );
+    let verdict = owner_release_verdict(&owner, &same).await;
+    assert_eq!(
+        verdict.reason(),
+        "process-terminal proof is missing; runner pid 4242 is confirmed gone and the run is \
+         terminal"
+    );
+}
+
+/// The bind stamps the binder's scope beside the pid, so the rung above has something to compare.
+/// HEAD has no such field to stamp.
+#[tokio::test]
+async fn mark_started_stamps_the_binders_pid_namespace_scope() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = observing_from(Some(RUNNER_SCOPE), options(tmp.path()));
+    let s = session("s");
+    let run_id = RunId::from_token("bound");
+    let dir = write_run(tmp.path(), &run_id, &s, RunState::Running, Some(4242)).await;
+    let mut handle = acquire(
+        AcquireInput {
+            session_id: &s,
+            limit: Some(1),
+            run_id: &run_id,
+            kind: ActiveAsyncCapacityKind::Runner,
+            async_dir: &dir,
+        },
+        &options,
+    )
+    .await
+    .expect("admitted")
+    .expect("a slot");
+    handle
+        .mark_started(
+            4242,
+            crate::background::process_terminal::RunnerProcessInstanceId::new(),
+        )
+        .await
+        .expect("bound");
+
+    let owner = read_owner(&slot_dir(&session_pool_dir(options.root_dir(), &s), 0))
+        .await
+        .expect("owner");
+    assert_eq!(owner.runner_pid, Some(4242));
+    assert_eq!(
+        owner.runner_pid_namespace_scope.as_deref(),
+        Some(RUNNER_SCOPE)
+    );
+}
+
+/// The workflow-child fallback (`child_pid_fallback`): upstream reaches the same guard by running
+/// each unresolved async child through `abandonedRunnerReleaseVerdict` (`:305`). A terminal child
+/// with a published runner identity, no proof, a `Dead`-looking pid and a FOREIGN scope must keep
+/// its parent's slot. HEAD reads the pid as gone and releases the parent.
+#[tokio::test]
+async fn a_workflow_child_whose_runner_pid_is_in_another_namespace_pins_its_parents_slot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let options = observing_from(
+        Some(OTHER_SCOPE),
+        past_threshold_with_a_dead_probe(tmp.path()),
+    );
+    let s = session("s");
+    let parent = RunId::from_token("wf");
+    let child = RunId::from_token("child");
+    let instance = crate::background::process_terminal::RunnerProcessInstanceId::new();
+
+    let child_dir = write_run(tmp.path(), &child, &s, RunState::Failed, Some(11)).await;
+    patch_status(&child_dir, |status| {
+        status.pid_namespace_scope = Some(RUNNER_SCOPE.to_string());
+        status.process_terminal = Some(
+            crate::background::process_terminal::ProcessTerminal::Pending {
+                base: crate::background::process_terminal::ProcessTerminalBase::new(
+                    child.clone(),
+                    instance.clone(),
+                ),
+            },
+        );
+    })
+    .await;
+
+    let dir = write_run(tmp.path(), &parent, &s, RunState::Complete, Some(5)).await;
+    patch_status(&dir, |status| {
+        status.mode = RunMode::Workflow;
+        let mut step = StepStatus::pending("agent-a");
+        step.run_id = Some(child.clone());
+        status.steps = vec![step];
+    })
+    .await;
+
+    let owner = owner_record(&s, &parent, &dir, ActiveAsyncCapacityKind::Workflow);
+    seed_slot(&options, &owner).await;
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert_eq!(
+        verdict,
+        ActiveAsyncCapacityReleaseVerdict::Retained {
+            reason: "async workflow child agent-a process-terminal proof is missing; runner PID \
+                     namespace differs from this process, so liveness is unknown"
+                .to_string()
+        }
+    );
+
+    // The same child in this observer's own namespace is confirmed gone and releases the parent.
+    let same = observing_from(
+        Some(RUNNER_SCOPE),
+        past_threshold_with_a_dead_probe(tmp.path()),
+    );
+    let verdict = owner_release_verdict(&owner, &same).await;
+    assert!(verdict.is_releasable(), "got {verdict:?}");
+
+    // And a child with NO published identity reaches the bare fallback, guarded the same way.
+    patch_status(&child_dir, |status| status.process_terminal = None).await;
+    let verdict = owner_release_verdict(&owner, &options).await;
+    assert_eq!(
+        verdict,
+        ActiveAsyncCapacityReleaseVerdict::Retained {
+            reason: "async workflow child agent-a runner pid 11: runner PID namespace differs \
+                     from this process, so liveness is unknown"
+                .to_string()
+        }
+    );
 }

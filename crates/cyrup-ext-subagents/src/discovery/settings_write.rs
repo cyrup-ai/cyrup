@@ -84,7 +84,9 @@ fn read_settings_file_strict(path: &Path) -> Result<Map<String, Value>, Subagent
 /// on its target's sidecar. `FileSettingsStore::with_lock` locks the path it is given, so for a
 /// symlinked file the two take DIFFERENT sidecars and do not exclude each other; for a regular file
 /// they are the same lock.
-async fn lock_settings_file(path: &Path) -> Result<cyrup_config::lock::FileLock, SubagentError> {
+pub(crate) async fn lock_settings_file(
+    path: &Path,
+) -> Result<cyrup_config::lock::FileLock, SubagentError> {
     // `None`: this crate holds no `CancelToken` at these sites, and every non-`models_store`
     // caller of `FileLock::acquire` passes `None` for the same reason.
     cyrup_config::lock::FileLock::acquire(path, None)
@@ -95,6 +97,45 @@ async fn lock_settings_file(path: &Path) -> Result<cyrup_config::lock::FileLock,
                 path.display()
             ))
         })
+}
+
+/// SUBA-184 — how long a SYNCHRONOUS settings writer waits for another writer's lock: pi
+/// `withFileLease(filePath, action, waitMs = 200)` (`src/shared/file-lease.ts:61` @ad11b7ab),
+/// which `withSettingsFileLease` calls with the default.
+pub(crate) const SETTINGS_LEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// SUBA-184 — [`lock_settings_file`] for a writer that is not async (the watchdog settings
+/// writers, whose upstream twins are sync as well): the SAME `flock` on the SAME
+/// `<physical target>.lock` sidecar, so it excludes every [`lock_settings_file`] holder of that
+/// file (agent-override saves, profile loads) in this process or another, waited for at most
+/// `wait` (pi's 200 ms, [`SETTINGS_LEASE_WAIT`]). `target` must already be the physical target
+/// ([`settings_write_target`]), as pi `withSettingsFileLease` resolves it before
+/// `withFileLease` (`src/shared/settings-file-lease.ts:33-36` @ad11b7ab):
+///
+/// ```text
+/// export function withSettingsFileLease<T>(filePath: string, action: () => T): T {
+///     fs.mkdirSync(path.dirname(filePath), { recursive: true });
+///     return withFileLease(resolveSettingsWriteTarget(filePath), action);
+/// }
+/// ```
+///
+/// `[CYRUP-DELTA]` pi's lease is a `mkdir` `<file>.write-lock` directory; this is the `flock`
+/// sidecar SUBA-029/171 already hold — see `cyrup_config::lock::BlockingFileLock`. A timeout
+/// carries pi's sentence verbatim (`Timed out waiting for another process to finish updating
+/// <abs>.`); any other lock failure reads as [`lock_settings_file`]'s.
+pub(crate) fn lock_settings_file_blocking(
+    target: &Path,
+    wait: std::time::Duration,
+) -> Result<cyrup_config::lock::BlockingFileLock, SubagentError> {
+    cyrup_config::lock::BlockingFileLock::acquire(target, wait).map_err(|e| match e {
+        cyrup_config::ConfigError::LockTimeout { .. } => {
+            SubagentError::MalformedSettings(e.to_string())
+        }
+        other => SubagentError::MalformedSettings(format!(
+            "Failed to lock settings file '{}': {other}",
+            target.display()
+        )),
+    })
 }
 
 /// SUBA-171 — pi `resolveSettingsWriteTarget` (`src/shared/settings-file-lease.ts:6-30`
@@ -146,7 +187,7 @@ fn resolve_settings_write_target(file_path: &Path) -> std::io::Result<PathBuf> {
 /// both before it takes the settings lease (`withSettingsFileLease`,
 /// `src/shared/settings-file-lease.ts:33-36` @ad11b7ab), so the lease, the read-modify-write and
 /// the rename all act on the same physical file whether it is reached directly or through a link.
-fn settings_write_target(path: &Path) -> Result<PathBuf, SubagentError> {
+pub(crate) fn settings_write_target(path: &Path) -> Result<PathBuf, SubagentError> {
     let fail = |e: std::io::Error| {
         SubagentError::MalformedSettings(format!(
             "Failed to write settings file '{}': {e}",
@@ -170,7 +211,7 @@ fn settings_write_target(path: &Path) -> Result<PathBuf, SubagentError> {
 /// (`stat().mode & 0o7777`) is checked for write access (pi `accessSync(W_OK)`) and carried onto
 /// the temp before the rename, so a `0600` file stays `0600` and a read-only file is refused
 /// instead of replaced. A new file gets the umask default, as pi's does.
-fn write_settings_file(
+pub(crate) fn write_settings_file(
     path: &Path,
     target: &Path,
     settings: &Map<String, Value>,

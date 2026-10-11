@@ -940,12 +940,9 @@ async fn remove(
 ) -> Result<ScheduledRunActionOutcome, ScheduledRunError> {
     let schedule = resolve(action, params, ctx).await?;
     if let Some(active) = schedule.active_run_id.as_ref() {
-        let run = ctx
-            .store
-            .history(&schedule.id)
-            .await?
-            .into_iter()
-            .find(|item| &item.id == active);
+        // SUBA-183 — pi `remove` `:809` @ `ad11b7ab`: `const run = this.activeRun(store,
+        // schedule);` — the receipt first, then the history entry.
+        let run = ctx.store.active_run(&schedule).await?;
         let mut terminal = false;
         if let Some(run) = run
             && run.schedule_id == schedule.id

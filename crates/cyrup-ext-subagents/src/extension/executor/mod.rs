@@ -962,6 +962,48 @@ mod tests {
         );
     }
 
+    /// SUBA-222 — the live-controller pid probe never trusts a pid from another PID namespace. The
+    /// run records a genuinely reaped pid (so `kill(pid, 0)` answers `ESRCH` here) under a FOREIGN
+    /// namespace scope: its controller's liveness is unknown from this process, so the dismissal
+    /// is refused, as a probe answering `Unknown` already is. Red before the guard: the bare probe
+    /// reads `Dead` and a possibly-live workflow is dismissed.
+    #[tokio::test]
+    async fn dismiss_refuses_a_run_whose_controller_pid_is_in_another_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = SubagentExecutor::new();
+        executor.set_host_services(Arc::new(FixedSessionHost("session-a")));
+        let reaped = {
+            let mut child = std::process::Command::new("true")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("`true` spawns");
+            let pid = child.id();
+            let _ = child.wait();
+            pid
+        };
+        let paths = seed_orphaned_run(dir.path(), "run0foreignns", Some("session-a"), Some(reaped));
+        let mut status: crate::background::RunStatus =
+            serde_json::from_str(&std::fs::read_to_string(&paths.status).expect("read status"))
+                .expect("parse status");
+        status.pid_namespace_scope = Some("pid:[foreign-namespace]".to_string());
+        std::fs::write(
+            &paths.status,
+            serde_json::to_string(&status).expect("serialize status"),
+        )
+        .expect("write status");
+
+        let err = executor
+            .control_dismiss(dir.path(), Some("run0foreignns"))
+            .await
+            .expect_err("a controller in another namespace may be alive");
+        assert_eq!(
+            err,
+            "Workflow 'run0foreignns' still has a live controller and cannot be dismissed."
+        );
+    }
+
     /// pi `subagent-executor.ts:5865-5870`: `dismiss` is in upstream's
     /// `MUTATING_MANAGEMENT_ACTIONS` (`:175`) and the child-safe gate runs immediately BEFORE the
     /// `if (action === "dismiss")` block, so a fanout child never reaches the handler.

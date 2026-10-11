@@ -381,6 +381,7 @@ impl Harness {
             ),
             runner_pid: Some(a_reaped_pid()),
             runner_process_start_identity: None,
+            runner_pid_namespace_scope: None,
             runner_started_at: Some(1),
         };
         let pool = session_pool_dir(
