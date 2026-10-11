@@ -236,7 +236,7 @@ pub use virtual_registry::{
     VirtualModelError, VirtualModelListener, VirtualModelRegistry, find_latest_response,
     message_thinking_level,
 };
-pub use wire::WireProvider;
+pub use wire::{ApiDispatch, WireProvider};
 
 /// Header overlay: a `None` value suppresses a would-be default header (arch-01 §3.1).
 pub type HeaderMap = std::collections::BTreeMap<String, Option<String>>;

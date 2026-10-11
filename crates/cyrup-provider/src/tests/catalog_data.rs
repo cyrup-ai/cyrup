@@ -351,7 +351,8 @@ fn the_catalog_file_set_matches_the_registered_providers() {
 
 /// PROV-030's regression guard (PROV-038 asked for it here): every row's `api` must be an api the
 /// registry can actually construct, otherwise the model resolves, lists in `/model`, and then dies
-/// at `wire.rs` with `no API implementation for <api>`.
+/// at `wire.rs` with `Provider <id> has no API implementation for "<api>"` (pi's `createProvider`
+/// text, `models.ts:1072-1083` @f1b2e77f5; PROV-157).
 ///
 /// **There is no carve-out, and there must never be one again.** `google-vertex` was the single
 /// dangling api this guard was written around; `api/google_vertex.rs` closed it (PROV-030) and the
@@ -392,9 +393,11 @@ fn every_catalog_row_names_a_registered_api() {
             assert!(
                 registry.contains(&m.api),
                 "{name}: {} names api `{}`, which register_builtins() does not provide — \
-                 every request on this row would die with `no API implementation for {}`",
+                 every request on this row would die with `Provider {} has no API \
+                 implementation for \"{}\"`",
                 m.id,
                 m.api,
+                m.provider,
                 m.api
             );
         }

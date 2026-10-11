@@ -738,10 +738,11 @@ async fn the_builtin_typesafe_provider_classifies_against_its_own_system_one_end
 }
 
 /// pi's `typesafeProvider()` passes no `api`, so `createProvider` answers any chat stream with
-/// `Provider typesafe has no API implementation for "<api>"` (`models.ts:1076-1080`). The built-in
-/// carries an EMPTY api registry, so a chat model handed to it fails rather than being streamed
-/// through the shared registry under TypeSafe's key. The assertion is cyrup's wording
-/// (`ProviderError::NoApiImpl`), which differs from pi's and carries no provider id: PROV-157.
+/// `Provider typesafe has no API implementation for "<api>"` (`models.ts:1072-1083` @f1b2e77f5).
+/// The built-in carries an EMPTY api registry, so a chat model handed to it fails rather than
+/// being streamed through the shared registry under TypeSafe's key. PROV-157's Verify: the
+/// message is pi's, whole; red at the base, where it read `no API implementation for
+/// openai-responses`.
 #[tokio::test]
 async fn the_typesafe_provider_streams_nothing() {
     use crate::context::Context;
@@ -764,13 +765,12 @@ async fn the_typesafe_provider_streams_nothing() {
     ))
     .await;
     assert_eq!(message.stop_reason, cyrup_core::StopReason::Error);
-    assert!(
-        message
-            .error_message
-            .as_deref()
-            .is_some_and(|m| m.contains("no API implementation for openai-responses")),
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some(r#"Provider typesafe has no API implementation for "openai-responses""#),
         "{message:?}"
     );
+    assert_eq!(message.api.as_str(), "openai-responses");
 }
 
 /// PROV-110 corner (1) on the System One wire. pi posts `JSON.stringify({model, state, questions})`

@@ -47,10 +47,10 @@ pub fn typesafe_auth() -> ProviderAuth {
 /// Construct the TypeSafe provider over the given credential store.
 ///
 /// It takes no api registry because pi's `typesafeProvider()` passes no `api`: an EMPTY registry
-/// makes any chat stream through it fail (`no API implementation for <api>`), as pi's
-/// `createProvider` answers `Provider typesafe has no API implementation for "<api>"`
-/// (`models.ts:1076-1080`), instead of dispatching a chat model it was handed through the shared
-/// built-in registry under TypeSafe's key.
+/// makes any chat stream through it fail with pi's own `createProvider` text, `Provider typesafe
+/// has no API implementation for "<api>"` (`models.ts:1072-1083` @f1b2e77f5; PROV-157), instead of
+/// dispatching a chat model it was handed through the shared built-in registry under TypeSafe's
+/// key.
 pub fn typesafe_provider_with(store: Arc<dyn CredentialStore>) -> WireProvider {
     // `jev-latest` and the `typesafe-system-one` map come from the classifier table.
     super::classifiers::TYPESAFE_CLASSIFIERS.attach(WireProvider::new(

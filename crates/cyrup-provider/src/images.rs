@@ -409,17 +409,17 @@ pub fn register_images_builtins(reg: &mut ImagesApiProviderRegistry) {
     );
 }
 
-/// Registry-routed entrypoint (pi `generateImages`, `images.ts:19-25`). Resolves the api impl for
-/// `model.api` and delegates; `Err(NoApiImpl)` is pi's
-/// `throw new Error("No API provider registered for api: …")` (`:9`, inside
-/// `resolveImagesApiProvider` `:6-12`).
+/// Registry-routed entrypoint (pi `generateImages`, `images.ts:19-25` @f1b2e77f5). Resolves the
+/// api impl for `model.api` and delegates; `Err(UnregisteredApi)` is pi's
+/// ``throw new Error(`No API provider registered for api: ${api}`)`` (`:9`, inside
+/// `resolveImagesApiProvider` `:6-12`), text and all (PROV-157).
 ///
 /// Auth is the caller's problem here, exactly as upstream documents: prefer
 /// [`crate::collection::Models::generate_images`], which resolves provider auth first.
 ///
 /// # Errors
 ///
-/// [`crate::error::ProviderError::NoApiImpl`] when no impl is registered for `model.api`.
+/// [`crate::error::ProviderError::UnregisteredApi`] when no impl is registered for `model.api`.
 pub async fn generate_images(
     registry: &mut ImagesApiProviderRegistry,
     model: &ImageModel,
@@ -427,7 +427,9 @@ pub async fn generate_images(
     options: &ImagesOptions,
 ) -> Result<AssistantImages, crate::error::ProviderError> {
     let Some(provider) = registry.get(&model.api) else {
-        return Err(crate::error::ProviderError::NoApiImpl(model.api.clone()));
+        return Err(crate::error::ProviderError::UnregisteredApi(
+            model.api.clone(),
+        ));
     };
     Ok(provider.generate_images(model, context, options).await)
 }
@@ -525,7 +527,7 @@ mod tests {
     }
 
     /// The registry-routed entrypoint (pi `images.ts:19-25`): an unregistered api is pi's throw,
-    /// which is `Err(NoApiImpl)` here rather than an error envelope — the one place in the image
+    /// which is `Err(UnregisteredApi)` here rather than an error envelope — the one place in the image
     /// surface that reports a missing api as a call failure, because upstream's does too.
     #[tokio::test]
     async fn the_global_entrypoint_errors_for_an_unregistered_api() {
@@ -540,8 +542,12 @@ mod tests {
         .await
         .expect_err("nothing is registered");
         assert!(
-            matches!(&err, crate::error::ProviderError::NoApiImpl(api) if api.as_str() == OPENROUTER_IMAGES),
-            "expected NoApiImpl, got {err:?}"
+            matches!(&err, crate::error::ProviderError::UnregisteredApi(api) if api.as_str() == OPENROUTER_IMAGES),
+            "expected UnregisteredApi, got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "No API provider registered for api: openrouter-images"
         );
 
         // With the built-ins registered it resolves and reaches the impl (no api key configured, so

@@ -258,17 +258,20 @@ impl ProviderRegistration {
         self.config.has_stream_simple
     }
 
-    /// Realize this registration as a concrete [`cyrup_provider::Provider`] (Pi
-    /// `ModelRegistry.applyProviderConfig`, model-registry.ts:917-940): a [`cyrup_provider::ConfigProvider`]
-    /// over the parsed model catalog + the resolved api key. The model registry (arch-08 §5.6) installs
+    /// Realize this registration as a concrete [`cyrup_provider::Provider`]: a
+    /// [`cyrup_provider::ConfigProvider`] over the parsed model catalog + the resolved api key. At
+    /// f1b2e77f5 pi's `ModelRuntime.registerProvider` stores the registration and recomposes the id
+    /// through `composeModelProvider` (`core/model-runtime.ts:921-933`), whose base-less provider
+    /// streams through the process-wide api registry (`provider-composer.ts:583-603`); the
+    /// `ConfigProvider` declares that dispatch (PROV-157). The model registry (arch-08 §5.6) installs
     /// the returned provider so a guest `registerProvider` model becomes selectable AND streamable in
     /// the assembled run.
     ///
-    /// Per-model wire fields are folded exactly as Pi does: `api = model.api || config.api`
-    /// (model-registry.ts:923), `baseUrl = model.baseUrl ?? config.baseUrl` (:931), `contextWindow`
-    /// defaults to 128000 and `maxTokens` to 16384 (Pi's `models.json` parse defaults,
-    /// model-registry.ts:621-622). A model that resolves no `api` or `baseUrl` is skipped (Pi rejects
-    /// such a registration at `validateProviderConfig`; here it is dropped rather than panicking).
+    /// Per-model wire fields are folded as pi's `modelFromJson` does (`provider-composer.ts:210-249`
+    /// @f1b2e77f5): `api = definition.api ?? providerConfig.api` (`:216`), `baseUrl =
+    /// definition.baseUrl ?? providerConfig.baseUrl` (`:222`), `contextWindow` defaults to 128000 and
+    /// `maxTokens` to 16384 (`:242-243`). A model that resolves no `api` or `baseUrl` is skipped (pi
+    /// throws at `:218`/`:223`; here it is dropped rather than panicking).
     pub fn build_provider(&self) -> std::sync::Arc<dyn cyrup_provider::Provider> {
         let name = if self.config.name.is_empty() {
             self.id.clone()
@@ -289,8 +292,8 @@ impl ProviderRegistration {
         .into_arc()
     }
 
-    /// Parse this registration's model catalog into concrete [`cyrup_provider::Model`]s (Pi
-    /// model-registry.ts:922-940). Open-shaped fields (`thinkingLevelMap`, `compat`) are deserialized
+    /// Parse this registration's model catalog into concrete [`cyrup_provider::Model`]s (pi
+    /// `modelFromJson`, `provider-composer.ts:210-249` @f1b2e77f5). Open-shaped fields (`thinkingLevelMap`, `compat`) are deserialized
     /// from their carried JSON; a malformed block is dropped (never a panic) rather than failing the
     /// whole registration.
     pub fn build_models(&self) -> Vec<cyrup_provider::Model> {
@@ -298,11 +301,11 @@ impl ProviderRegistration {
 
         let mut out: Vec<Model> = Vec::with_capacity(self.config.models.len());
         for m in &self.config.models {
-            // `api = model.api || config.api` (Pi model-registry.ts:923); required.
+            // `api = definition.api ?? providerConfig.api` (pi `provider-composer.ts:216`); required.
             let Some(api) = m.api.clone().or_else(|| self.config.api.clone()) else {
                 continue;
             };
-            // `baseUrl = model.baseUrl ?? config.baseUrl` (Pi :931); required.
+            // `baseUrl = definition.baseUrl ?? providerConfig.baseUrl` (`:222`); required.
             let Some(base_url) = m.base_url.clone().or_else(|| self.config.base_url.clone()) else {
                 continue;
             };

@@ -1,8 +1,12 @@
-//! `ConfigProvider` — a [`Provider`] built from a custom/guest provider registration (Pi
-//! `ModelRegistry.applyProviderConfig`, model-registry.ts:892-960). A guest `pi.registerProvider()`
-//! contributes a `baseUrl`/`api`/`apiKey` + a model catalog; Pi folds those models straight into the
-//! shared `ModelRegistry.models` array (model-registry.ts:917-940) so the registered model becomes
-//! selectable and streamable exactly like a built-in.
+//! `ConfigProvider` — a [`Provider`] built from a custom/guest provider registration. A guest
+//! `pi.registerProvider()` contributes a `baseUrl`/`api`/`apiKey` + a model catalog; at f1b2e77f5
+//! pi stores it (`extensionProviders.set`) and recomposes the id through `composeModelProvider`
+//! (`core/model-runtime.ts:921-933`), so the registered model becomes selectable and streamable
+//! exactly like a built-in. Under a FRESH id that composition has no base, and its `streamWith`
+//! falls through to the process-wide api registry (`provider-composer.ts:583-603`): this provider
+//! declares [`ApiDispatch::Global`], so a miss reports pi's `No API provider registered for api:
+//! <api>` (PROV-157). A registration over a BUILT-IN id is composed over that base upstream; cyrup's
+//! `ConfigProvider` has no base, which is the EXT-M07 composition gap, not a dispatch question.
 //!
 //! cyrup streams through a concrete [`Provider`] per provider id, so a guest registration is realized
 //! as a `ConfigProvider`: a static catalog + an api-key auth + an in-memory credential store seeded
@@ -16,7 +20,7 @@ use crate::context::Context;
 use crate::model::Model;
 use crate::provider::Provider;
 use crate::stream::{StreamEvent, StreamOptions};
-use crate::wire::WireProvider;
+use crate::wire::{ApiDispatch, WireProvider};
 use cyrup_core::{EventStream, ProviderId};
 use std::sync::Arc;
 
@@ -31,9 +35,10 @@ impl ConfigProvider {
     /// Build a provider from a registration's resolved parts: `id`, display `name`, the already
     /// resolved api key (literal / `$ENV` / `!command` — resolution happens at registration time),
     /// and the parsed model catalog. A present, non-empty key is seeded into an in-memory credential
-    /// store so request auth resolves to it (Pi stores it in `providerRequestConfigs` and injects it
-    /// per request, model-registry.ts:705-741); absent a key the provider streams as "not configured"
-    /// (Pi requires `apiKey` or `oauth` when a registration defines models, model-registry.ts:880-882).
+    /// store so request auth resolves to it (pi's composed provider resolves the registration's
+    /// `apiKey` per request, `composeApiKeyAuth`, `provider-composer.ts:578` @f1b2e77f5); absent a
+    /// key the provider streams as "not configured". Its api registry is the process-wide one, so
+    /// it declares [`ApiDispatch::Global`] (`streamWith`'s fall-through, `:598-599`; PROV-157).
     pub fn new(
         id: impl Into<ProviderId>,
         name: impl Into<String>,
@@ -51,7 +56,8 @@ impl ConfigProvider {
         // `env_key` with no vars: a stored credential owns the provider (used here); with none stored
         // it resolves to "not configured" rather than reading an unrelated env var.
         let auth = ProviderAuth::with_api_key(env_key("API key", Vec::<String>::new()));
-        let inner = WireProvider::new(id, name, models, auth, store, Arc::new(builtin_registry()));
+        let inner = WireProvider::new(id, name, models, auth, store, Arc::new(builtin_registry()))
+            .with_api_dispatch(ApiDispatch::Global);
         Self { inner }
     }
 
@@ -243,6 +249,24 @@ mod tests {
         assert!(
             err.contains("transport"),
             "expected transport error, got: {err}"
+        );
+    }
+
+    /// PROV-157 — a registration under a fresh id is pi's composed provider with no base
+    /// (`model-runtime.ts:921-933` @f1b2e77f5 → `composeModelProvider`), whose `streamWith` falls
+    /// through to the process-wide registry: ``throw new Error(`No API provider registered for api:
+    /// ${model.api}`)`` (`provider-composer.ts:598-599`).
+    #[tokio::test]
+    async fn a_registration_on_an_unregistered_api_reports_the_registry_miss() {
+        let mut m = model("acme-1", "http://127.0.0.1:1/v1");
+        m.api = "no-such-api".into();
+        let p = ConfigProvider::new("acme", "Acme", Some("sk-acme".into()), vec![m.clone()]);
+        let msg =
+            collect_message(p.stream(&m, &Context::default(), &StreamOptions::default())).await;
+        assert_eq!(msg.stop_reason, StopReason::Error);
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some("No API provider registered for api: no-such-api")
         );
     }
 

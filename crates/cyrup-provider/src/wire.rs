@@ -27,7 +27,7 @@ use crate::images::{
 use crate::model::Model;
 use crate::provider::Provider;
 use crate::stream::{StreamEvent, StreamOptions};
-use cyrup_core::{AssistantMessage, EventStream, ProviderId, StopReason};
+use cyrup_core::{ApiId, EventStream, ProviderId};
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -84,6 +84,53 @@ pub struct WireProvider {
     /// operations. When set, it answers the image and classifier operations INSTEAD of
     /// `images` and `classifiers`.
     operations_base: Option<Arc<dyn Provider>>,
+    /// Which of pi's two api lookups [`WireProvider::registry`] stands for, and so what a miss on
+    /// `model.api` reports (PROV-157). [`ApiDispatch::Own`] unless the constructing site declares
+    /// otherwise.
+    api_dispatch: ApiDispatch,
+}
+
+/// Which of pi's two api lookups a [`WireProvider`]'s [`ApiRegistry`] stands for — and so which of
+/// pi's two texts a stream reports when the registry has no entry for `model.api` (PROV-157).
+///
+/// cyrup dispatches every provider through an [`ApiRegistry`] keyed on `model.api`; pi has two
+/// different maps behind that one lookup, and they fail differently. Both texts are
+/// [`ProviderError`] variants; this type decides between them, so no construction site spells
+/// either string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApiDispatch {
+    /// The provider's OWN api map — pi `createProvider({ api })` (`models.ts:1070-1083`
+    /// @f1b2e77f5), which every built-in is. A miss is [`ProviderError::NoApiImpl`]: `Provider
+    /// <id> has no API implementation for "<api>"`.
+    #[default]
+    Own,
+    /// The PROCESS-WIDE api registry — reached by pi's composed provider (`composeModelProvider`'s
+    /// `streamWith` falls through to `getApiProvider(model.api)`, `provider-composer.ts:598-599`),
+    /// which is what a `models.json` block and a guest registration under a fresh id are
+    /// (`model-runtime.ts:921-933` → `composeModelProvider`), and by a provider that streams through
+    /// `compat` `stream` (llama.cpp, `extensions/llama/provider.ts:288-289`). A miss is
+    /// [`ProviderError::UnregisteredApi`]: `No API provider registered for api: <api>`.
+    ///
+    /// A provider composed over a base ([`WireProvider::with_operations_from`]) first asks the base:
+    /// pi hands `base.stream` every model whose api the base's own chat catalog lists
+    /// (`supportsBaseApi`, `provider-composer.ts:582`, `:593-596`), so a miss there is the base's
+    /// [`ApiDispatch::Own`] text. [`WireProvider::stream`] resolves that per request.
+    Global,
+}
+
+impl ApiDispatch {
+    /// The error a miss on `api` reports. `provider` is the dispatching provider's own id (pi
+    /// `input.id`); [`ApiDispatch::Global`]'s text names no provider.
+    #[must_use]
+    pub fn miss(self, provider: &ProviderId, api: &ApiId) -> ProviderError {
+        match self {
+            ApiDispatch::Own => ProviderError::NoApiImpl {
+                provider: provider.clone(),
+                api: api.clone(),
+            },
+            ApiDispatch::Global => ProviderError::UnregisteredApi(api.clone()),
+        }
+    }
 }
 
 /// A provider's credential-scoped availability policy (Pi `Provider.filterModels?`,
@@ -124,6 +171,7 @@ impl WireProvider {
             classifier_models: Vec::new(),
             classifiers: None,
             operations_base: None,
+            api_dispatch: ApiDispatch::Own,
         }
     }
 
@@ -217,6 +265,16 @@ impl WireProvider {
     #[must_use]
     pub fn with_operations_from(mut self, base: Arc<dyn Provider>) -> Self {
         self.operations_base = Some(base);
+        self
+    }
+
+    /// Declare which of pi's api lookups this provider's registry stands for (PROV-157). A
+    /// construction site that is pi's composed provider, or a `compat`-streaming one, declares
+    /// [`ApiDispatch::Global`]; leaving the default [`ApiDispatch::Own`] there reports
+    /// `createProvider`'s text where pi reports the registry's.
+    #[must_use]
+    pub fn with_api_dispatch(mut self, api_dispatch: ApiDispatch) -> Self {
+        self.api_dispatch = api_dispatch;
         self
     }
 
@@ -394,6 +452,19 @@ impl Provider for WireProvider {
         let store = self.store.clone();
         let auth_ctx = self.auth_ctx.clone();
         let registry = self.registry.clone();
+        // pi's composer hands `base.stream` every model whose api the base's own chat catalog lists
+        // (`supportsBaseApi`, `provider-composer.ts:582`, `:593-596` @f1b2e77f5), reading the base's
+        // live catalog per request; only the rest fall through to the registry. A composition is
+        // over its own id (`composeModelProvider(providerId, base, …)`), so the base's miss text
+        // names this provider.
+        let api_dispatch = match (&self.operations_base, self.api_dispatch) {
+            (Some(base), ApiDispatch::Global)
+                if base.models().iter().any(|row| row.api == model.api) =>
+            {
+                ApiDispatch::Own
+            }
+            (_, api_dispatch) => api_dispatch,
+        };
         let model = model.clone();
         let context = context.clone();
         let options = options.clone();
@@ -401,10 +472,22 @@ impl Provider for WireProvider {
 
         tokio::spawn(async move {
             let model_id = model.id.as_str().to_string();
+            // pi's setup failures end in `lazyStream`'s `createSetupErrorMessage`, which carries
+            // `provider: model.provider` and `api: model.api` (`api/lazy.ts:4-12` @f1b2e77f5).
+            let setup_error = |error: ProviderError| {
+                error.into_error_event(model.provider.clone(), &model_id, Some(model.api.clone()))
+            };
 
             // 1. Resolve auth (failures → terminal Error, never thrown — R-01-018). The
             // provider-scoped env overlay (Pi `options.env`) participates in env-key resolution /
             // base-url (Pi `applyAuth`, `models.ts:482` @v0.83.0).
+            //
+            // [CYRUP-DELTA, mechanism] This task is pi's `Models.stream` (`applyAuth`,
+            // `models.ts:843-875`) and `createProvider`'s `dispatch` (`:1072-1083`) in one, because
+            // the agent streams through `Provider::stream` directly (`cyrup-agent` `stream_fn.rs`):
+            // so a direct call resolves auth BEFORE the dispatch lookup, where pi's bare
+            // `provider.stream` dispatches unauthenticated. Through `Models::stream` the order is
+            // pi's: `Models` applies auth first either way.
             let overrides = AuthOverrides {
                 api_key: options.api_key.as_deref(),
                 env: options.env.as_ref(),
@@ -421,21 +504,17 @@ impl Provider for WireProvider {
             .await
             {
                 Ok(Some(result)) => result,
+                // pi `applyAuth` (`models.ts:859-861`): `Provider is not configured:
+                // ${model.provider}`.
                 Ok(None) => {
-                    let msg = AssistantMessage::errored(
-                        id.clone(),
-                        &model_id,
-                        Some(model.api.clone()),
-                        StopReason::Error,
-                        format!("provider '{id}' is not configured (no credential or env key)"),
-                    );
-                    sink.send(StreamEvent::terminal(msg)).await;
+                    sink.send(setup_error(ProviderError::NotConfigured(
+                        model.provider.clone(),
+                    )))
+                    .await;
                     return;
                 }
                 Err(e) => {
-                    let pe = ProviderError::from(e);
-                    sink.send(pe.into_error_event(id.clone(), &model_id, Some(model.api.clone())))
-                        .await;
+                    sink.send(setup_error(ProviderError::from(e))).await;
                     return;
                 }
             };
@@ -451,15 +530,12 @@ impl Provider for WireProvider {
                 }
             }
 
-            // 2. Look up the ApiImpl for model.api (missing → terminal Error — R-01-008).
-            let api_impl = match registry.get(&model.api) {
-                Some(imp) => imp,
-                None => {
-                    let pe = ProviderError::NoApiImpl(model.api.clone());
-                    sink.send(pe.into_error_event(id.clone(), &model_id, Some(model.api.clone())))
-                        .await;
-                    return;
-                }
+            // 2. Look up the ApiImpl for model.api (missing → terminal Error — R-01-008), in
+            // whichever of pi's maps the registry stands for (PROV-157).
+            let Some(api_impl) = registry.get(&model.api) else {
+                sink.send(setup_error(api_dispatch.miss(&id, &model.api)))
+                    .await;
+                return;
             };
 
             // 3. Drive the wire protocol. `run` emits Start..deltas..terminal into the sink.
@@ -487,7 +563,9 @@ mod tests {
     use crate::model::{Modality, ModelCost};
     use crate::stream::collect_message;
     use crate::stream::sse::{SseRequest, open_sse};
-    use cyrup_core::{ApiId, CancelToken, Content, ToolCall, ToolCallId, Usage};
+    use cyrup_core::{
+        AssistantMessage, CancelToken, Content, StopReason, ToolCall, ToolCallId, Usage,
+    };
     use futures::StreamExt;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -714,9 +792,15 @@ mod tests {
         assert_eq!(seen_key.lock().unwrap().as_deref(), Some("sk-test"));
     }
 
+    /// PROV-157 — pi `createProvider`'s dispatch miss (`models.ts:1072-1083` @f1b2e77f5):
+    /// ``throw new ModelsError("stream", `Provider ${input.id} has no API implementation for
+    /// "${model.api}"`)`` inside `lazyStream`, whose setup-error message carries `provider:
+    /// model.provider` and `api: model.api` (`api/lazy.ts:4-12`). The model names ANOTHER provider
+    /// on purpose: the text takes the provider's own id, the message the model's.
     #[tokio::test]
     async fn missing_api_impl_yields_error_terminal() {
-        let model = test_model("no-such-api");
+        let mut model = test_model("no-such-api");
+        model.provider = "elsewhere".into();
         let registry = ApiRegistry::new(); // nothing registered
         let provider = provider_with(registry, &model);
         let msg = collect_message(provider.stream(
@@ -726,7 +810,81 @@ mod tests {
         ))
         .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
-        assert!(msg.error_message.unwrap().contains("no API implementation"));
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some(r#"Provider p has no API implementation for "no-such-api""#)
+        );
+        assert_eq!(msg.provider.as_str(), "elsewhere");
+        assert_eq!(msg.api.as_str(), "no-such-api");
+    }
+
+    /// PROV-157 — a provider whose registry stands for pi's process-wide one reports the
+    /// registry's text, which names no provider (`compat.ts:244-250`, `provider-composer.ts:
+    /// 598-599` @f1b2e77f5); the default is `createProvider`'s own map.
+    ///
+    /// `ApiDispatch` is new, so this cannot be red at the base; it is mutation-proved (swap
+    /// [`ApiDispatch::miss`]'s arms and it fails, with `missing_api_impl_yields_error_terminal`).
+    #[tokio::test]
+    async fn a_global_dispatch_miss_is_the_registry_text() {
+        assert_eq!(ApiDispatch::default(), ApiDispatch::Own);
+        let model = test_model("no-such-api");
+        let provider =
+            provider_with(ApiRegistry::new(), &model).with_api_dispatch(ApiDispatch::Global);
+        let msg = collect_message(provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
+        assert_eq!(msg.stop_reason, StopReason::Error);
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some("No API provider registered for api: no-such-api")
+        );
+    }
+
+    /// pi `providers.test.ts:695-705` @f1b2e77f5, "produces a stream error for a model whose api
+    /// has no implementation": a provider with `api: { "api-a": … }` handed a model on
+    /// `api-ghost`. pi asserts `toContain("no API implementation")`; this asserts the whole text.
+    /// The credential is there only because a `WireProvider` resolves auth before it dispatches
+    /// (the `[CYRUP-DELTA, mechanism]` in [`WireProvider::stream`]); pi's bare
+    /// `provider.streamSimple` dispatches unauthenticated.
+    #[tokio::test]
+    async fn a_model_whose_api_has_no_implementation_errors_the_stream() {
+        let registry = ApiRegistry::new();
+        registry.register_impl(Arc::new(ScriptedApi {
+            api: ApiId::from("api-a"),
+            seen_key: Arc::new(Mutex::new(None)),
+        }));
+        let mut known = test_model("api-a");
+        known.id = "model-a".into();
+        known.provider = "mixed".into();
+        let provider = WireProvider::new(
+            "mixed",
+            "Mixed",
+            vec![known],
+            ProviderAuth::with_api_key(env_key("Test", Vec::<String>::new())),
+            Arc::new(
+                InMemoryCredentialStore::new()
+                    .with_credential(ProviderId::from("mixed"), Credential::api_key("k")),
+            ),
+            Arc::new(registry),
+        )
+        .with_auth_context(Arc::new(MapCtx(BTreeMap::new())));
+        let mut ghost = test_model("api-ghost");
+        ghost.id = "model-x".into();
+        ghost.provider = "mixed".into();
+        let msg = collect_message(provider.stream_simple(
+            &ghost,
+            &Context::default(),
+            &crate::utils::simple_options::SimpleStreamOptions::default(),
+        ))
+        .await;
+        assert_eq!(msg.stop_reason, StopReason::Error);
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some(r#"Provider mixed has no API implementation for "api-ghost""#)
+        );
     }
 
     #[tokio::test]
@@ -754,7 +912,27 @@ mod tests {
         ))
         .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
-        assert!(msg.error_message.unwrap().contains("not configured"));
+        // pi `applyAuth` (`models.ts:859-861` @f1b2e77f5), the half of pi's `Models.stream` a
+        // `WireProvider` stands in for: ``Provider is not configured: ${model.provider}``.
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some("Provider is not configured: p")
+        );
+        // The text names `model.provider`, and the message carries it (`api/lazy.ts:4-12`), even
+        // when a direct call hands the provider another provider's model.
+        let mut stray = model.clone();
+        stray.provider = "elsewhere".into();
+        let msg = collect_message(provider.stream(
+            &stray,
+            &Context::default(),
+            &StreamOptions::default(),
+        ))
+        .await;
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some("Provider is not configured: elsewhere")
+        );
+        assert_eq!(msg.provider.as_str(), "elsewhere");
     }
 
     // ---- A TEST ApiImpl that drives the real SSE transport against a local mock server ----

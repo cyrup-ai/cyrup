@@ -74,8 +74,12 @@ impl AuthError {
 /// abort/serde/io vocabulary stays consistent (arch-00 §8).
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    /// Unknown provider id. Code `provider`.
-    #[error("unknown provider: {0}")]
+    /// No provider is registered under the model's provider id — pi `requireProvider`
+    /// (`packages/ai/src/models.ts:830-836` @f1b2e77f5):
+    /// ``throw new ModelsError("provider", `Unknown provider: ${model.provider}`)``. The ONE home
+    /// of that text: `Models::stream`, `generate_images` and `classify` all render this variant.
+    /// Code `provider`.
+    #[error("Unknown provider: {0}")]
     UnknownProvider(ProviderId),
     /// The provider's auth strategy resolved to nothing for this request (PROV-108). pi
     /// `applyAuth` (`packages/ai/src/models.ts:843-875` @f1b2e77f5), `:859-861`:
@@ -83,9 +87,24 @@ pub enum ProviderError {
     /// — the same text the classifier and image entry points already report. Code `auth`.
     #[error("Provider is not configured: {0}")]
     NotConfigured(ProviderId),
-    /// No API implementation registered for `model.api`. Code `stream`.
-    #[error("no API implementation for {0}")]
-    NoApiImpl(ApiId),
+    /// The provider's OWN api map has no entry for `model.api` — pi `createProvider`'s dispatch
+    /// miss (`models.ts:1072-1083` @f1b2e77f5), thrown inside `lazyStream`:
+    /// ``throw new ModelsError("stream", `Provider ${input.id} has no API implementation for
+    /// "${model.api}"`)``. `provider` is the provider's own id (`input.id`), which a direct call
+    /// can hand a model of another provider. PROV-157. Code `stream`.
+    #[error("Provider {provider} has no API implementation for \"{api}\"")]
+    NoApiImpl { provider: ProviderId, api: ApiId },
+    /// The PROCESS-WIDE api registry has no entry for the api — pi's one text for that lookup:
+    /// `compat` `resolveApiProvider` (`compat.ts:244-250`), images' `resolveImagesApiProvider`
+    /// (`images.ts:6-12`) and a composed provider's fall-through (`provider-composer.ts:598-599`)
+    /// all ``throw new Error(`No API provider registered for api: ${api}`)``. Which lookup a
+    /// provider's registry stands for is [`crate::wire::ApiDispatch`]. PROV-157.
+    ///
+    /// Code `stream`, the dispatch-miss class [`ProviderError::NoApiImpl`] is in: pi throws a bare
+    /// `Error`, which has no code [CYRUP-DELTA, unrepresentable — every variant carries a
+    /// func-01 R-01-017 code].
+    #[error("No API provider registered for api: {0}")]
+    UnregisteredApi(ApiId),
     /// Dynamic model-catalog refresh failed. Code `model_source`.
     #[error("model source refresh failed: {0}")]
     ModelSource(#[source] BoxErr),
@@ -132,7 +151,7 @@ impl ProviderError {
         match self {
             ProviderError::UnknownProvider(_) => "provider",
             ProviderError::NotConfigured(_) => "auth",
-            ProviderError::NoApiImpl(_) => "stream",
+            ProviderError::NoApiImpl { .. } | ProviderError::UnregisteredApi(_) => "stream",
             ProviderError::ModelSource(_) => "model_source",
             ProviderError::Http { .. } | ProviderError::RetryDelay(_) => "http",
             ProviderError::Transport(_) => "transport",
@@ -162,7 +181,11 @@ impl ProviderError {
         match self {
             ProviderError::UnknownProvider(p) => ProviderError::UnknownProvider(p.clone()),
             ProviderError::NotConfigured(p) => ProviderError::NotConfigured(p.clone()),
-            ProviderError::NoApiImpl(a) => ProviderError::NoApiImpl(a.clone()),
+            ProviderError::NoApiImpl { provider, api } => ProviderError::NoApiImpl {
+                provider: provider.clone(),
+                api: api.clone(),
+            },
+            ProviderError::UnregisteredApi(a) => ProviderError::UnregisteredApi(a.clone()),
             ProviderError::ModelSource(e) => ProviderError::ModelSource(e.to_string().into()),
             ProviderError::Http { status, message } => ProviderError::Http {
                 status: *status,
@@ -223,7 +246,15 @@ mod tests {
             ProviderError::UnknownProvider("x".into()).code(),
             "provider"
         );
-        assert_eq!(ProviderError::NoApiImpl("y".into()).code(), "stream");
+        assert_eq!(
+            ProviderError::NoApiImpl {
+                provider: "p".into(),
+                api: "y".into()
+            }
+            .code(),
+            "stream"
+        );
+        assert_eq!(ProviderError::UnregisteredApi("y".into()).code(), "stream");
         assert_eq!(
             ProviderError::Http {
                 status: 500,
@@ -235,6 +266,38 @@ mod tests {
         assert_eq!(ProviderError::Aborted.code(), "aborted");
         let ae = AuthError::oauth("p".into(), "nope");
         assert_eq!(ProviderError::from(ae).code(), "oauth");
+    }
+
+    /// PROV-157 — pi's three dispatch texts, whole, and `reproduce` keeps each (the refresh dedup
+    /// fans one error out to every awaiter, so a variant it rewrote would change the text a
+    /// second caller sees). The struct variant and `UnregisteredApi` are new, so this cannot
+    /// compile at the base; it is mutation-proved (map either to `Decode` in `reproduce`, or edit
+    /// any `#[error]` literal, and it fails).
+    #[test]
+    fn dispatch_errors_render_pis_text_and_survive_reproduce() {
+        let cases = [
+            (
+                ProviderError::NoApiImpl {
+                    provider: "typesafe".into(),
+                    api: "openai-responses".into(),
+                },
+                r#"Provider typesafe has no API implementation for "openai-responses""#,
+            ),
+            (
+                ProviderError::UnregisteredApi("openrouter-images".into()),
+                "No API provider registered for api: openrouter-images",
+            ),
+            (
+                ProviderError::UnknownProvider("ghost".into()),
+                "Unknown provider: ghost",
+            ),
+        ];
+        for (error, text) in cases {
+            assert_eq!(error.to_string(), text);
+            let copy = error.reproduce();
+            assert_eq!(copy.to_string(), text);
+            assert_eq!(copy.code(), error.code(), "{text}");
+        }
     }
 
     #[test]

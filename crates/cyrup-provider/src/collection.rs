@@ -544,7 +544,7 @@ impl Models {
         let Some(provider) = self.providers.get(model.provider.as_str()) else {
             return AssistantImages::errored(
                 model,
-                format!("Unknown provider: {}", model.provider),
+                ProviderError::UnknownProvider(model.provider.clone()).to_string(),
                 options.is_aborted(),
             );
         };
@@ -638,7 +638,7 @@ impl Models {
     /// `core/model-registry.ts:168-173`).
     ///
     /// **Never fails as a call**: an unknown provider (`Unknown provider: ${model.provider}`,
-    /// `:824-829`), a provider that is not configured (`Provider is not configured: ...`,
+    /// `requireProvider`, `:830-836` @f1b2e77f5), a provider that is not configured (`Provider is not configured: ...`,
     /// `:853-855`), a failed auth resolution, and a provider without classification
     /// ([`Provider::classify`]'s default) all come back as an error [`ClassifierResult`], marked
     /// `aborted` when the request was cancelled (`classifierErrorResult(model, error,
@@ -670,7 +670,7 @@ impl Models {
         let Some(provider) = self.providers.get(model.provider.as_str()) else {
             return ClassifierResult::errored(
                 model,
-                format!("Unknown provider: {}", model.provider),
+                ProviderError::UnknownProvider(model.provider.clone()).to_string(),
                 options.is_aborted(),
             );
         };
@@ -1628,7 +1628,37 @@ mod tests {
             collect_message(models.stream(&m, &Context::default(), &StreamOptions::default()))
                 .await;
         assert_eq!(msg.stop_reason, StopReason::Error);
-        assert!(msg.error_message.unwrap().contains("unknown provider"));
+        // pi `requireProvider` (`models.ts:830-836` @f1b2e77f5).
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some("Unknown provider: ghost")
+        );
+    }
+
+    /// pi `Models.generateImages` runs `requireProvider` (`models.ts:830-836` @f1b2e77f5) inside the
+    /// `try` that `imageErrorResult` catches: the image surface reports the SAME text the stream
+    /// does, which `ProviderError::UnknownProvider` is the one home of (PROV-157).
+    ///
+    /// GUARD, not a red proof: green at the base, where this site spelled the text with its own
+    /// `format!`. It pins that the site now renders the variant: change the variant's `#[error]`
+    /// literal and this and the stream tests go red together.
+    #[tokio::test]
+    async fn generate_images_unknown_provider_reports_require_providers_text() {
+        let models = create_models(CreateModelsOptions::default());
+        let mut image =
+            crate::providers::openrouter_image_model("google/gemini-2.5-flash-image").expect("row");
+        image.provider = "ghost".into();
+        let result = models
+            .generate_images(
+                &image,
+                &crate::images::ImagesContext::default(),
+                &crate::images::ImagesOptions::default(),
+            )
+            .await;
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("Unknown provider: ghost")
+        );
     }
 
     #[tokio::test]
@@ -1669,7 +1699,11 @@ mod tests {
         let opts = SimpleStreamOptions::default();
         let msg = collect_message(models.stream_simple(&m, &Context::default(), &opts)).await;
         assert_eq!(msg.stop_reason, StopReason::Error);
-        assert!(msg.error_message.unwrap().contains("unknown provider"));
+        // pi `requireProvider` (`models.ts:830-836` @f1b2e77f5).
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some("Unknown provider: ghost")
+        );
     }
 
     #[tokio::test]
@@ -1713,7 +1747,11 @@ mod tests {
         let opts = SimpleStreamOptions::default();
         let msg = models.complete_simple(&m, &Context::default(), &opts).await;
         assert_eq!(msg.stop_reason, StopReason::Error);
-        assert!(msg.error_message.unwrap().contains("unknown provider"));
+        // pi `requireProvider` (`models.ts:830-836` @f1b2e77f5).
+        assert_eq!(
+            msg.error_message.as_deref(),
+            Some("Unknown provider: ghost")
+        );
     }
 
     #[test]

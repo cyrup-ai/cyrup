@@ -14,7 +14,8 @@
 //!
 //! 1. `composeModelProvider` synthesizes a `Provider` even when `base` is `undefined`
 //!    (provider-composer.ts:411-437), so a provider that exists ONLY in `models.json` is a real,
-//!    streamable provider. Its `streamWith` falls through to `getApiProvider(model.api)` (:459-465).
+//!    streamable provider. Its `streamWith` falls through to `getApiProvider(model.api)`
+//!    (`:583-603` @f1b2e77f5).
 //! 2. Every consumer reads that one collection: `--list-models`
 //!    (`modelRegistry.getAvailable()`, list-models.ts:35), `find`, `setModel`, `stream`. A caller
 //!    that reaches for the raw built-in registry is reading a registry Pi does not have.
@@ -25,17 +26,22 @@
 //! cyrup's analog of `getApiProvider(model.api)` is [`WireProvider`], which holds a catalog + a
 //! [`ProviderAuth`] and dispatches each request through the shared [`ApiRegistry`] keyed on
 //! `model.api`. Every built-in text provider in `cyrup-provider`'s `providers/all.rs` **is** a
-//! `WireProvider` (they differ only in id/name/baseUrl/catalog/auth), so building the composed
-//! provider the same way — carrying the base's name and baseUrl unless the block sets its own
-//! (provider-composer.ts:607-608, CFG-113) — reproduces the built-in's behavior exactly when there
-//! is nothing to compose, and adds the overlay when there is.
+//! `WireProvider` (they differ only in id/name/baseUrl/catalog/auth), so the composed provider is
+//! built the same way, carrying the base's name and baseUrl unless the block sets its own
+//! (provider-composer.ts:607-608, CFG-113). It declares [`ApiDispatch::Global`]: its registry is
+//! `streamWith`'s process-wide one, and a model on an api its base's chat catalog lists is the base's
+//! to answer (`supportsBaseApi`, `:582`, `:593-596`), which [`WireProvider`] resolves per request
+//! through [`WireProvider::with_operations_from`]. So a miss reports pi's text on both branches
+//! (PROV-157). Where the base is one of pi's single-api built-ins, pi's base streams any model
+//! through its one api (`apiFor = single ?? byApi[model.api]`, `models.ts:1070`) where cyrup
+//! dispatches on `model.api`: that is PROV-160, not a composition question.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use cyrup_core::ProviderId;
 use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
-use cyrup_provider::wire::WireProvider;
+use cyrup_provider::wire::{ApiDispatch, WireProvider};
 use cyrup_provider::{
     AnyModel, ApiKeyAuth, ApiRegistry, AuthContext, AuthError, AuthResult, ClassifierModel,
     CreateModelsOptions, Credential, CredentialStore, ImageModel, InMemoryCredentialStore, Model,
@@ -482,7 +488,11 @@ impl ModelFile {
                 registry.clone(),
             )
             .with_image_models(base_images)
-            .with_classifier_models(base_classifiers);
+            .with_classifier_models(base_classifiers)
+            // `streamWith` falls through to the process-wide registry (provider-composer.ts:
+            // 598-599); a model its base lists is the base's (`:593-596`), resolved per request
+            // from `with_operations_from` below. PROV-157.
+            .with_api_dispatch(ApiDispatch::Global);
             if let Some(base_url) = base_url {
                 provider = provider.with_base_url(base_url);
             }
