@@ -329,13 +329,19 @@ const STILL_CONNECTING_NOTICE: &str =
 /// How long a `session_start` may spend shutting the previous session's servers down before it
 /// starts the new session's build.
 ///
-/// What the teardown waits on, in order: the previous generation's connects, aborted, end at their
-/// next look at the signal, and the one stage that does not look — an OAuth token refresh, which is
-/// not abandoned half-way because a rotated refresh token would be lost — is bounded by rmcp's 30 s
-/// per OAuth request (`transport/auth.rs:31` @3.1.4); then the connections close together, an HTTP
-/// session's `DELETE` under rmcp's 5 s (`SESSION_CLEANUP_TIMEOUT`,
-/// `transport/streamable_http_client.rs:35`) and a stdio child's exit under its 3 s before the kill
-/// ([`crate::stdio_child::MAX_WAIT_ON_DROP`], rmcp's `MAX_WAIT_ON_DROP_SECS`).
+/// What the teardown waits on, in order. The previous generation's connects are aborted, and each
+/// ends at its next look at its attempt's signal; every stage looks, the OAuth token lookup
+/// included, which is raced against the attempt as upstream's OAuth fetches are
+/// (`createAuthProvider`, `server-manager.ts`). A keyring read already under way finishes on its
+/// blocking thread, but nothing waits for it. A connect the abort caught after its handshake closes
+/// what it had built, and then the live connections close together: an HTTP session's `DELETE`
+/// under rmcp's 5 s (`SESSION_CLEANUP_TIMEOUT`, `transport/streamable_http_client.rs:35`) and a
+/// stdio child's exit under its 3 s before the kill ([`crate::stdio_child::MAX_WAIT_ON_DROP`],
+/// rmcp's `MAX_WAIT_ON_DROP_SECS`). So the closing takes at most 10 s.
+///
+/// The 35 s is a ceiling over those 10 s, not a sum of bounds; the margin covers what nothing here
+/// bounds, the metadata and trace flushes that write to disk. A teardown that outlives it costs the
+/// new session its servers rather than holding its start without end.
 const PREVIOUS_GENERATION_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(35);
 
 /// How many calls' still-connecting notes are kept at once (see `McpExtension::remember_note`).
@@ -4747,9 +4753,13 @@ done
                 build.settle(BuildState::Failed("the server never answered".to_string()));
             })
         };
+        // Each call is raced against a bound well past the instant it should end at, so a wait that
+        // misses its end fails here, on the paused clock, instead of parking the test forever.
+        let bound = std::time::Duration::from_secs(120);
         let started = tokio::time::Instant::now();
-        let result = call(cyrup_core::CancelToken::new())
+        let result = tokio::time::timeout(bound, call(cyrup_core::CancelToken::new()))
             .await
+            .expect("the call is answered when its build settles")
             .expect("a failed build is reported, not thrown");
         assert_eq!(
             result.details.as_ref().and_then(|d| d.get("error")),
@@ -4770,7 +4780,10 @@ done
             })
         };
         let started = tokio::time::Instant::now();
-        let error = call(cancel).await.expect_err("an aborted call throws");
+        let error = tokio::time::timeout(bound, call(cancel))
+            .await
+            .expect("the call ends at its own cancel")
+            .expect_err("an aborted call throws");
         assert_eq!(error.message, crate::abort::ABORTED_FALLBACK_REASON);
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
         canceller.await.unwrap();
@@ -4779,7 +4792,12 @@ done
         let cancel = cyrup_core::CancelToken::new();
         cancel.cancel();
         let started = tokio::time::Instant::now();
-        assert!(call(cancel).await.is_err());
+        assert!(
+            tokio::time::timeout(bound, call(cancel))
+                .await
+                .expect("a call cancelled before it began does not wait")
+                .is_err()
+        );
         assert_eq!(started.elapsed(), std::time::Duration::ZERO);
     }
 

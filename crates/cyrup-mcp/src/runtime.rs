@@ -5412,14 +5412,26 @@ impl ConnectionBuilder {
             // and, with it, the token that provider would attach. Explicit OAuth reads the store on
             // the FIRST attempt; implicit OAuth reaches here only after a 401 has proven it needed
             // to — which is the whole point of the two-state split (MCP-115).
+            //
+            // Raced against the attempt. Upstream's OAuth fetches run under the attempt's signal
+            // (`createAuthProvider` in `server-manager.ts` combines the OAuth runtime's signal with
+            // it); the provider here looks only at the generation's, so a lookup that does not
+            // return — a keyring that hangs, a token refresh nobody answers — held a `close` of
+            // this one server until it did.
             let oauth_token = match &auth_state {
                 crate::oauth::HttpAuthProviderState::Explicit => {
-                    self.auth.authorize(name, &server_url, None).await?
+                    crate::abort::abortable(
+                        self.auth.authorize(name, &server_url, None),
+                        &request.attempt,
+                    )
+                    .await??
                 }
                 crate::oauth::HttpAuthProviderState::ImplicitChallenged { challenge } => {
-                    self.auth
-                        .authorize(name, &server_url, challenge.as_deref())
-                        .await?
+                    crate::abort::abortable(
+                        self.auth.authorize(name, &server_url, challenge.as_deref()),
+                        &request.attempt,
+                    )
+                    .await??
                 }
                 crate::oauth::HttpAuthProviderState::Disabled
                 | crate::oauth::HttpAuthProviderState::ImplicitDeferred => None,
@@ -8574,6 +8586,72 @@ done
         let outcome = tokio::time::timeout(Duration::from_secs(4), connecting)
             .await
             .expect("the connect waited for the secret command after its attempt was aborted")
+            .expect("the connect task");
+        let error = outcome.err().expect("an aborted connect is an error");
+        assert!(
+            matches!(error, McpError::Aborted(_)),
+            "expected an abort, got {error}"
+        );
+        assert!(aborted.elapsed() < Duration::from_secs(4));
+    }
+
+    /// A token lookup that never returns: a keyring that hangs, or a refresh against an
+    /// authorization server that does not answer.
+    #[derive(Debug, Default)]
+    struct HangingAuth {
+        asked: tokio::sync::Notify,
+    }
+
+    impl HttpAuthProvider for HangingAuth {
+        fn authorize<'a>(
+            &'a self,
+            _server: &'a str,
+            _url: &'a str,
+            _challenge: Option<&'a str>,
+        ) -> BoxFuture<'a, McpResult<Option<String>>> {
+            self.asked.notify_one();
+            Box::pin(futures::future::pending())
+        }
+
+        fn invalidate_auth_entry_cache(&self, _server: &str) {}
+    }
+
+    /// An OAuth server's connect ends at its attempt's abort while its token lookup is still out,
+    /// as upstream's does: its OAuth fetches run under the attempt's signal (`createAuthProvider`,
+    /// `server-manager.ts`). The lookup here looked only at the generation's, so closing one server
+    /// whose keyring hung or whose refresh went unanswered waited on the lookup — up to 30 s per
+    /// OAuth request, and without end for a keyring.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_attempt_does_not_wait_for_its_oauth_token() {
+        // `auth: "oauth"`: the lookup runs before the first request.
+        abort_while_the_token_lookup_hangs(explicit_oauth_entry("http://127.0.0.1:9/mcp")).await;
+        // No `auth`: the lookup runs once a 401 has asked for it.
+        let fixture = HttpFixture::start(usize::MAX).await;
+        abort_while_the_token_lookup_hangs(http_entry(&fixture.url)).await;
+    }
+
+    async fn abort_while_the_token_lookup_hangs(entry: ServerEntry) {
+        let auth = Arc::new(HangingAuth::default());
+        let request = request("oauth", entry);
+        let attempt = request.attempt.clone();
+        let connecting = {
+            let auth = Arc::clone(&auth);
+            tokio::spawn(async move {
+                builder()
+                    .with_auth_provider(auth as Arc<dyn HttpAuthProvider>)
+                    .create_connection(request)
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), auth.asked.notified())
+            .await
+            .expect("the connect asked for its token");
+        let aborted = tokio::time::Instant::now();
+        attempt.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(4), connecting)
+            .await
+            .expect("the connect waited for its OAuth token after its attempt was aborted")
             .expect("the connect task");
         let error = outcome.err().expect("an aborted connect is an error");
         assert!(
