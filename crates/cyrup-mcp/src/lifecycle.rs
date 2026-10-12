@@ -978,18 +978,40 @@ impl McpLifecycleManager {
         *slot = Some(check.clone());
         drop(slot);
 
+        // The `finally` (`lifecycle.ts:135-137`). A JS promise runs to its end whoever awaits it; a
+        // dropped Rust future runs nothing, so a starter cut short — an `input` handler dropped at
+        // the dispatcher's budget — left the memo set for the rest of the generation, and every
+        // later caller joined a pass that had already ended instead of starting one. Detached, the
+        // pass and its `finally` run to the end, and the caller only waits for them.
         let owner = Arc::clone(self);
-        Box::pin(async move {
-            let result = check.clone().await;
-            if let Ok(mut slot) = owner.convergence.lock()
-                && slot
-                    .as_ref()
-                    .is_some_and(|held| Shared::ptr_eq(held, &check))
-            {
-                *slot = None;
+        let finish = {
+            let check = check.clone();
+            async move {
+                let result = check.clone().await;
+                if let Ok(mut slot) = owner.convergence.lock()
+                    && slot
+                        .as_ref()
+                        .is_some_and(|held| Shared::ptr_eq(held, &check))
+                {
+                    *slot = None;
+                }
+                result
             }
-            result
-        })
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let finished = handle.spawn(finish);
+                Box::pin(async move {
+                    finished.await.unwrap_or_else(|join| {
+                        Err(Arc::new(McpError::other(format!(
+                            "MCP keep-alive convergence did not finish: {join}"
+                        ))))
+                    })
+                })
+            }
+            // Off a runtime nothing can be detached; the caller drives the pass as before.
+            Err(_) => Box::pin(finish),
+        }
     }
 
     /// `checkKeepAliveConnections(signal)` (`lifecycle.ts:150-157`) — `parallelLimit` at
@@ -2502,6 +2524,42 @@ mod tests {
             supervisor.log().len(),
             2,
             "the second pass runs and finds `a` already connected"
+        );
+    }
+
+    /// The caller that starts a pass can be dropped before it ends — the `input` handler is, at the
+    /// dispatcher's budget. The pass still runs to its end and its `finally` still clears the memo,
+    /// so the next caller starts a pass rather than joining one nothing is driving.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_whose_starter_is_dropped_still_finishes_and_clears_the_memo() {
+        let supervisor = FakeSupervisor::arc();
+        if let Ok(mut delay) = supervisor.connect_delay.lock() {
+            *delay = Duration::from_millis(50);
+        }
+        let lc = lifecycle_with(Arc::clone(&supervisor));
+        lc.register_server("a", keep_alive_entry(), None);
+        lc.mark_keep_alive("a");
+
+        let starter = lc.ensure_converged(CancelToken::new());
+        let cut = tokio::time::timeout(Duration::from_millis(10), starter).await;
+        assert!(
+            cut.is_err(),
+            "precondition: the starter is dropped mid-pass"
+        );
+        assert!(
+            lc.convergence.lock().unwrap().is_some(),
+            "precondition: the memo is still held by the running pass"
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            supervisor.log(),
+            vec!["connect:a", "connected:a"],
+            "the pass ran to its end without the caller that started it"
+        );
+        assert!(
+            lc.convergence.lock().unwrap().is_none(),
+            "and its `finally` cleared the memo"
         );
     }
 

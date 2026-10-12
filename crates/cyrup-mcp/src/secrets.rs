@@ -221,20 +221,9 @@ pub fn resolve_command_secret(value: &str, context: &str) -> McpResult<String> {
     // would otherwise block forever while this thread polls `try_wait`, and upstream's `maxBuffer`
     // has no such deadlock because libuv reads continuously.
     let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || -> (Vec<u8>, bool) {
-        let Some(mut stdout) = stdout else {
-            return (Vec::new(), false);
-        };
-        let mut buffer = Vec::new();
-        // One byte past the cap is enough to *detect* the overflow, which is all upstream's
-        // `ENOBUFS` does.
-        let mut limited = (&mut stdout).take((COMMAND_SECRET_MAX_OUTPUT_BYTES + 1) as u64);
-        let _ = limited.read_to_end(&mut buffer);
-        let overflowed = buffer.len() > COMMAND_SECRET_MAX_OUTPUT_BYTES;
-        // Drain the rest so the child is never wedged on a full pipe while we wait for it.
-        let mut sink = Vec::new();
-        let _ = stdout.read_to_end(&mut sink);
-        (buffer, overflowed)
+    let (sender, read) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(drain_stdout(stdout));
     });
 
     let started = std::time::Instant::now();
@@ -252,7 +241,17 @@ pub fn resolve_command_secret(value: &str, context: &str) -> McpResult<String> {
         std::thread::sleep(COMMAND_SECRET_POLL);
     };
 
-    let (buffer, overflowed) = reader.join().unwrap_or((Vec::new(), false));
+    // [CYRUP-DELTA] The reader ends at end-of-file, which a process the command started in the
+    // background and that kept its stdout can hold off for ever after the command itself has
+    // exited; joined bare, that held the connect with it. The command's budget covers the read
+    // too: a reader still blocked when it is spent is left to finish on its own thread, and the
+    // secret fails as a command that ran out of time.
+    let remaining = COMMAND_SECRET_TIMEOUT
+        .saturating_sub(started.elapsed())
+        .max(COMMAND_SECRET_POLL);
+    let Ok((buffer, overflowed)) = read.recv_timeout(remaining) else {
+        return Err(failure("command timed out after 10 seconds"));
+    };
 
     let Some(status) = status else {
         return Err(failure("command timed out after 10 seconds"));
@@ -272,6 +271,41 @@ pub fn resolve_command_secret(value: &str, context: &str) -> McpResult<String> {
         return Err(failure("command returned empty output"));
     }
     Ok(resolved)
+}
+
+/// Read a secret command's stdout to the end: up to one byte past the cap, which is enough to
+/// detect an overflow (upstream's `maxBuffer` `ENOBUFS`), then the rest into nothing, so the
+/// command is never wedged on a full pipe.
+fn drain_stdout(stdout: Option<std::process::ChildStdout>) -> (Vec<u8>, bool) {
+    let Some(mut stdout) = stdout else {
+        return (Vec::new(), false);
+    };
+    let mut buffer = Vec::new();
+    let mut limited = (&mut stdout).take((COMMAND_SECRET_MAX_OUTPUT_BYTES + 1) as u64);
+    let _ = limited.read_to_end(&mut buffer);
+    let overflowed = buffer.len() > COMMAND_SECRET_MAX_OUTPUT_BYTES;
+    let mut sink = Vec::new();
+    let _ = stdout.read_to_end(&mut sink);
+    (buffer, overflowed)
+}
+
+/// Run a blocking secret step — a `!command`, which spawns a shell and polls it — off the async
+/// worker, so a tokio worker is not held for the up to [`COMMAND_SECRET_TIMEOUT`] it can take, and
+/// so the future awaiting it can be dropped: a caller that races it against its signal stops
+/// waiting at the signal. The command itself runs to its own end, as upstream's `spawnSync` does.
+///
+/// # Errors
+///
+/// What `work` returns, or [`McpError::Other`] naming `context` when the blocking pool could not
+/// run it.
+pub async fn off_the_worker<T: Send + 'static>(
+    context: &str,
+    work: impl FnOnce() -> McpResult<T> + Send + 'static,
+) -> McpResult<T> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(outcome) => outcome,
+        Err(join) => Err(McpError::other(format!("{context} failed to run: {join}"))),
+    }
 }
 
 /// `resolveCommandSecretsRecord(values, context)` (`utils.ts:155`) — [`resolve_command_secret`] per
@@ -564,6 +598,28 @@ fn validate_resolved_headers(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// [CYRUP-DELTA] A secret command's budget covers reading its output too. A command that starts
+    /// a background process which keeps its stdout exits at once, and its reader waits for an
+    /// end-of-file that process holds back; joined bare, that held the connect for as long as the
+    /// process lived — fifteen seconds here, for ever in general.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_command_is_bounded_even_when_a_background_process_holds_its_output() {
+        let started = std::time::Instant::now();
+        let outcome = resolve_command_secret("!printf hunter2; (sleep 15 &)", "the test");
+        let elapsed = started.elapsed();
+        let error = outcome.expect_err("the output never ended within the budget");
+        assert!(
+            error.to_string().contains("timed out after 10 seconds"),
+            "{error}"
+        );
+        assert!(
+            elapsed >= COMMAND_SECRET_TIMEOUT
+                && elapsed < COMMAND_SECRET_TIMEOUT + Duration::from_secs(2),
+            "the secret took {elapsed:?}, its budget is {COMMAND_SECRET_TIMEOUT:?}"
+        );
+    }
     use std::sync::Arc;
 
     fn env_of(pairs: &[(&str, &str)]) -> EnvFn {

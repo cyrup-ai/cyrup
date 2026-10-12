@@ -118,6 +118,13 @@ pub enum SanctionedWaitKind {
     /// `extensions/mcp/index.ts` @v1.0.4, which awaits the servers' `ready` promises). Always
     /// declared with a ceiling; the handler gives up and lets the call run before it passes.
     ServerConnect,
+    /// A `session_start` handler shutting the previous session's servers down before it starts the
+    /// new session's — the MCP extension's generation handover, whose order upstream awaits
+    /// (`index.ts` `session_start`). Closing a server waits on the server: a stdio child is given
+    /// time to exit before it is killed, an HTTP session is ended with a `DELETE`. Cut at the
+    /// dispatch budget, the handler is dropped before it starts the new session's build, and that
+    /// session has no MCP at all. Always declared with a ceiling derived from those bounds.
+    ServerShutdown,
 }
 
 /// One live sanctioned wait.

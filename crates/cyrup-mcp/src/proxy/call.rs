@@ -1140,10 +1140,14 @@ async fn catch_arm(
             Ok(text_result(message, map))
         }
         ProxyCallError::UrlElicitationRequired { error } => {
-            let action = ctx
-                .env
-                .handle_url_elicitation_required(server_name, &error)
-                .await;
+            // The browser interaction waits on a human; the call's own signal ends that wait, as a
+            // cancelled interaction (`elicitation-handler.ts` answers `cancel` for an aborted one).
+            let action = crate::abort::abortable(
+                ctx.env.handle_url_elicitation_required(server_name, &error),
+                owned,
+            )
+            .await
+            .unwrap_or(UrlElicitationAction::Cancel);
             let message = match action {
                 UrlElicitationAction::Accept =>
                     "The original MCP tool did not run. Complete the opened browser interaction, then retry the tool.".to_string(),
@@ -1637,6 +1641,55 @@ mod tests {
             gateway.structured_content, None,
             "a gateway call has no script to hand the result to"
         );
+    }
+
+    /// The browser interaction a `-32042` asks for waits on a human. The call's own cancel ends
+    /// that wait, and the call reports the interaction as cancelled.
+    #[tokio::test]
+    async fn a_call_cancelled_while_the_user_is_in_the_browser_stops_waiting() {
+        let config = config_with(&[("srv", stdio("a"))]);
+        let env = FakeEnv::default().with_connection("srv", ConnectionStatus::Connected);
+        env.call_needs_url
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        env.url_prompt_hangs
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (ctx, _) = ctx_with(
+            config,
+            &[("srv", vec![ToolMetadata::new("srv_run", "run", "")])],
+            &[],
+            env,
+        );
+        let cancel = CancelToken::new();
+        let call = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                execute_call(
+                    &ctx,
+                    "srv_run",
+                    None,
+                    None,
+                    &cancel,
+                    Some(ApprovalOrigin::Direct),
+                    None,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !call.is_finished(),
+            "precondition: the call is waiting on the browser"
+        );
+        cancel.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+            .await
+            .expect("the call's own cancel ends the browser wait")
+            .expect("the call task joins")
+            .expect("a cancelled interaction is a result, not an error");
+        assert_eq!(text_of(&result), "The URL interaction was cancelled.");
+        let details = result.details.clone().unwrap();
+        assert_eq!(details["error"], json!("url_elicitation_required"));
     }
 
     /// A server `isError` result keeps its blocks and its flag for the script, and is still the

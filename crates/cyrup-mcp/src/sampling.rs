@@ -137,12 +137,15 @@ pub struct SamplingOptions {
 
 impl SamplingOptions {
     /// `getSignal: () => owner.isActive() ? combineAbortSignals(owner.signal, ctx.signal) : owner.signal`
-    /// (`init.ts:131-133`).
+    /// (`init.ts:174-176` @v5.0.0, unchanged at v5.2.0).
     ///
-    /// **Mechanism divergence, recorded.** Upstream composes two `AbortSignal`s with
-    /// `AbortSignal.any`; here a child token is composed by [`crate::abort::combine`] and passed down
-    /// as `StreamOptions.cancel` rather than polled inside the completion. The observable behaviour —
-    /// an in-flight sampling call dies when the turn is cancelled or the session reloads — is the same.
+    /// **The turn half is missing, and that is a gap, not a mechanism difference.** Upstream's
+    /// `ctx.signal` is the live turn's abort, so an in-flight sampling call dies when the user
+    /// cancels the turn as well as when the session reloads. The host offers an extension no handle
+    /// on the live turn's cancel token, so here only the owner half is observed: a cancelled turn
+    /// leaves the server's sampling call running until the model answers or the session ends.
+    /// Filed as `MCP-634`. The token is still composed by [`crate::abort::combine`] and passed
+    /// down as `StreamOptions.cancel`, so the turn half joins with no other change once it exists.
     ///
     /// **Called twice on purpose.** [`handle_sampling_request`] reads it once at entry and
     /// [`resolve_sampling_model`] reads it again inside the probe loop, exactly as upstream does

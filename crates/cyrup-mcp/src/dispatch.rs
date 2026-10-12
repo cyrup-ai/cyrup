@@ -40,7 +40,7 @@
 
 use std::sync::{Arc, Weak};
 
-use serde_json::{Map as JsonMap, Value, json};
+use serde_json::{Map as JsonMap, Value};
 
 use cyrup_core::{CancelToken, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 
@@ -377,6 +377,7 @@ impl McpToolDispatch for McpDispatch {
 )]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn dangling() -> McpDispatch {
         McpDispatch::new(Weak::new())

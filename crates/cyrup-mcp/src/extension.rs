@@ -326,6 +326,18 @@ const TOOL_CALL_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 const STILL_CONNECTING_NOTICE: &str =
     "MCP servers are still connecting; their tools become available once connected.";
 
+/// How long a `session_start` may spend shutting the previous session's servers down before it
+/// starts the new session's build.
+///
+/// What the teardown waits on, in order: the previous generation's connects, aborted, end at their
+/// next look at the signal, and the one stage that does not look — an OAuth token refresh, which is
+/// not abandoned half-way because a rotated refresh token would be lost — is bounded by rmcp's 30 s
+/// per OAuth request (`transport/auth.rs:31` @3.1.4); then the connections close together, an HTTP
+/// session's `DELETE` under rmcp's 5 s (`SESSION_CLEANUP_TIMEOUT`,
+/// `transport/streamable_http_client.rs:35`) and a stdio child's exit under its 3 s before the kill
+/// (`MAX_WAIT_ON_DROP_SECS`, `transport/child_process.rs:10`).
+const PREVIOUS_GENERATION_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(35);
+
 /// How many calls' still-connecting notes are kept at once (see `McpExtension::remember_note`).
 const STILL_CONNECTING_NOTES: usize = 64;
 
@@ -1622,6 +1634,13 @@ impl McpExtension {
         let snapshot = self.context_snapshot(ctx);
         let dispatch_ctx = ctx.clone();
 
+        // Declared, so the dispatcher's 5 s budget does not cut it: a cut drops this handler before
+        // `start_initialization` below, and the new session gets no MCP at all. The teardown is
+        // bounded by what it waits on ([`PREVIOUS_GENERATION_TEARDOWN`]).
+        let teardown = ctx.begin_sanctioned_wait(
+            cyrup_ext::native::SanctionedWaitKind::ServerShutdown,
+            PREVIOUS_GENERATION_TEARDOWN + cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET,
+        );
         crate::lifecycle::shutdown_previous_generation(
             previous,
             crate::lifecycle::SESSION_RESTART_STOP_REASON,
@@ -1630,6 +1649,7 @@ impl McpExtension {
             crate::live::metadata_flush(self.dirs.clone()),
         )
         .await;
+        drop(teardown);
 
         // The post-await re-check. A newer generation superseded this one while the previous owner
         // drained, so this continuation must not become the live runtime.
@@ -1685,12 +1705,17 @@ impl McpExtension {
     /// fault and shows `Extension error (mcp): extension timed out (epoch deadline)`; upstream's
     /// `await` has no such budget. A server that needs longer than 5 s to start (a cold `npx`
     /// download) therefore ended the wait with an error line, and the prompt had been held for
-    /// nothing. The build wait is declared ([`cyrup_ext::native::SanctionedWaitKind::ServerConnect`])
+    /// nothing. The server wait is declared ([`cyrup_ext::native::SanctionedWaitKind::ServerConnect`])
     /// and ends at its own bound, so the handler returns quietly before the budget could cut it.
-    /// The convergence pass after it keeps the budget: it is bounded near 5 s anyway, because
-    /// `refreshTools` carries `KEEP_ALIVE_REFRESH_TIMEOUT_MS = 5_000` per server across
-    /// [`KEEP_ALIVE_CHECK_CONCURRENCY`][crate::lifecycle::KEEP_ALIVE_CHECK_CONCURRENCY] workers, and
-    /// the turn continuing against a possibly-stale catalog is upstream's own `catch`.
+    ///
+    /// The convergence pass after it is not declared, and keeps the budget: upstream awaits it with
+    /// no bound of its own, its reconnects bounded by their connect budgets and its refreshes by
+    /// `KEEP_ALIVE_REFRESH_TIMEOUT_MS` (`lifecycle.ts:127-137`, `server-manager.ts:704` @v5.2.0),
+    /// and holding a submission that long is a choice this port has not made (`MCP-636`). This
+    /// port has no `KEEP_ALIVE_REFRESH_TIMEOUT_MS`: its `refreshTools` is not wired (`MCP-120`).
+    /// A pass the budget cuts goes on detached
+    /// ([`crate::lifecycle::McpLifecycleManager::ensure_converged`]), so the next submission joins
+    /// it rather than a memo of one that never finished.
     async fn on_input(&self, ctx: &HostCtx) {
         // `const inputOwner = currentOwner; if (!inputOwner?.isActive()) return;`
         let Some(owner) = self.owner().filter(|owner| owner.is_active()) else {
@@ -3194,7 +3219,12 @@ pub fn mcp_extension_for_env(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -4911,6 +4941,53 @@ done
         assert!(
             matches!(ext.on_event(&result, &event_ctx()).await, HookOutcome::Noop),
             "the note belongs to one result"
+        );
+    }
+
+    /// A new session's start shuts the previous session's servers down before it builds its own,
+    /// and closing a server waits on the server. Under the dispatcher's 5 s budget a slow teardown
+    /// cut the handler before it started the build, and the new session had no MCP at all; the
+    /// teardown is a declared wait now, bounded by what it waits on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_teardown_of_the_previous_session_does_not_cost_the_next_one_its_build() {
+        use cyrup_ext::{Dispatcher, NativeHandle, Subscriptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        // A server that keeps running after its stdin closes: the close waits for it, then kills it.
+        let lingering = serde_json::json!({
+            "command": "sh",
+            "args": [
+                "-c",
+                format!("{LIVE_MCP}\nsleep 30"),
+                "sh",
+                rmcp::model::ProtocolVersion::LATEST.as_str(),
+                dir.path().join("started").to_string_lossy(),
+            ],
+            "lifecycle": "keep-alive",
+        });
+        let (ext, _state) = start_and_settle(
+            dir.path(),
+            serde_json::json!({ "lingering": lingering }),
+            "lingering",
+        )
+        .await;
+
+        let subs = Subscriptions::empty().with(cyrup_ext::EventKind::SessionStart);
+        let handle = Arc::new(NativeHandle::new(
+            Arc::clone(&ext) as Arc<dyn NativeExtension>,
+            subs,
+            event_ctx(),
+        ));
+        let dispatcher = Dispatcher::with_budget(std::time::Duration::from_millis(400));
+        dispatcher.add(handle).unwrap();
+        dispatcher
+            .dispatch_notify(&session_start_event(), &cyrup_core::CancelToken::new())
+            .await;
+
+        assert!(
+            ext.init_task().is_some() || ext.state().is_some(),
+            "the handler was cut while the previous session's server was closing, before it \
+             started the new session's build"
         );
     }
 

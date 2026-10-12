@@ -1550,6 +1550,40 @@ pub fn marks_keep_alive_at_registration(lifecycle: ServerLifecycle) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The detach joiner: an attempt reaped AFTER the connect released it never closes the
+    /// connection it built, and one aborted BEFORE the release does. The joiner runs on its own task,
+    /// so on this current-thread runtime it is first polled only after both tokens have fired — the
+    /// order the manager produces when it reaps an attempt as it settles. An unbiased `select!`
+    /// closed the connection on a coin flip; 64 rounds leave that no hiding place.
+    #[tokio::test]
+    async fn an_attempt_reaped_after_its_release_never_closes_the_connection() {
+        let settle = || async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        };
+        for round in 0..64 {
+            let attempt = CancelToken::new();
+            let (service, detach) = detachable_from(&attempt);
+            detach.cancel();
+            attempt.cancel();
+            settle().await;
+            assert!(
+                !service.is_cancelled(),
+                "round {round}: a reap after the release closed the connection"
+            );
+        }
+
+        let attempt = CancelToken::new();
+        let (service, _detach) = detachable_from(&attempt);
+        attempt.cancel();
+        settle().await;
+        assert!(
+            service.is_cancelled(),
+            "an abort before the release must still close the half-built connection"
+        );
+    }
     use crate::config::ServerEntry;
 
     fn config_with(lifecycle: Option<ServerLifecycle>, disabled: bool) -> McpConfig {
@@ -3927,11 +3961,19 @@ fn detachable_from(attempt: &CancelToken) -> (CancelToken, CancelToken) {
     let armed = service.clone();
     let released = detach.clone();
     handle.spawn(async move {
+        // `biased`, with the release FIRST. The manager reaps the attempt token the moment the
+        // attempt settles, which is right after the release fires; a joiner that has not been
+        // polled in between finds both arms ready, and an unbiased `select!` picks one at random —
+        // half the time the abort arm, cancelling the service token of a connection that has just
+        // been handed back live. Measured: a request right after such a reap failed with
+        // `TransportClosed` in four runs of six. Once the release has fired, a later abort is the
+        // attempt's settling, never a reason to close what it built.
         tokio::select! {
-            () = watched.cancelled() => armed.cancel(),
+            biased;
             // The `finally`, and the joiner's own exit path.
             () = released.cancelled() => {}
             () = armed.cancelled() => {}
+            () = watched.cancelled() => armed.cancel(),
         }
     });
     (service, detach)
@@ -4936,7 +4978,7 @@ impl ConnectionBuilder {
 
         // Step 1. `createClient` — the throw has to precede the spawn.
         let lifecycle = version_negotiation(entry)?;
-        let handler = (self.handler)(name, &request.request);
+        let handler = (self.handler)(name, &request.runtime);
         let identity = handler.identity();
 
         // Step 2. Note `command` is used raw: upstream maps `interpolateEnvVars` over `args` only.
@@ -4994,29 +5036,20 @@ impl ConnectionBuilder {
             let definition = Arc::clone(&request.definition);
             let server_name = name.to_string();
             let base_env = self.base_env.clone();
-            match tokio::task::spawn_blocking(move || {
-                StdioTransportSpec::resolve(
-                    &definition,
-                    &server_name,
-                    command,
-                    args,
-                    cwd,
-                    &base_env,
-                )
-            })
-            .await
-            {
-                Ok(spec) => spec?,
-                // The closure cannot panic under this crate's lint policy and the runtime is alive
-                // (we are running on it), so this arm is defensive. Reported rather than unwrapped:
-                // a `JoinError` here is a local failure, and it names the step it happened in.
-                Err(_join) => {
-                    return Err(McpError::Server {
-                        server: name.to_string(),
-                        message: "MCP stdio environment resolution failed to run".to_string(),
-                    });
-                }
-            }
+            crate::abort::abortable(
+                crate::secrets::off_the_worker("MCP stdio environment resolution", move || {
+                    StdioTransportSpec::resolve(
+                        &definition,
+                        &server_name,
+                        command,
+                        args,
+                        cwd,
+                        &base_env,
+                    )
+                }),
+                &request.attempt,
+            )
+            .await??
         };
         let (process, stderr) = spawn_stdio_transport(&spec)?;
         let pid = process.id();
@@ -5149,8 +5182,23 @@ impl ConnectionBuilder {
         };
 
         // Steps 3–6: `resolveCommandSecretsRecord`, `commandBearer`, the bearer ladder and the
-        // per-header `new Headers()` guard (ungated since MCP-597) — all of `crate::secrets`.
-        let spec = HttpTransportSpec::resolve(entry, name, server_url.clone(), &self.env)?;
+        // per-header `new Headers()` guard (ungated since MCP-597) — all of `crate::secrets`. Off
+        // the async worker and raced against the attempt, as the stdio arm's step 7 is: a header or
+        // bearer `!command` blocks for up to ten seconds, and run inline it held a tokio worker and
+        // could not be told to stop.
+        let spec = {
+            let definition = Arc::clone(&request.definition);
+            let server_name = name.to_string();
+            let url = server_url.clone();
+            let env = self.env.clone();
+            crate::abort::abortable(
+                crate::secrets::off_the_worker("MCP HTTP header resolution", move || {
+                    HttpTransportSpec::resolve(&definition, &server_name, url, &env)
+                }),
+                &request.attempt,
+            )
+            .await??
+        };
 
         // `server-manager.ts:868-870`: built **once per connect**, above `attempt`, and spread into
         // every attempt's transport options. The plan's cyrup note says "inside the retry closure";
@@ -5164,7 +5212,9 @@ impl ConnectionBuilder {
                 crate::request_headers_command::RequestHeadersCommandClient::new(
                     http_client.clone(),
                     config,
-                    Some(request.attempt.clone()),
+                    // The connection's own lifetime, not the attempt's: this client signs every
+                    // request the connection makes, long after the attempt has been reaped.
+                    Some(request.runtime.clone()),
                 )?,
             ),
             None => None,
@@ -5392,7 +5442,7 @@ impl ConnectionBuilder {
 
         // `this.createClient(serverName, definition)` — fresh per attempt.
         let lifecycle = version_negotiation(entry)?;
-        let handler = (self.handler)(name, &request.request);
+        let handler = (self.handler)(name, &request.runtime);
         let identity = handler.identity();
 
         // `requestOptions.timeout`, per attempt — upstream's object is built once and passed to
@@ -5897,21 +5947,37 @@ async fn discover(
     };
 
     let budget = request.request_timeout();
-    let (tools, resources_result, prompts_result) = tokio::join!(
-        bounded_list(budget, list_all_tools_with_hints(peer)),
-        async {
-            if !has_resources {
-                return None;
-            }
-            Some(bounded_list(budget, peer.list_all_resources()).await)
-        },
-        async {
-            if !has_prompts {
-                return None;
-            }
-            Some(bounded_list(budget, peer.list_all_prompts()).await)
-        },
-    );
+    let lists = async {
+        tokio::join!(
+            bounded_list(budget, list_all_tools_with_hints(peer)),
+            async {
+                if !has_resources {
+                    return None;
+                }
+                Some(bounded_list(budget, peer.list_all_resources()).await)
+            },
+            async {
+                if !has_prompts {
+                    return None;
+                }
+                Some(bounded_list(budget, peer.list_all_prompts()).await)
+            },
+        )
+    };
+    // Upstream's lists run under `requestOptions`, whose `signal` aborts them
+    // (`server-manager.ts:576-584`), and a `close` racing the attempt disposes the transport they
+    // run on. Here the attempt signal — the caller, the runtime and a racing `close` — ends them at
+    // once rather than after the budget: a cancelled connect used to wait out the whole budget
+    // here, the one stage after the handshake that never looked at a signal.
+    let (tools, resources_result, prompts_result) = tokio::select! {
+        biased;
+        () = request.attempt.cancelled() => {
+            return Err(McpError::Aborted(
+                crate::abort::ABORTED_FALLBACK_REASON.to_string(),
+            ));
+        }
+        lists = lists => lists,
+    };
 
     // `if (requestOptions?.signal?.aborted) throwIfAborted(requestOptions.signal)` — upstream tests
     // the REQUEST signal, not the attempt controller's, and `CreateConnection::request` is exactly
@@ -6943,6 +7009,7 @@ done
             definition: Arc::new(entry),
             attempt: CancelToken::new(),
             request: CancelToken::new(),
+            runtime: CancelToken::new(),
             credentials_invalidated: false,
             request_options: build_request_options(None, None),
         }
@@ -8200,6 +8267,72 @@ done
         );
     }
 
+    /// A connect whose attempt is aborted while the server sits on `tools/list` ends at the abort,
+    /// not at the list's budget. Upstream's lists run under the request's signal and on a transport
+    /// a racing `close` disposes; here the lists looked at nothing, so a cancelled connect — and
+    /// with it `close`, `close_all` and a session ending — waited out the whole budget, 60 s by
+    /// default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_attempt_ends_its_discovery_at_the_abort() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("tools-list-received");
+        let mut entry = stdio_entry(STALLED_LIST_MCP, &[&marker.to_string_lossy()]);
+        entry.env = Some(record(&[(
+            "PV",
+            rmcp::model::ProtocolVersion::LATEST.as_str(),
+        )]));
+        let request = request("stalled", entry);
+        let attempt = request.attempt.clone();
+        let connecting = tokio::spawn(async move { builder().create_connection(request).await });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fixture was asked for its tools");
+        let aborted = tokio::time::Instant::now();
+        attempt.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .expect("the discovery waited past the abort for its list budget")
+            .expect("the connect task");
+        let error = outcome.err().expect("an aborted connect is an error");
+        assert!(
+            matches!(error, McpError::Aborted(_)),
+            "expected an abort, got {error}"
+        );
+        assert!(aborted.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A `!command` secret in a stdio server's `env` runs off the async worker and is raced against
+    /// the attempt: an aborted connect ends at the abort, not when the command does. The command
+    /// cannot be interrupted (upstream's `spawnSync` cannot either), but nothing waits for it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_attempt_does_not_wait_for_a_secret_command() {
+        let mut entry = stdio_entry(TINY_MCP, &[]);
+        entry.env = Some(record(&[("TOKEN", "!sleep 8; printf late")]));
+        let request = request("secret", entry);
+        let attempt = request.attempt.clone();
+        let connecting = tokio::spawn(async move { builder().create_connection(request).await });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let aborted = tokio::time::Instant::now();
+        attempt.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(4), connecting)
+            .await
+            .expect("the connect waited for the secret command after its attempt was aborted")
+            .expect("the connect task");
+        let error = outcome.err().expect("an aborted connect is an error");
+        assert!(
+            matches!(error, McpError::Aborted(_)),
+            "expected an abort, got {error}"
+        );
+        assert!(aborted.elapsed() < Duration::from_secs(4));
+    }
+
     // ── MCP-114 · §3.4 steps 1–6 ──────────────────────────────────────────────────────────────
 
     /// `resolveServerUrl`'s missing-variable throw, with its singular/plural rule, raised **before**
@@ -9186,6 +9319,85 @@ done
                 "exactly one Authorization, and it is the DERIVED one"
             );
         }
+    }
+
+    /// The signing client signs every request the connection makes, so it lives as long as the
+    /// connection — not as long as the attempt that built it. The manager reaps the attempt's two
+    /// tokens the moment the attempt settles; a signing client that kept one of them refused every
+    /// request after the connect as 'HTTP request headers command aborted'.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_signing_client_outlives_the_attempt_that_built_it() {
+        let fixture = HttpFixture::start(0).await;
+        let mut entry = http_entry(&fixture.url);
+        entry.request_headers_command = Some(crate::config::HttpRequestHeadersCommand {
+            command: Some("sh".to_string()),
+            args: Some(vec![
+                "-c".to_string(),
+                "printf '{\"x-signature\":\"sig\"}'".to_string(),
+            ]),
+            ..crate::config::HttpRequestHeadersCommand::default()
+        });
+        let request = request("signed", entry);
+        let connection = builder()
+            .connect_http_client(&request)
+            .await
+            .expect("connects");
+
+        // What the manager does once the attempt has settled.
+        request.attempt.cancel();
+        request.request.cancel();
+
+        let peer = connection.resource.peer().cloned().expect("a client");
+        let listed = peer.list_tools(None).await;
+        assert!(
+            listed.is_ok(),
+            "the first request after the connect was refused: {listed:?}"
+        );
+        let last = fixture
+            .requests()
+            .into_iter()
+            .rfind(|recorded| recorded.method == "POST")
+            .expect("a POST");
+        assert!(last.body.contains("tools/list"), "{}", last.body);
+        assert_eq!(last.header("x-signature"), Some("sig"));
+        connection.resource.close().await.expect("close");
+    }
+
+    /// The client handler is handed the connection's lifetime token, which the manager does not
+    /// reap: its `elicitation/complete` gate (`!runtimeSignal.aborted`) read the attempt-scoped
+    /// request token before, and so was shut from the first notification after the connect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_client_handler_is_given_the_connections_lifetime_token() {
+        let fixture = HttpFixture::start(0).await;
+        let handed: Arc<std::sync::Mutex<Vec<CancelToken>>> = Arc::default();
+        let factory: HandlerFactory = {
+            let handed = Arc::clone(&handed);
+            Arc::new(move |server: &str, token: &CancelToken| {
+                handed.lock().unwrap().push(token.clone());
+                bare_handler_factory()(server, token)
+            })
+        };
+        let mut request = request("handled", http_entry(&fixture.url));
+        request.runtime = CancelToken::new();
+        let connection = builder()
+            .with_handler_factory(factory)
+            .connect_http_client(&request)
+            .await
+            .expect("connects");
+
+        request.attempt.cancel();
+        request.request.cancel();
+        let token = handed.lock().unwrap().first().cloned().expect("a handler");
+        assert!(
+            !token.is_cancelled(),
+            "the handler's token died with the attempt"
+        );
+        request.runtime.cancel();
+        assert!(
+            token.is_cancelled(),
+            "the handler's token is the connection's lifetime token"
+        );
+        connection.resource.close().await.expect("close");
     }
 
     /// A signing helper that fails aborts the request with upstream's sentence rather than sending

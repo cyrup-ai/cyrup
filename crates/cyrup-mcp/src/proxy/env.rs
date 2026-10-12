@@ -9,7 +9,6 @@ use serde_json::{Map as JsonMap, Value};
 
 use cyrup_core::{CancelToken, Content};
 
-use crate::abort::combine;
 use crate::config::{McpConfig, McpSettings, ServerEntry};
 use crate::errors::{McpError, McpResult};
 use crate::owner::McpRuntimeOwner;
@@ -534,9 +533,10 @@ impl ProxyCtx {
         &self.state.owner
     }
 
-    /// `combineAbortSignals(state.owner?.signal, signal)`.
-    pub(crate) fn owned_signal(&self, cancel: &CancelToken) -> CancelToken {
-        combine(&self.owner().token(), Some(cancel))
+    /// `combineAbortSignals(state.owner?.signal, signal)`, for as long as the returned value lives
+    /// ([`crate::abort::ScopedSignal`]: the joiner it needs is reaped when the call ends).
+    pub(crate) fn owned_signal(&self, cancel: &CancelToken) -> crate::abort::ScopedSignal {
+        crate::abort::ScopedSignal::new(&self.owner().token(), cancel)
     }
 
     /// `state.ui` — `None` in a headless build, which is upstream's `if (state.ui)` guard.

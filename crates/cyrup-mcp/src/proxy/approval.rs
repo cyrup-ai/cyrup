@@ -398,7 +398,16 @@ pub async fn ensure_tool_call_approved(
         "{title}{hint}\n\nArguments:\n{}",
         approval_argument_preview(args)
     );
-    let decision = dialog.select(&prompt, &APPROVAL_OPTIONS).await;
+    // `await abortable(ui.select(...), ownedSignal)` (`tool-approval.ts:197` @v5.0.0): the call's
+    // cancel, or the generation's, ends the wait for the human. Awaited bare, an aborted turn sat
+    // in front of an approval nobody was going to give.
+    let owner = state.owner.token();
+    let decision = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return ApprovalOutcome::Denied,
+        () = owner.cancelled() => return ApprovalOutcome::Denied,
+        decision = dialog.select(&prompt, &APPROVAL_OPTIONS) => decision,
+    };
     if cancelled() {
         // The answer arrived after the run was cancelled: discard it rather than caching a
         // session-wide approval nothing will use.
@@ -464,9 +473,21 @@ mod tests {
         /// The P-3 gate to observe from inside the dialog (MCP-471), when a test wires one.
         gate: Option<Arc<cyrup_ext::HumanWaitGate>>,
         waiting_during_dialog: Mutex<Vec<bool>>,
+        /// A human who has not answered yet: the dialog blocks until the test answers through this.
+        held: Mutex<Option<std::sync::mpsc::Receiver<Option<String>>>>,
     }
 
     impl ScriptedUi {
+        /// A dialog that stays open until the returned sender answers it.
+        fn held() -> (Arc<Self>, std::sync::mpsc::Sender<Option<String>>) {
+            let (answer, held) = std::sync::mpsc::channel();
+            let ui = Arc::new(Self {
+                held: Mutex::new(Some(held)),
+                ..Self::default()
+            });
+            (ui, answer)
+        }
+
         fn answering(answer: Option<&str>) -> Arc<Self> {
             Arc::new(Self {
                 answer: Mutex::new(answer.map(str::to_string)),
@@ -520,6 +541,9 @@ mod tests {
                     })
                     .unwrap_or_default(),
             );
+            if let Some(held) = self.held.lock().unwrap().take() {
+                return held.recv().ok().flatten();
+            }
             self.answer.lock().unwrap().clone()
         }
     }
@@ -1099,6 +1123,54 @@ mod tests {
             .await,
             ApprovalOutcome::Denied
         );
+    }
+
+    /// `await abortable(ui.select(...), ownedSignal)` (`tool-approval.ts:197`): a call cancelled
+    /// while its approval dialog is open stops waiting for the human and is denied. Before, the
+    /// cancel was read before and after the dialog only, so an aborted turn sat in front of a
+    /// dialog nobody was going to answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_cancelled_while_its_dialog_is_open_stops_waiting_and_is_denied() {
+        let tool = demo_tool();
+        let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
+        let (ui, answer) = ScriptedUi::held();
+        let state = approval_state(
+            demo_config(Some(ApproveTools::All(true))),
+            Some(Arc::clone(&ui)),
+        );
+        let cancel = CancelToken::new();
+        let asking = {
+            let state = Arc::clone(&state);
+            let tool = tool.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                ensure_tool_call_approved(
+                    &state,
+                    "demo",
+                    &tool,
+                    &json!({}),
+                    ApprovalOrigin::Proxy,
+                    &cancel,
+                    &metadata,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ui.prompt_count() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the dialog opened");
+
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), asking)
+            .await
+            .expect("the call went on waiting for the human after it was cancelled")
+            .expect("the approval task");
+        assert_eq!(outcome, ApprovalOutcome::Denied);
+        let _ = answer.send(Some(APPROVE_ONCE_OPTION.to_string()));
     }
 
     /// MCP-601, `tool-approval.ts:191-193` — the one sentence the annotations buy the user.

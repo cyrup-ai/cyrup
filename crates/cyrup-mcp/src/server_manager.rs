@@ -1271,6 +1271,13 @@ pub struct CreateConnection {
     /// threads this one into `buildRequestOptions` so a per-request timeout outlives the attempt
     /// controller's abort.
     pub request: CancelToken,
+    /// `this.runtimeSignal` — the generation's signal, and the only one of the three that lives as
+    /// long as the connection does. What the connection keeps — the client handler's gate, a
+    /// signing client — takes this one. [`Self::attempt`] and [`Self::request`] are reaped when
+    /// the attempt settles, so anything that kept either saw it cancelled from the first request
+    /// after the connect: every `requestHeadersCommand` request failed as aborted, and the
+    /// handler's `elicitation/complete` gate stayed shut.
+    pub runtime: CancelToken,
     /// `credentialsInvalidated` — carried forward from a previous `needs-auth` connection so the
     /// credential cache is discarded at most once per episode (MCP-116).
     pub credentials_invalidated: bool,
@@ -2195,6 +2202,13 @@ impl McpServerManager {
         let attempt = AbortHandle::new();
         // `combineAbortSignals(ownedSignal, attemptController.signal)`.
         let attempt_signal = crate::abort::combine(&owned, Some(attempt.token()));
+        // `this.runtimeSignal`, for what outlives the attempt; absent, a token that never fires.
+        let runtime = self
+            .runtime_signal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default();
         let definition = Arc::new(definition.clone());
         let global_timeout = *self
             .default_request_timeout_ms
@@ -2274,6 +2288,7 @@ impl McpServerManager {
                         definition: Arc::clone(&definition),
                         attempt: attempt_signal.clone(),
                         request: owned.clone(),
+                        runtime: runtime.clone(),
                         credentials_invalidated,
                         request_options,
                     };
@@ -2440,12 +2455,24 @@ impl McpServerManager {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return tail.await;
         };
-        match handle.spawn(tail).await {
-            Ok(outcome) => outcome,
-            Err(join) => Err(ManagerError::other(format!(
-                "MCP connect for {name} did not finish: {join}"
-            ))),
-        }
+        let joined = handle.spawn(tail);
+        // The winner waits for its tail as a deduped caller waits for the attempt: raced against its
+        // own signal. The tail is detached, so a cancelled winner only stops waiting — the tail
+        // still reaches its generation fence and disposes or registers what it built. Awaited bare,
+        // a cancelled caller waited for whatever stage of the connect ignored the attempt signal
+        // (a `!command` secret, an OAuth refresh, the discovery lists).
+        Self::race(
+            async move {
+                match joined.await {
+                    Ok(outcome) => outcome,
+                    Err(join) => Err(ManagerError::other(format!(
+                        "MCP connect for {name} did not finish: {join}"
+                    ))),
+                }
+            },
+            &owned,
+        )
+        .await
     }
 }
 
@@ -3796,6 +3823,57 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// The winner of a connect stops waiting at its own cancel, even while the attempt is in a stage
+    /// that does not look at the signal — the shape of a `!command` secret or an OAuth refresh. The
+    /// detached tail still reaches its generation fence. Before, the winner awaited its tail bare and
+    /// waited out whatever stage the attempt was in; the deduped callers already raced their own
+    /// signal.
+    ///
+    /// What the attempt builds after its caller left is upstream's to decide, and upstream registers
+    /// it: the fence disposes only on the attempt's own abort or a newer generation
+    /// (`server-manager.ts` `connect`), so the connection lands in the table, owned by the manager,
+    /// rather than in no one's hands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_winner_stops_waiting_for_an_attempt_that_ignores_its_signal() {
+        let gate = Gate::shut();
+        let factory = ScriptedFactory::new(Script::Connect, Some(gate.clone()));
+        let manager = manager(Arc::clone(&factory) as Arc<dyn ConnectionFactory>);
+        let caller = CancelToken::new();
+        let connecting = {
+            let manager = Arc::clone(&manager);
+            let caller = caller.clone();
+            tokio::spawn(async move { manager.connect("s", &entry(), Some(&caller)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while factory.call_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the attempt started");
+
+        caller.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), connecting)
+            .await
+            .expect("the winner went on waiting for an attempt its caller had cancelled")
+            .expect("the connect task");
+        assert!(outcome.is_err(), "a cancelled connect is an error");
+
+        gate.open();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.get_connection("s").is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the detached tail ran to its fence and registered what the attempt built");
+        assert_eq!(
+            factory.total_closes(),
+            0,
+            "nothing was built twice or orphaned"
+        );
     }
 
     /// A factory whose `client.close()` always fails — the shape that must reach
@@ -5189,6 +5267,7 @@ mod tests {
             trace: None,
             attempt: CancelToken::new(),
             request: CancelToken::new(),
+            runtime: CancelToken::new(),
             credentials_invalidated: false,
             request_options,
         };
