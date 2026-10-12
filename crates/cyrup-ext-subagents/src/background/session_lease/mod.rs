@@ -57,7 +57,9 @@ mod types;
 pub use acquire::{SessionLeaseHandle, SessionLeaseOptions, acquire_session_lease};
 pub use error::{SessionLeaseConflict, SessionLeaseError};
 pub use identity::{
-    ProcessStartIdentity, process_demonstrably_gone, process_start_identity, runtime_start_identity,
+    OwnerStamp, ProcessStartIdentity, linux_start_identity, owner_demonstrably_gone,
+    portable_start_identity, process_demonstrably_gone, process_start_identity,
+    runtime_start_identity,
 };
 pub use inspect::{
     canonical_session_file_path, canonical_session_id, demonstrably_stale, inspect_session_lease,

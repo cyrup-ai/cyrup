@@ -663,3 +663,72 @@ async fn a_marker_a_ui_could_not_remove_is_withdrawn_at_the_next_turn() {
     );
     ext.stop_forwarding_watcher();
 }
+
+/// PERM-044: two live processes on one session file. Nothing refuses a second process on a root
+/// session's file (no lock guards it), so a headless process can start on a session that a process
+/// with a UI has already settled, and write a marker naming itself, alive. The process with the UI
+/// answers every child of the session, so the marker is false: its next turn takes it down, and it
+/// is not written again by this process however many turns follow.
+#[tokio::test]
+async fn a_ui_withdraws_a_marker_a_headless_process_wrote_after_the_ui_had_settled_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_anchor_guard, ext) = parent_ext(dir.path(), "perm-two-processes").await;
+    let agent_dir = dir.path().join("agent");
+    let marked = || crate::forwarding::session_is_unattended(&agent_dir, "perm-two-processes");
+    let hook = || HostEvent::BeforeAgentStart {
+        prompt: String::new(),
+        images: json!(null),
+        system_prompt: String::new(),
+        options: json!(null),
+        injected: Vec::new(),
+    };
+
+    let _ = ext
+        .on_event(
+            &HostEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
+            &ui_ctx(dir.path()),
+        )
+        .await;
+    let _ = ext.on_event(&hook(), &ui_ctx(dir.path())).await;
+    assert!(!marked(), "the UI settled the session: no marker");
+
+    // The headless process starts on the same session file and says it has no UI. Its marker names
+    // a process that is running (this one stands in for it; the extension never wrote it).
+    assert!(crate::forwarding::mark_session_unattended(
+        &agent_dir,
+        "perm-two-processes",
+        None
+    ));
+    assert!(
+        marked(),
+        "the premise: a live writer's marker refuses the children"
+    );
+
+    let _ = ext.on_event(&hook(), &ui_ctx(dir.path())).await;
+    assert!(
+        !marked(),
+        "the UI's next turn withdraws the marker of the process that started after it settled"
+    );
+
+    // Each later turn of the UI is one `lstat` and leaves nothing behind.
+    for _ in 0..3 {
+        let _ = ext
+            .on_event(
+                &HostEvent::Input {
+                    text: "next".into(),
+                    images: Vec::new(),
+                    source: cyrup_ext::InputEventSource::Interactive,
+                    streaming_behavior: None,
+                },
+                &ui_ctx(dir.path()),
+            )
+            .await;
+    }
+    let location =
+        crate::forwarding::forwarding_location(&agent_dir, "perm-two-processes").unwrap();
+    assert!(!location.session_root.join("no-ui").exists());
+    ext.stop_forwarding_watcher();
+}

@@ -84,13 +84,24 @@ impl PermissionSystemExtension {
     /// spool to mark.
     ///
     /// Called from every event arm that carries a ctx (it rides on
-    /// [`Self::maybe_start_forwarding_watcher`]), so the file system is touched only when the state
-    /// changes: the session id and the state last synced are remembered. The FIRST sync for a session
-    /// id settles the file whatever it holds, because a session id outlives the process that marked
-    /// it (`-c`, `--session <file>`): a UI that resumes a session a `-p` run marked has to withdraw
-    /// that run's marker, not only one of its own. A marker whose writer has died is ignored by the
-    /// child's side anyway ([`forwarding::session_is_unattended`]); this is what removes one whose
-    /// writer is still there, and the file of one that is not.
+    /// [`Self::maybe_start_forwarding_watcher`]: `SessionStart` once, then `BeforeAgentStart`,
+    /// `Input` and `ToolCall` on every turn). The session id and the state last synced are
+    /// remembered. The FIRST sync for a session id settles the file whatever it holds, because a
+    /// session id outlives the process that marked it (`-c`, `--session <file>`): a UI that resumes
+    /// a session a `-p` run marked has to withdraw that run's marker, not only one of its own. A
+    /// marker whose writer has died is ignored by the child's side anyway
+    /// ([`forwarding::session_is_unattended`]); this is what removes one whose writer is still
+    /// there, and the file of one that is not.
+    ///
+    /// After that, a process WITH a UI looks again on every sync (one `lstat`,
+    /// [`forwarding::session_has_unattended_marker`]) and withdraws a marker it finds (PERM-044).
+    /// Nothing stops a second process from running on the same session file at the same time (no
+    /// lock or lease guards a root session's file; the session lease is the subagent revival
+    /// runner's), so a headless process that starts on this session after this one settled it
+    /// writes a marker naming itself, alive; while this process has a UI its watcher answers every
+    /// child of the session, that headless process's included, so the marker is false and is taken
+    /// down at this process's next turn. A process WITHOUT a UI writes its marker once per session
+    /// id and does not write it again after a UI took it down, so the two never take turns.
     ///
     /// A marker is not withdrawn at `SessionShutdown`: it is stamped with the process that wrote it,
     /// so it stops meaning anything when that process exits, and it is swept up by the next headless
@@ -108,10 +119,13 @@ impl PermissionSystemExtension {
             return;
         };
         let mut synced = guard(&self.unattended_marker);
-        if synced
-            .as_ref()
-            .is_some_and(|last| last.session_id == session_id && last.marked != has_ui)
-        {
+        let settled = synced.as_ref().is_some_and(|last| {
+            last.session_id == session_id
+                && last.marked != has_ui
+                && !(has_ui
+                    && forwarding::session_has_unattended_marker(&self.agent_dir, &session_id))
+        });
+        if settled {
             return;
         }
         let marked = if has_ui {

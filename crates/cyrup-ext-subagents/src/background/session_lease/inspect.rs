@@ -163,17 +163,21 @@ pub fn demonstrably_stale(
     liveness: fn(u32) -> crate::background::reconcile::Liveness,
     start_identity_of: fn(u32) -> Option<super::identity::ProcessStartIdentity>,
 ) -> bool {
-    use super::identity::process_demonstrably_gone;
+    use super::identity::{OwnerStamp, owner_demonstrably_gone, process_demonstrably_gone};
     use super::types::LeaseWriter;
 
-    // Rung 1 (`:175`).
-    if owner.hostname != hostname {
-        return false;
-    }
-    // Rung 2 (`:176`).
-    if !process_demonstrably_gone(
-        owner.pid,
-        owner.process_start_identity.as_ref(),
+    // Rungs 1 (`:175`) and 2 (`:176`), the half of the ladder the permission system's `no-ui`
+    // marker shares. `owner.json` records no PID namespace (upstream's has none), so the
+    // namespace rung of `owner_demonstrably_gone` never fires for a lease.
+    if !owner_demonstrably_gone(
+        &OwnerStamp {
+            pid: owner.pid,
+            start_identity: owner.process_start_identity.as_ref(),
+            hostname: &owner.hostname,
+            pid_namespace_scope: None,
+        },
+        hostname,
+        None,
         liveness,
         start_identity_of,
     ) {
