@@ -646,10 +646,11 @@ left as filed.
 
 `MCP-603` and `MCP-632` are untouched and stay open.
 
-**Mutation proofs:** 58, each a deliberate defect in the code a pin guards, applied, the pin's tests
-run, the file restored byte for byte; all 58 turn their pins red. `M07` and `M19` are the second runs
+**Mutation proofs:** 60, each a deliberate defect in the code a pin guards, applied, the pin's tests
+run, the file restored byte for byte; all 60 turn their pins red. `M07` and `M19` are the second runs
 recorded on `MCP-631`; `M48`/`M49` move the default to 30 s and 90 s under the live `cyrup-it` pin;
-`M52`–`M58` guard the fixes below.
+`M52`–`M58` guard the fixes below; `M59`/`M60` guard `e84fdcbbf`, the approval dialog's cancel
+failing the call as aborted, which `cyrup-it`'s `codemode_wire` caught answering as a decline.
 
 **Adversarial review.** Four reviewers read the branch's diff (cancellation, the depth guard and
 transports, the script deadline, and the truth of every comment, doc and ledger claim), and a
