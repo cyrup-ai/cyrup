@@ -135,6 +135,7 @@ pub mod call_deadline;
 pub mod commands;
 pub mod config;
 pub mod credentials;
+pub mod depth_guard;
 pub mod dirs;
 pub mod dispatch;
 pub mod elicitation;
@@ -159,7 +160,9 @@ pub mod sampling;
 pub mod schema;
 pub mod secrets;
 pub mod server_manager;
+pub mod startup;
 pub mod state;
+pub mod stdio_child;
 pub mod trace;
 pub mod ui;
 

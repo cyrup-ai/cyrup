@@ -2367,13 +2367,21 @@ fn csrf_token_of(authorization_url: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
-/// Resolve the configured client secret, running a `!command` **once** (MCP-349).
-fn resolve_client_secret(server_name: &str, config: &OAuthFlowConfig) -> McpResult<Option<String>> {
-    let Some(raw) = config.client_secret.as_deref() else {
+/// Resolve the configured client secret, running a `!command` **once** (MCP-349), off the async
+/// worker ([`crate::secrets::off_the_worker`]), so a caller that races this against its signal
+/// stops waiting at the signal rather than after the command's ten seconds.
+async fn resolve_client_secret(
+    server_name: &str,
+    config: &OAuthFlowConfig,
+) -> McpResult<Option<String>> {
+    let Some(raw) = config.client_secret.clone() else {
         return Ok(None);
     };
     let context = format!("MCP server \"{server_name}\" OAuth clientSecret");
-    resolve_command_secret(raw, &context).map(Some)
+    crate::secrets::off_the_worker("MCP OAuth clientSecret resolution", move || {
+        resolve_command_secret(&raw, &context).map(Some)
+    })
+    .await
 }
 
 /// The metadata lever of MCP-318 / OA-14.
@@ -2656,7 +2664,7 @@ async fn prepare_session(
         .await
         .map_err(|error| McpError::other(error.to_string()))?;
     let mut metadata = resolution.metadata;
-    let configured_secret = resolve_client_secret(server_name, config)?;
+    let configured_secret = resolve_client_secret(server_name, config).await?;
     apply_client_auth_lever(&mut metadata, configured_secret.is_some());
     let expected_issuer = metadata.issuer.clone();
     let requires_issuer = requires_issuer(&metadata);
@@ -2788,11 +2796,13 @@ async fn authenticate_client_credentials(
             "MCP server \"{server_name}\" client_credentials OAuth requires oauth.clientId"
         ))
     })?;
-    let client_secret = resolve_client_secret(server_name, config)?.ok_or_else(|| {
-        McpError::other(format!(
-            "MCP server \"{server_name}\" client_credentials OAuth requires oauth.clientSecret"
-        ))
-    })?;
+    let client_secret = resolve_client_secret(server_name, config)
+        .await?
+        .ok_or_else(|| {
+            McpError::other(format!(
+                "MCP server \"{server_name}\" client_credentials OAuth requires oauth.clientSecret"
+            ))
+        })?;
 
     let mut state = OAuthState::new(server_url, None)
         .await
@@ -2879,9 +2889,16 @@ pub async fn start_auth(
     let generation = runtime.generation();
     throw_if_aborted(&signal, None)?;
 
-    // Step 3 — the `client_credentials` short-circuit: no listener, no state, no browser.
+    // Step 3 — the `client_credentials` short-circuit: no listener, no state, no browser. Raced
+    // against the signal as `prepare_session` is below: it is a metadata walk and a token POST
+    // (each under rmcp's 30 s) and a `!command` secret, and it is the one grant a `-p` run's tool
+    // call signs in with, so nothing else would stop it.
     if config.uses_client_credentials() {
-        authenticate_client_credentials(server_name, server_url, &config, &storage).await?;
+        abortable(
+            authenticate_client_credentials(server_name, server_url, &config, &storage),
+            &signal,
+        )
+        .await??;
         return Ok(String::new());
     }
 

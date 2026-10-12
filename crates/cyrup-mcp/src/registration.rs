@@ -1356,24 +1356,44 @@ fn resolve_tool_selection(
     }
 }
 
-/// Whether some enabled server declares tools to the model in its first request (`hasDirectTools`,
-/// `extensions/mcp/index.ts` @v1.0.4): `directTools: true` or a list, not `"search"`, whose tools are
-/// registered held back and loaded by a search. The first prompt waits for the servers that are
-/// still connecting only if this is true; a server whose tools a script or a search reaches is
-/// waited for by that script or search (`McpExtension::on_tool_call`).
+/// How an enabled server declares its tools to the model, by name (`hasDirectTools`,
+/// `extensions/mcp/index.ts:141` @v1.0.4, and its `"search"` sibling).
 ///
-/// [CYRUP-DELTA] The build here connects every server as one, so the wait is on the whole build and
-/// not on the server that declares tools: it is held for a slow server that declares none whenever
-/// another one does.
+/// `Eager` is `directTools: true` or a list: the tools are in the request. `Search` is
+/// `directTools: "search"`: the tools are registered held back and a search loads them. A server
+/// that declares none is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectDeclaration {
+    Eager,
+    Search,
+}
+
+/// Every enabled server that declares direct tools, with how. The first prompt waits for the
+/// `Eager` ones that are still being discovered, so their tools are in its request
+/// (`waitForDirectServers`, `index.ts:1040-1058` @v1.0.4); a startup pass publishes the tools of
+/// either kind as each of those servers settles ([`crate::startup::StartupPass`]).
 #[must_use]
-pub fn declares_direct_tools(config: &McpConfig, env_override: Option<&[String]>) -> bool {
+pub fn direct_tool_servers(
+    config: &McpConfig,
+    env_override: Option<&[String]>,
+) -> IndexMap<String, DirectDeclaration> {
     let env_selection = env_override.map(parse_direct_tool_selectors);
     let settings = config.settings.as_ref();
-    config.enabled_servers().any(|(server_name, definition)| {
-        let selection =
-            resolve_tool_selection(server_name, definition, settings, env_selection.as_ref());
-        selection.wants_direct_tools() && !selection.lazy
-    })
+    config
+        .enabled_servers()
+        .filter_map(|(server_name, definition)| {
+            let selection =
+                resolve_tool_selection(server_name, definition, settings, env_selection.as_ref());
+            selection.wants_direct_tools().then(|| {
+                let declaration = if selection.lazy {
+                    DirectDeclaration::Search
+                } else {
+                    DirectDeclaration::Eager
+                };
+                (server_name.clone(), declaration)
+            })
+        })
+        .collect()
 }
 
 /// `metadata-cache.ts` `getMissingConfiguredDirectToolServers` — every enabled server that *wants*

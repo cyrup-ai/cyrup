@@ -1253,25 +1253,37 @@ async fn request_on_peer(
         Settled::TimedOut(limit) => {
             // `await_response` sends the same notification with the same reason before returning
             // its `Timeout`; the request is cancelled on the wire either way.
-            let reason = RequestHandle::<RoleClient>::REQUEST_TIMEOUT_REASON.to_string();
-            if let Err(error) = handle.cancel(Some(reason)).await {
-                tracing::debug!("MCP: cancelling a timed-out request failed: {error}");
-            }
+            cancel_on_the_wire(
+                handle,
+                RequestHandle::<RoleClient>::REQUEST_TIMEOUT_REASON,
+                "a timed-out",
+            );
             Err(Box::new(RequestFailure::plain(format!(
                 "MCP request timed out after {} ms",
                 limit.as_millis()
             ))))
         }
         Settled::Cancelled => {
-            if let Err(error) = handle
-                .cancel(Some(crate::abort::ABORTED_FALLBACK_REASON.to_string()))
-                .await
-            {
-                tracing::debug!("MCP: cancelling an aborted request failed: {error}");
-            }
+            cancel_on_the_wire(handle, crate::abort::ABORTED_FALLBACK_REASON, "an aborted");
             Err(Box::new(RequestFailure::aborted()))
         }
     }
+}
+
+/// Send `notifications/cancelled` for a request this side has given up on, without waiting for it.
+///
+/// The request has already ended for its caller; the notification only tells the server. Awaited,
+/// the result of a call that had timed out or been cancelled waited for the write to a server that
+/// may be the reason it timed out: rmcp's `send_notification` returns once the transport has
+/// written the message (`service.rs:824-834`, `:1509-1528` @3.1.4), and a server that has stopped
+/// reading its stdin never lets a full pipe drain.
+fn cancel_on_the_wire(handle: RequestHandle<RoleClient>, reason: &str, which: &'static str) {
+    let notify = handle.cancel(Some(reason.to_string()));
+    tokio::spawn(async move {
+        if let Err(error) = notify.await {
+            tracing::debug!("MCP: cancelling {which} request failed: {error}");
+        }
+    });
 }
 
 /// `connection.client` — the peer every MCP request rides, or the honest refusal.
@@ -2088,6 +2100,11 @@ while IFS= read -r line; do
         *'"name":"boom"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"it went wrong"}],"isError":true}}\n' "$id"
           ;;
+        *'"name":"deep"'*)
+          d=''; e=''; i=0
+          while [ "$i" -lt 197 ]; do d="$d["; e="$e]"; i=$((i+1)); done
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[],"structuredContent":{"v":%s1%s}}}\n' "$id" "$d" "$e"
+          ;;
         *'"name":"structured"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[],"structuredContent":{"ok":true}}}\n' "$id"
           ;;
@@ -2346,6 +2363,7 @@ done
                 definition: Arc::new(live_entry()),
                 attempt: attempt.clone(),
                 request: CancelToken::new(),
+                runtime: CancelToken::new(),
                 credentials_invalidated: false,
                 request_options: crate::runtime::build_request_options(None, None),
             })
@@ -2500,6 +2518,96 @@ done
         assert_eq!(deadlines.open_prompts("fixture"), 0);
     }
 
+    /// MCP-630 on stdio: a `tools/call` reply nested 200 levels deep fails its call at once with
+    /// the refusal, under the 60 s default it used to run to — rmcp's line codec dropped the line and
+    /// the call ended `MCP request timed out after 60000 ms`.
+    #[tokio::test]
+    async fn a_reply_nested_past_what_cyrup_reads_fails_its_call_at_once() {
+        let (_attempt, _resource, peer) = live_peer().await;
+        let params = CallToolRequestParams::new("deep").with_arguments(JsonMap::new());
+        let started = Instant::now();
+        let failure = tokio::time::timeout(
+            Duration::from_secs(10),
+            request_on_peer(
+                &peer,
+                CallToolRequest::new(params).into(),
+                PeerRequestOptions::with_timeout(crate::runtime::DEFAULT_REQUEST_TIMEOUT),
+                &CancelToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("the call waited for a reply it had already been sent")
+        .expect_err("a refused reply fails its call");
+        assert_eq!(failure.message, crate::depth_guard::refusal_message(200));
+        assert_eq!(failure.protocol_code, Some(-32700));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A cancelled call returns at its cancel even when the server has stopped reading.
+    ///
+    /// `hang` leaves the fixture asleep, reading nothing more from its stdin; a second call with a
+    /// 1 MiB argument then fills the pipe, so every later write — the cancelled call's
+    /// `notifications/cancelled` among them — waits behind one that never finishes. The cancelled
+    /// call must not wait for that write: the notification only tells the server, and the server
+    /// is the reason nothing is moving.
+    #[tokio::test]
+    async fn a_cancelled_call_does_not_wait_to_tell_a_server_that_stopped_reading() {
+        let (_attempt, _resource, peer) = live_peer().await;
+        let cancel = CancelToken::new();
+        let hung = {
+            let peer = peer.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let params = CallToolRequestParams::new("hang").with_arguments(JsonMap::new());
+                request_on_peer(
+                    &peer,
+                    CallToolRequest::new(params).into(),
+                    PeerRequestOptions::no_options(),
+                    &cancel,
+                    None,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A write larger than any pipe buffer, to a reader that has stopped: it never completes.
+        let clog = {
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                let mut arguments = JsonMap::new();
+                arguments.insert("text".to_string(), Value::String("x".repeat(1 << 20)));
+                let params = CallToolRequestParams::new("echo").with_arguments(arguments);
+                request_on_peer(
+                    &peer,
+                    CallToolRequest::new(params).into(),
+                    PeerRequestOptions::no_options(),
+                    &CancelToken::new(),
+                    None,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !hung.is_finished() && !clog.is_finished(),
+            "precondition: both calls are outstanding"
+        );
+
+        cancel.cancel();
+        let failure = tokio::time::timeout(Duration::from_secs(2), hung)
+            .await
+            .expect("the cancelled call returns at its cancel, not after the write to the server")
+            .expect("the call task joins")
+            .expect_err("a cancelled call reports the abort");
+        assert!(
+            matches!(failure.error, McpError::Aborted(_)),
+            "the abort class: {failure:?}"
+        );
+        clog.abort();
+    }
+
     /// MCP-607 end to end: a 1.5 s budget against a server that reports progress every second for
     /// three seconds before answering. Each notification arrives with ~0.5 s left and refills the
     /// budget, so the call completes at ~3 s — twice the budget it was given.
@@ -2578,6 +2686,7 @@ done
                 definition: Arc::new(live_entry()),
                 attempt: attempt.clone(),
                 request: CancelToken::new(),
+                runtime: CancelToken::new(),
                 credentials_invalidated: false,
                 request_options: crate::runtime::build_request_options(None, None),
             })
@@ -3163,10 +3272,10 @@ done
             "the SDK default, named in the message: {}",
             text_of(&result.content)
         );
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() >= crate::runtime::DEFAULT_REQUEST_TIMEOUT,
-            "the minute really passed before the call gave up: {:?}",
-            started.elapsed()
+            elapsed >= Duration::from_secs(60) && elapsed < Duration::from_secs(61),
+            "the call gave up after {elapsed:?}, not at the SDK's 60 s"
         );
     }
 }

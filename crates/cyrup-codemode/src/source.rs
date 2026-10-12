@@ -253,5 +253,50 @@ pub fn parse_codemode_source(input: &str) -> Result<ParsedCodemodeSource, Codemo
     })
 }
 
+/// The same source with the options line's `timeout_ms` set to `timeout_ms` — the source's own
+/// line layout (after [`strip_fence`]), its other options and their order kept.
+///
+/// `None` when the source does not parse, sets no `timeout_ms`, or `timeout_ms` is not one an
+/// options line can carry (`1..=`[`MAX_TIMEOUT_MS`]). A caller that has spent part of a script's
+/// budget before the script starts uses this to start it with what is left: the MCP extension's
+/// wait for the servers a script names (gap-analysis MCP-628).
+#[must_use]
+pub fn with_timeout_ms(input: &str, timeout_ms: u64) -> Option<String> {
+    if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+        return None;
+    }
+    parse_codemode_source(input).ok()?.options.timeout_ms?;
+    let input = strip_fence(input).ok()?;
+    let input: &str = &input;
+    let mut offset = 0;
+    for line in input.split('\n') {
+        let start = offset;
+        offset += line.len() + 1;
+        let text = line.strip_suffix('\r').unwrap_or(line);
+        if js_trim(text).is_empty() {
+            continue;
+        }
+        // The first non-blank line, which `parse_codemode_source` has just read as the options line.
+        let lead = text.len() - js_trim_start(text).len();
+        let directive = js_trim_start(text).strip_prefix(CODEMODE_OPTIONS_PREFIX)?;
+        let Value::Object(mut fields) = serde_json::from_str(js_trim(directive)).ok()? else {
+            return None;
+        };
+        let slot = fields.get_mut("timeout_ms")?;
+        *slot = Value::from(timeout_ms);
+        let rewritten = format!(
+            "{}{CODEMODE_OPTIONS_PREFIX} {}",
+            text.get(..lead)?,
+            Value::Object(fields)
+        );
+        let rest = input.get(start + text.len()..)?;
+        let source = format!("{}{rewritten}{rest}", input.get(..start)?);
+        // The rewrite is a different spelling of a line the parser accepted; prove it still is.
+        return (parse_codemode_source(&source).ok()?.options.timeout_ms == Some(timeout_ms))
+            .then_some(source);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests;

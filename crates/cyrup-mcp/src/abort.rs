@@ -105,6 +105,44 @@ pub fn throw_if_aborted(token: &CancelToken, reason: Option<&str>) -> McpResult<
 /// `new Error(String(signal.reason ?? "MCP request aborted"))`.
 pub const ABORTED_FALLBACK_REASON: &str = "MCP request aborted";
 
+/// `combineAbortSignals(owner, caller)` for the length of one operation, and reaped when it ends.
+///
+/// [`combine`] parks a joiner task until the owner, the caller or the combination fires, and a
+/// call that ends normally fires none of them: the agent never cancels a finished call's token, so
+/// every MCP call left one task behind until the turn was cancelled or the session ended. Here the
+/// combination is built over a **private child** of the caller's token, and dropping this cancels
+/// that child: the joiner wakes, cancels the combination and exits. Cancelling the child reaches
+/// neither the caller's token nor the owner's — the reason it is a child, and the same shape as the
+/// server manager's `SignalScope`.
+pub struct ScopedSignal {
+    token: CancelToken,
+    scope: CancelToken,
+}
+
+impl ScopedSignal {
+    /// The owner's token combined with a child of `caller`'s.
+    #[must_use]
+    pub fn new(owner: &CancelToken, caller: &CancelToken) -> Self {
+        let scope = caller.child_token();
+        let token = combine(owner, Some(&scope));
+        Self { token, scope }
+    }
+}
+
+impl std::ops::Deref for ScopedSignal {
+    type Target = CancelToken;
+
+    fn deref(&self) -> &CancelToken {
+        &self.token
+    }
+}
+
+impl Drop for ScopedSignal {
+    fn drop(&mut self) {
+        self.scope.cancel();
+    }
+}
+
 /// `abortable(promise, signal)` — race `fut` against `token`.
 ///
 /// `biased;` puts the cancel arm first, which is upstream's `throwIfAborted(signal)` **before** the
@@ -199,6 +237,67 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(combined.is_cancelled());
         assert!(!a.is_cancelled() && !b.is_cancelled());
+    }
+
+    /// A call that ends without anyone cancelling anything still reaps its joiner — and reaps it
+    /// without reaching the caller's token or the owner's.
+    #[tokio::test]
+    async fn a_scoped_signal_reaps_its_joiner_when_the_call_ends_and_cancels_nothing_else() {
+        let tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let owner = CancelToken::new();
+        let caller = CancelToken::new();
+        let before = tasks();
+
+        let signal = ScopedSignal::new(&owner, &caller);
+        assert_eq!(
+            tasks(),
+            before + 1,
+            "precondition: the combination parks one joiner"
+        );
+        let token = CancelToken::clone(&signal);
+        assert!(!token.is_cancelled());
+
+        // The call ends normally: nobody cancels the caller's token or the owner's.
+        drop(signal);
+        for _ in 0..16 {
+            if tasks() == before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            tasks(),
+            before,
+            "the joiner exits when the call's scope ends"
+        );
+        assert!(token.is_cancelled(), "and the call's own token is spent");
+        assert!(
+            !caller.is_cancelled() && !owner.is_cancelled(),
+            "the caller's turn and the owner's generation go on"
+        );
+    }
+
+    /// While the call runs, the scope is a child of the caller's token, so the caller's cancel
+    /// still reaches the call.
+    #[tokio::test]
+    async fn a_scoped_signal_still_fires_on_the_callers_cancel_and_the_owners() {
+        for owner_fires in [false, true] {
+            let owner = CancelToken::new();
+            let caller = CancelToken::new();
+            let signal = ScopedSignal::new(&owner, &caller);
+            if owner_fires {
+                owner.cancel();
+            } else {
+                caller.cancel();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), signal.cancelled())
+                .await
+                .expect("a parent's cancel reaches the scoped signal");
+        }
     }
 
     #[tokio::test]

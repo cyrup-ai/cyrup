@@ -1794,6 +1794,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "cyrup-codemode",
  "cyrup-config",
  "cyrup-core",

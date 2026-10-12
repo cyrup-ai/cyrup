@@ -25,7 +25,7 @@ use crate::state::McpState;
 // ---- fixtures --------------------------------------------------------------------------------
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::lifecycle::McpLifecycleManager;
 use crate::proxy::call::AuthRecovery;
@@ -84,6 +84,10 @@ pub(crate) struct FakeEnv {
     pub(crate) calls_made: Mutex<Vec<(String, Option<OriginatingCall>)>>,
     /// What `call_tool` answers; the empty outcome when unset.
     pub(crate) call_outcome: Mutex<Option<CallToolOutcome>>,
+    /// `call_tool` fails with `UrlElicitationRequiredError` instead of answering.
+    pub(crate) call_needs_url: AtomicBool,
+    /// `handle_url_elicitation_required` never answers — the user never finishes in the browser.
+    pub(crate) url_prompt_hangs: AtomicBool,
 }
 
 impl FakeEnv {
@@ -216,6 +220,15 @@ impl ProxyEnv for FakeEnv {
             .lock()
             .unwrap()
             .push((tool.to_string(), call.cloned()));
+        if self.call_needs_url.load(Ordering::SeqCst) {
+            return Err(ProxyCallError::UrlElicitationRequired {
+                error: Box::new(rmcp::model::ErrorData::new(
+                    rmcp::model::ErrorCode(-32042),
+                    "url elicitation required",
+                    None,
+                )),
+            });
+        }
         Ok(self
             .call_outcome
             .lock()
@@ -237,6 +250,9 @@ impl ProxyEnv for FakeEnv {
         _server: &str,
         _error: &rmcp::model::ErrorData,
     ) -> UrlElicitationAction {
+        if self.url_prompt_hangs.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         UrlElicitationAction::Accept
     }
     fn failure_age_seconds(&self, server: &str) -> Option<u64> {

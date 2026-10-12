@@ -59,14 +59,106 @@ use crate::state::McpState;
 /// The literal, stable extension id every registration, log and diagnostic surface refers to.
 pub const EXTENSION_ID: &str = "mcp";
 
+/// The `initializeMcp` future of one build, memoised as a `Shared` so every joiner sees the same
+/// outcome.
+pub type InitTask = Shared<BoxFuture<'static, Result<Arc<McpState>, Arc<McpError>>>>;
+
 /// One in-flight `initializeMcp`, memoised so a second `SessionStart` within the same generation
-/// joins it rather than starting a rival build.
+/// joins it rather than starting a rival build, together with the two signals its waits end on.
 ///
-/// Held as `Arc<InitTask>` so `startInitialization`'s third staleness check — *"a second
+/// Held as `Arc<Build>` so `startInitialization`'s third staleness check — *"a second
 /// initialization has superseded this one within the same generation"* — is an **identity**
 /// comparison (`Arc::ptr_eq`), not a value comparison. Dropping that check silently permits a
 /// double commit within one generation (MCP-011).
-pub type InitTask = Shared<BoxFuture<'static, Result<Arc<McpState>, Arc<McpError>>>>;
+pub struct Build {
+    /// The build itself, driven by the task [`McpExtension::start_initialization`] spawns.
+    future: InitTask,
+    /// What that driver did with the build once it resolved. A wait for the commit ends on this
+    /// rather than on a timer it re-reads the slots under: it used to poll `proxy_ctx` for 200 ms
+    /// in one place and the cleared memo for 5 s in another, two bounds that were about the commit
+    /// tail and derived from nothing in it (MCP-631).
+    settled: tokio::sync::watch::Sender<BuildState>,
+    /// The startup pass, server by server — what the first prompt and a script wait on (MCP-629,
+    /// MCP-628).
+    startup: Arc<crate::startup::StartupPass>,
+}
+
+/// What became of one [`Build`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BuildState {
+    /// Still building, or committing.
+    Running,
+    /// Committed: the state, the proxy context and the tools are installed.
+    Committed,
+    /// `initializeMcp` rejected, with this message.
+    Failed(String),
+    /// It resolved but was not committed — a newer build or generation superseded it.
+    Superseded,
+}
+
+impl Build {
+    fn new(future: InitTask, startup: Arc<crate::startup::StartupPass>) -> Self {
+        Self {
+            future,
+            settled: tokio::sync::watch::Sender::new(BuildState::Running),
+            startup,
+        }
+    }
+
+    /// A build whose future is `future` and that nothing drives. A test sets its outcome itself.
+    #[cfg(test)]
+    pub(crate) fn detached(future: InitTask) -> Arc<Self> {
+        Arc::new(Self::new(
+            future,
+            Arc::new(crate::startup::StartupPass::new()),
+        ))
+    }
+
+    /// The startup pass this build reports to.
+    #[must_use]
+    pub fn startup(&self) -> &crate::startup::StartupPass {
+        &self.startup
+    }
+
+    /// Record what became of the build. Only the first outcome counts. Its startup pass ends with
+    /// it, so a wait for the build and a wait for its servers end together.
+    pub(crate) fn settle(&self, outcome: BuildState) {
+        self.settled.send_if_modified(|state| {
+            let first = *state == BuildState::Running && outcome != BuildState::Running;
+            if first {
+                *state = outcome;
+            }
+            first
+        });
+        self.startup.finish();
+    }
+
+    /// Wait until the build has been committed, failed or been superseded.
+    ///
+    /// No bound: the build is bounded by its own stages (each server's connect by its
+    /// `requestTimeoutMs`, a `!command` secret by its 10 s, a sign-in by its callback timeout). A
+    /// caller that has a deadline or a cancel of its own races this future against it.
+    pub(crate) async fn settled(&self) -> BuildState {
+        let mut settled = self.settled.subscribe();
+        // The sender lives in `self`, which this future borrows, so the channel cannot close.
+        settled
+            .wait_for(|state| *state != BuildState::Running)
+            .await
+            .map_or(BuildState::Superseded, |state| state.clone())
+    }
+}
+
+/// Settles a build its driver did not: a commit tail that panicked, or a driver dropped by a
+/// runtime shutting down. Without it a wait on the build would wait for an outcome nobody sends.
+struct DriverGuard(Arc<Build>);
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        self.0.settle(BuildState::Failed(
+            "MCP initialization ended without a result".to_string(),
+        ));
+    }
+}
 
 /// `startInitialization(..., "stale_session_start")` (`index.ts:405`) — the
 /// [`crate::lifecycle::shutdown_state`] reason a build that lost its generation is torn down under.
@@ -113,19 +205,23 @@ pub struct McpExtension {
     /// `state` — the committed runtime, or `None` between generations.
     state: Mutex<Option<Arc<McpState>>>,
     /// `initPromise` — the in-flight build, if any.
-    init_task: Mutex<Option<Arc<InitTask>>>,
+    init_task: Mutex<Option<Arc<Build>>>,
     /// `waitedForStartup` — whether the first prompt of this session has had its turn at waiting
     /// for the build. Reset by the session start.
     waited_for_startup: AtomicBool,
     /// How long a `codemode` or `tool_search` call waits for the build: [`TOOL_CALL_WAIT`], except in
     /// a test that cannot wait two minutes.
     tool_call_wait: std::time::Duration,
-    /// [CYRUP-DELTA] The build a `codemode` or `tool_search` call has already waited the whole
-    /// [`TOOL_CALL_WAIT`] for without it settling. Later calls do not wait for it again: a server
-    /// that did not answer in two minutes did not answer in the minute after, and every script
-    /// would otherwise pay the two minutes again, for as long as the server stayed silent. Weak, so
-    /// that a dead generation's build is not kept alive by the record of having waited for it.
-    stalled_build: Mutex<Option<std::sync::Weak<InitTask>>>,
+    /// [CYRUP-DELTA] The servers of one build that a `codemode` or `tool_search` call has already
+    /// waited the whole [`TOOL_CALL_WAIT`] for without them settling. Later calls do not wait for
+    /// them again: a server that did not answer in two minutes did not answer in the minute after,
+    /// and every script would otherwise pay the two minutes again, for as long as the server stayed
+    /// silent. Weak, so that a dead generation's build is not kept alive by the record of having
+    /// waited for it.
+    stalled_servers: Mutex<Option<(std::sync::Weak<Build>, std::collections::BTreeSet<String>)>>,
+    /// The servers each `codemode` or `tool_search` call went ahead without, from its `tool_call`
+    /// to its `tool_result` (MCP-628).
+    still_connecting: Mutex<std::collections::HashMap<cyrup_core::ToolCallId, Vec<String>>>,
     /// `registeredDirectTools` — tool name to fingerprint, surviving re-`init` (MCP-036).
     registered_direct_tools: Mutex<IndexMap<String, String>>,
     /// `lazyDirectTools` and `deferredToolDefinitions` — the search-mode tools registered by the
@@ -215,13 +311,14 @@ pub struct McpExtension {
 const CODEMODE_TOOL: &str = "codemode";
 const TOOL_SEARCH_TOOL: &str = "tool_search";
 
-/// How long a `codemode` or `tool_search` call waits for the servers to connect.
+/// How long a `codemode` or `tool_search` call waits for the servers it needs to connect.
 ///
-/// [CYRUP-DELTA] Upstream's `waitForServers` is unbounded: it ends when every server's `ready`
-/// promise settles, which each connection's own timeouts bound. One build here connects every
-/// server, with nothing but the transport's own limits to end it, so a server that never answers
-/// would hold every script for the life of the session. Two minutes covers a cold `npx` download;
-/// when it passes the call runs against whatever has registered, as it did before the wait existed.
+/// [CYRUP-DELTA] Upstream's `waitForServers` is unbounded: it ends when the `ready` promise of
+/// every server the call needs settles, which each connection's own timeouts bound
+/// (`extensions/mcp/index.ts:563-576` @v1.0.4). The wait here is on the same per-server signals
+/// ([`crate::startup::StartupPass`]), and a server's connect is bounded too, but a project-server
+/// trust dialog or an OAuth sign-in inside the build can outlast any connect timeout, so a script
+/// is not held past two minutes for one. A script with a shorter `timeout_ms` waits at most that.
 const TOOL_CALL_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// What is said when a wait for the servers ends before they have connected (`index.ts:1056`
@@ -229,32 +326,120 @@ const TOOL_CALL_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 const STILL_CONNECTING_NOTICE: &str =
     "MCP servers are still connecting; their tools become available once connected.";
 
-/// [CYRUP-DELTA] How long a `codemode` script waits for the servers it needs: [`TOOL_CALL_WAIT`], or
-/// the script's own `timeout_ms` when that is shorter. The wait is before the script starts, so a
-/// script that asked for three seconds waited two minutes and was then given its three. It still gets
-/// its `timeout_ms` after the wait.
-fn script_wait(code: &str, bound: std::time::Duration) -> std::time::Duration {
-    cyrup_codemode::source::parse_codemode_source(code)
-        .ok()
-        .and_then(|parsed| parsed.options.timeout_ms)
-        .map_or(bound, |ms| bound.min(std::time::Duration::from_millis(ms)))
-}
-
-/// How long the first prompt waits for the servers that are still connecting.
+/// How long a `session_start` may spend shutting the previous session's servers down before it
+/// starts the new session's build.
 ///
-/// pi's built-in MCP extension holds the first prompt for the servers whose tools it declares, for
-/// at most `startupWaitMs`, default 10 000 (`extensions/mcp/index.ts` @v1.0.4,
-/// `DEFAULT_STARTUP_WAIT_MS`), so that their tools are in the first request; the adapter's own
-/// `input` handler waited 30 s ([`crate::proxy::INIT_WAIT_TIMEOUT_MS`]). The build here connects
-/// every server, and the user is waiting at the prompt, so the shorter bound applies; a server
-/// that is slower than this is waited for by the script or search that needs it
-/// ([`TOOL_CALL_WAIT`]).
+/// What the teardown waits on, in order. The previous generation's connects are aborted, and each
+/// ends at its next look at its attempt's signal; every stage looks, the OAuth token lookup
+/// included, which is raced against the attempt as upstream's OAuth fetches are
+/// (`createAuthProvider`, `server-manager.ts`). A keyring read already under way finishes on its
+/// blocking thread, but nothing waits for it. A connect the abort caught after its handshake closes
+/// what it had built, and then the live connections close together: an HTTP session's `DELETE`
+/// under rmcp's 5 s (`SESSION_CLEANUP_TIMEOUT`, `transport/streamable_http_client.rs:35`) and a
+/// stdio child's exit under its 3 s before the kill ([`crate::stdio_child::MAX_WAIT_ON_DROP`],
+/// rmcp's `MAX_WAIT_ON_DROP_SECS`). So the closing takes at most 10 s.
+///
+/// The 35 s is a ceiling over those 10 s, not a sum of bounds; the margin covers what nothing here
+/// bounds, the metadata and trace flushes that write to disk. A teardown that outlives it costs the
+/// new session its servers rather than holding its start without end.
+const PREVIOUS_GENERATION_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(35);
+
+/// How many calls' still-connecting notes are kept at once (see `McpExtension::remember_note`).
+const STILL_CONNECTING_NOTES: usize = 64;
+
+/// How long the first prompt waits for the servers whose tools it declares and that are still
+/// being discovered.
+///
+/// pi's built-in MCP extension holds the first prompt for those servers for at most
+/// `startupWaitMs`, default 10 000 (`extensions/mcp/index.ts:93`, `:1040-1058` @v1.0.4), so that
+/// their tools are in the first request; the adapter's own `input` handler waited 30 s
+/// ([`crate::proxy::INIT_WAIT_TIMEOUT_MS`]) on the whole build. This is pi's: per server, and the
+/// user is waiting at the prompt. A server slower than this is waited for by the script or search
+/// that needs it ([`TOOL_CALL_WAIT`]).
 const FIRST_PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long, once the build has resolved, the wait gives the commit tail to publish the tools. The
-/// tail runs on its own task right after the build resolves, so this only guards a tail that never
-/// runs (a superseded generation).
-const COMMIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// The time a `codemode` script's MCP wait took out of its `timeout_ms` (MCP-628).
+///
+/// [CYRUP-DELTA, upward] The wait for the servers a script names runs before the script, in this
+/// `tool_call` hook, and the script's own deadline is armed when it starts, so the two used to be
+/// separate budgets and a script that asked for three seconds could take six. pi charges nothing
+/// either, but its script has no deadline unless it asks for one
+/// (`timeoutMs ?? Number.POSITIVE_INFINITY`, `extensions/codemode/execute.ts:427` @v1.0.4). Here `timeout_ms` is the whole budget: the wait is
+/// bounded by it, and what the wait took is taken off the deadline the script starts with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScriptBudget {
+    /// The script sets no `timeout_ms`. Its default limits are its own running time and 30 minutes
+    /// in all; the wait is not charged to them, because writing a `timeout_ms` into a script that
+    /// set none would replace both limits.
+    Default,
+    /// The script's `timeout_ms`.
+    Limit(std::time::Duration),
+}
+
+impl ScriptBudget {
+    /// The budget of `code`, or `None` when the source does not parse — the `codemode` tool
+    /// refuses it at once, so there is nothing to wait for.
+    fn of(code: &str) -> Option<Self> {
+        let parsed = cyrup_codemode::source::parse_codemode_source(code).ok()?;
+        Some(parsed.options.timeout_ms.map_or(Self::Default, |ms| {
+            Self::Limit(std::time::Duration::from_millis(ms))
+        }))
+    }
+
+    /// How long the wait may take: [`TOOL_CALL_WAIT`], or the script's own limit when shorter.
+    fn wait_bound(self, bound: std::time::Duration) -> std::time::Duration {
+        match self {
+            Self::Default => bound,
+            Self::Limit(limit) => bound.min(limit),
+        }
+    }
+}
+
+/// The `codemode` source after a wait of `waited`: the same script with `timeout_ms` set to what is
+/// left of it, or `None` when nothing is charged. `Err` carries the limit the wait used up.
+fn charge_script(
+    code: &str,
+    budget: ScriptBudget,
+    waited: std::time::Duration,
+) -> Result<Option<String>, std::time::Duration> {
+    let ScriptBudget::Limit(limit) = budget else {
+        return Ok(None);
+    };
+    // Whole milliseconds of the wait, rounded down: a wait that found every server ready took
+    // microseconds, and charging it a millisecond would rewrite every script, and refuse one that
+    // asked for a single millisecond, for a wait that did not happen. `timeout_ms` is whole
+    // milliseconds, so `limit` is too.
+    let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+    if waited_ms == 0 {
+        return Ok(None);
+    }
+    let limit_ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX);
+    let left_ms = limit_ms.saturating_sub(waited_ms);
+    if left_ms == 0 {
+        return Err(limit);
+    }
+    Ok(cyrup_codemode::source::with_timeout_ms(code, left_ms))
+}
+
+/// What a `codemode` or `tool_search` call is told about the servers it needed and did not get.
+///
+/// [CYRUP-DELTA, upward] pi says it with `ctx.ui.notify` only, which a `-p` run never shows and the
+/// model never reads; here the call's own result says it, in every mode.
+fn still_connecting_note(servers: &[String]) -> String {
+    let named = servers
+        .iter()
+        .map(|server| format!("\"{server}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match servers {
+        [_] => format!(
+            "MCP server {named} is still connecting; its tools were not available to this call."
+        ),
+        _ => format!(
+            "MCP servers {named} are still connecting; their tools were not available to this call."
+        ),
+    }
+}
 
 /// `\bword\b` over `code`: `word` with no identifier character on either side.
 fn contains_word(code: &str, word: &str) -> bool {
@@ -273,8 +458,10 @@ fn contains_word(code: &str, word: &str) -> bool {
 /// (`scriptNeedsServer`, `extensions/mcp/index.ts` @v1.0.4).
 ///
 /// [CYRUP-DELTA] A tool here is named by the configured `toolPrefix` (`fx_echo`), not only as
-/// `mcp__<server>__<tool>`, so the formatted prefix counts as naming the server too; with prefixes
-/// off a tool name says nothing about its server, and the script is assumed to need it.
+/// `mcp__<server>__<tool>`, so the formatted prefix counts as naming the server too, in the form a
+/// script writes it: a script calls a tool by its codemode identifier, in which every character an
+/// identifier cannot hold is `_` (`tools.my_docs_find` for server `my-docs`). With prefixes off a
+/// tool name says nothing about its server, and the script is assumed to need it.
 fn script_needs_server(code: &str, server: &str, prefix: crate::config::ToolPrefix) -> bool {
     const DISCOVERY: [&str; 4] = [
         "searchTools",
@@ -289,7 +476,11 @@ fn script_needs_server(code: &str, server: &str, prefix: crate::config::ToolPref
         return true;
     }
     let prefix = crate::registration::server_prefix(server, prefix);
-    prefix.is_empty() || code.contains(&prefix)
+    if prefix.is_empty() {
+        return true;
+    }
+    let identifier = cyrup_codemode::identifier::to_codemode_identifier(&prefix);
+    code.contains(&prefix) || code.contains(identifier.as_str())
 }
 
 impl McpExtension {
@@ -648,7 +839,8 @@ impl McpExtension {
             init_task: Mutex::new(None),
             waited_for_startup: AtomicBool::new(false),
             tool_call_wait: TOOL_CALL_WAIT,
-            stalled_build: Mutex::new(None),
+            stalled_servers: Mutex::new(None),
+            still_connecting: Mutex::new(std::collections::HashMap::new()),
             registered_direct_tools: Mutex::new(IndexMap::new()),
             lazy_direct_tools: Mutex::new(IndexMap::new()),
             registered_prompt_commands: Mutex::new(IndexMap::new()),
@@ -845,24 +1037,24 @@ impl McpExtension {
 
     /// `initPromise` — the in-flight build, if one has not yet settled.
     ///
-    /// The join point for anything that must wait on a runtime that is still coming up: clone the
-    /// inner [`InitTask`] out of the `Arc` and await it under a bound (see [`Self::on_input`], which
-    /// does exactly that). Joining is not the same as owning — the returned handle carries no
-    /// authority to commit, and the commit tail's identity check
-    /// ([`Self::init_task_is`]) is what keeps a joiner from being mistaken for the builder.
+    /// The join point for anything that must wait on a runtime that is still coming up: a wait on
+    /// the commit ends on [`Build`]'s settled signal, a wait for servers on its startup pass (see
+    /// [`Self::on_input`]). Joining is not the same as owning — the returned handle carries no
+    /// authority to commit, and the commit tail's identity check ([`Self::init_task_is`]) is what
+    /// keeps a joiner from being mistaken for the builder.
     #[must_use]
-    pub fn init_task(&self) -> Option<Arc<InitTask>> {
+    pub fn init_task(&self) -> Option<Arc<Build>> {
         self.init_task.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// `initPromise === promise` — `startInitialization`'s **third** staleness check.
     ///
-    /// An `Arc::ptr_eq` and never a value comparison: [`InitTask`] is a `Shared` future, which has
+    /// An `Arc::ptr_eq` and never a value comparison: a [`Build`]'s future is a `Shared`, which has
     /// no equality and no stable id of its own, and the whole point of the check is identity. Two
     /// `SessionStart`s inside one generation each memoise their own build; without this the second
     /// build's commit and the first build's commit would both pass the other two checks and both
     /// write `state`.
-    fn init_task_is(&self, task: &Arc<InitTask>) -> bool {
+    fn init_task_is(&self, task: &Arc<Build>) -> bool {
         self.init_task()
             .is_some_and(|current| Arc::ptr_eq(&current, task))
     }
@@ -1093,7 +1285,7 @@ impl McpExtension {
         dispatch_ctx: HostCtx,
         generation: u64,
         stale_reason: &'static str,
-    ) -> Option<Arc<InitTask>> {
+    ) -> Option<Arc<Build>> {
         let Some(strong) = self.self_weak.get().and_then(std::sync::Weak::upgrade) else {
             tracing::debug!("MCP: no self handle bound; session initialization not started");
             return None;
@@ -1120,6 +1312,22 @@ impl McpExtension {
         // cleanup and the three explicit teardown sites — `on_session_start`,
         // `on_session_shutdown` and the failure tail below — own it instead. That is what lets a
         // build which never commits still have its runtime shut down.
+        // MCP-629 — the startup pass the build reports to, server by server. Its publisher is this
+        // generation's surface sync, so a server whose tools are declared reaches the model the
+        // moment it settles. Weak, because the build the pass belongs to is held by this extension.
+        let startup = Arc::new(crate::startup::StartupPass::new());
+        {
+            let weak = Arc::downgrade(&strong);
+            let owner = Arc::clone(&owner);
+            startup.set_publisher(move || {
+                if let Some(ext) = weak.upgrade()
+                    && owner.is_active()
+                    && ext.generation() == generation
+                {
+                    ext.sync_tool_surface();
+                }
+            });
+        }
         let task: InitTask = {
             let owner = Arc::clone(&owner);
             let dirs = self.dirs.clone();
@@ -1127,6 +1335,7 @@ impl McpExtension {
                 programmatic_config: self.programmatic_config.clone(),
                 oauth_runtime: Some(Arc::clone(&oauth_runtime)),
                 auth_store: self.auth_store.clone(),
+                startup: Some(Arc::clone(&startup)),
             };
             async move {
                 crate::runtime::initialize_mcp(owner, dirs, snapshot, options)
@@ -1138,7 +1347,7 @@ impl McpExtension {
             .boxed()
             .shared()
         };
-        let handle = Arc::new(task);
+        let handle = Arc::new(Build::new(task, startup));
         if let Ok(mut slot) = self.init_task.lock() {
             *slot = Some(Arc::clone(&handle));
         }
@@ -1148,9 +1357,11 @@ impl McpExtension {
         // `docker` server takes seconds, and the model's first reply takes less — and the tools are
         // registered from the disk caches before any server is contacted. With the slot empty they
         // answered `MCP not initialized` for the whole build, a dead end the model reads as "MCP is
-        // broken". Upstream's executors wait: `await awaitWithTimeout(initPromise,
-        // INIT_WAIT_TIMEOUT_MS)` when `!state && initPromise` (`index.ts:2172`, `direct-tools.ts:137`
-        // @v5.2.0), and [`crate::dispatch::McpDispatch`]'s gate is that wait. It reads `proxy_ctx`
+        // broken". Upstream's executors wait when `!state && initPromise`: the gateway at most
+        // `INIT_WAIT_TIMEOUT_MS` (`awaitWithTimeout(initPromise, INIT_WAIT_TIMEOUT_MS)`, `index.ts:2174`
+        // @v5.2.0), a direct tool for the build itself (`await initPromise`, `direct-tools.ts:143-146`).
+        // [`crate::dispatch::McpDispatch`] keeps both: the gateway's 30 s, and a direct call's wait for
+        // the build or its own cancel (MCP-631). It reads `proxy_ctx`
         // and `init_task` live and holds only a `Weak`, so installing it before either is filled is
         // safe, and the generation's slots were cleared by `on_session_start` before this point.
         Self::install_dispatch(&strong);
@@ -1160,7 +1371,9 @@ impl McpExtension {
         // `on_input` to poll would mean the runtime starts building when the user first types.
         let driver = Arc::clone(&handle);
         tokio::spawn(async move {
-            match (*driver).clone().await {
+            // Settles the build however this task ends, including a commit tail that panics.
+            let _guard = DriverGuard(Arc::clone(&driver));
+            match driver.future.clone().await {
                 Ok(next_state) => {
                     Self::commit_initialization(
                         strong,
@@ -1216,7 +1429,7 @@ impl McpExtension {
         owner: &Arc<McpRuntimeOwner>,
         dispatch_ctx: &HostCtx,
         generation: u64,
-        task: &Arc<InitTask>,
+        task: &Arc<Build>,
         stale_reason: &'static str,
     ) {
         // 1 — the TRIPLE staleness check (`index.ts:305`), all three `||`-joined and checked before
@@ -1226,6 +1439,8 @@ impl McpExtension {
         // committed** — leaking it would leave a live server manager, its children and its
         // lifecycle timers running with nothing able to reach them.
         if !owner.is_active() || ext.generation() != generation || !ext.init_task_is(task) {
+            // Before the teardown: a call waiting on this build is answered now, not after it.
+            task.settle(BuildState::Superseded);
             if let Err(error) = crate::lifecycle::shutdown_state(
                 Some(next_state),
                 stale_reason,
@@ -1308,6 +1523,8 @@ impl McpExtension {
         if let Ok(mut slot) = ext.init_task.lock() {
             *slot = None;
         }
+        // …and every wait on the commit ends: the context, the dispatcher and the tools are in.
+        task.settle(BuildState::Committed);
 
         // 9 — `freezeDirectTools` (`index.ts:320-323`). Read from the config the runtime was
         // actually built from, which is the same document `init` registered the early surface from.
@@ -1340,8 +1557,10 @@ impl McpExtension {
         owner: &Arc<McpRuntimeOwner>,
         oauth_runtime: &Arc<crate::state::OAuthRuntime>,
         generation: u64,
-        task: &Arc<InitTask>,
+        task: &Arc<Build>,
     ) {
+        // A call waiting on this build gets the rejection however this generation fares.
+        task.settle(BuildState::Failed(error.to_string()));
         // `if (!owner.isActive() || generation !== lifecycleGeneration) return;`
         if !owner.is_active() || self.generation() != generation {
             return;
@@ -1433,6 +1652,13 @@ impl McpExtension {
         let snapshot = self.context_snapshot(ctx);
         let dispatch_ctx = ctx.clone();
 
+        // Declared, so the dispatcher's 5 s budget does not cut it: a cut drops this handler before
+        // `start_initialization` below, and the new session gets no MCP at all. The teardown is
+        // bounded by what it waits on ([`PREVIOUS_GENERATION_TEARDOWN`]).
+        let teardown = ctx.begin_sanctioned_wait(
+            cyrup_ext::native::SanctionedWaitKind::ServerShutdown,
+            PREVIOUS_GENERATION_TEARDOWN + cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET,
+        );
         crate::lifecycle::shutdown_previous_generation(
             previous,
             crate::lifecycle::SESSION_RESTART_STOP_REASON,
@@ -1441,6 +1667,7 @@ impl McpExtension {
             crate::live::metadata_flush(self.dirs.clone()),
         )
         .await;
+        drop(teardown);
 
         // The post-await re-check. A newer generation superseded this one while the previous owner
         // drained, so this continuation must not become the live runtime.
@@ -1476,10 +1703,11 @@ impl McpExtension {
     /// 1. **The owner is captured once, before the first await** (`const inputOwner = currentOwner`,
     ///    `index.ts:490`) and re-checked after (`:503`). A session replacement mid-pass must not let
     ///    a dead generation's convergence gate the live generation's turn.
-    /// 2. **A build in flight is waited for, bounded** by [`FIRST_PROMPT_WAIT`] (`index.ts:493-499`
-    ///    waits [`crate::proxy::INIT_WAIT_TIMEOUT_MS`]; see the constant for the difference). A
-    ///    timeout `return`s rather than failing: an input must never be swallowed because MCP was
-    ///    slow to start.
+    /// 2. **The servers whose tools the first request declares are waited for, bounded** by
+    ///    [`FIRST_PROMPT_WAIT`] — pi's `waitForDirectServers` (`extensions/mcp/index.ts:1040-1058`
+    ///    @v1.0.4), on each such server that the build is still discovering, not on the build
+    ///    (MCP-629). A timeout `return`s rather than failing: an input must never be swallowed
+    ///    because MCP was slow to start.
     /// 3. **`ensureConverged` is awaited, not spawned** (`:506`). Fire-and-forget would reintroduce
     ///    the very race the commit fixes, and the single-flight slot inside
     ///    [`McpLifecycleManager::ensure_converged`][crate::lifecycle::McpLifecycleManager::ensure_converged]
@@ -1495,29 +1723,40 @@ impl McpExtension {
     /// fault and shows `Extension error (mcp): extension timed out (epoch deadline)`; upstream's
     /// `await` has no such budget. A server that needs longer than 5 s to start (a cold `npx`
     /// download) therefore ended the wait with an error line, and the prompt had been held for
-    /// nothing. The build wait is declared ([`cyrup_ext::native::SanctionedWaitKind::ServerConnect`])
+    /// nothing. The server wait is declared ([`cyrup_ext::native::SanctionedWaitKind::ServerConnect`])
     /// and ends at its own bound, so the handler returns quietly before the budget could cut it.
-    /// The convergence pass after it keeps the budget: it is bounded near 5 s anyway, because
-    /// `refreshTools` carries `KEEP_ALIVE_REFRESH_TIMEOUT_MS = 5_000` per server across
-    /// [`KEEP_ALIVE_CHECK_CONCURRENCY`][crate::lifecycle::KEEP_ALIVE_CHECK_CONCURRENCY] workers, and
-    /// the turn continuing against a possibly-stale catalog is upstream's own `catch`.
+    ///
+    /// The convergence pass after it is not declared, and keeps the budget: upstream awaits it with
+    /// no bound of its own, its reconnects bounded by their connect budgets and its refreshes by
+    /// `KEEP_ALIVE_REFRESH_TIMEOUT_MS` (`lifecycle.ts:127-137`, `server-manager.ts:704` @v5.2.0),
+    /// and holding a submission that long is a choice this port has not made (`MCP-636`). This
+    /// port has no `KEEP_ALIVE_REFRESH_TIMEOUT_MS`: its `refreshTools` is not wired (`MCP-120`).
+    /// A pass the budget cuts goes on detached
+    /// ([`crate::lifecycle::McpLifecycleManager::ensure_converged`]), so the next submission joins
+    /// it rather than a memo of one that never finished.
     async fn on_input(&self, ctx: &HostCtx) {
         // `const inputOwner = currentOwner; if (!inputOwner?.isActive()) return;`
         let Some(owner) = self.owner().filter(|owner| owner.is_active()) else {
             return;
         };
 
-        // `if (!state && initPromise) { try { await awaitWithTimeout(...) } catch { return } }`
+        // `if (!state && initPromise) { ... }`, narrowed to pi's `waitForDirectServers`.
         if self.state().is_none()
-            && let Some(task) = self.init_task.lock().ok().and_then(|slot| slot.clone())
-            && self.first_prompt_waits()
+            && let Some(build) = self.init_task()
+            && let Some(wanted) = self.first_prompt_servers()
         {
             // Upstream's bare `catch { return }` covers BOTH arms: the timeout and a rejected
             // build. Neither is this handler's to report — `startInitialization` already did —
             // except that the first prompt is going on without the tools it waited for, which
             // `waitForDirectServers` says.
-            if !self
-                .wait_for_build(&task, &owner, ctx, FIRST_PROMPT_WAIT)
+            if let crate::startup::Waited::GaveUp(_) = self
+                .wait_for_servers(
+                    &build,
+                    &wanted,
+                    &std::collections::BTreeSet::new(),
+                    FIRST_PROMPT_WAIT,
+                    ctx,
+                )
                 .await
             {
                 self.notify_still_connecting();
@@ -1541,21 +1780,26 @@ impl McpExtension {
         }
     }
 
-    /// `waitForDirectServers`' two guards (`index.ts:1040-1046` @v1.0.4): only the first prompt of a
-    /// session waits (`waitedForStartup`), and only when some server declares tools to the model
-    /// (`hasDirectTools`), so that they are in its first request. Every other server is waited for
-    /// by the script or search that needs it ([`Self::on_tool_call`]).
-    ///
-    /// [CYRUP-DELTA] The build here connects every server as one future, so this waits for the build
-    /// and not for the servers that declare tools; see [`crate::registration::declares_direct_tools`].
-    fn first_prompt_waits(&self) -> bool {
+    /// `waitForDirectServers`' guards (`index.ts:1040-1046` @v1.0.4): only the first prompt of a
+    /// session waits (`waitedForStartup`), and only for the servers that declare tools to the model
+    /// in its request (`hasDirectTools` — `directTools: true` or a list, not `"search"`). `None`
+    /// when this prompt is not the first.
+    fn first_prompt_servers(&self) -> Option<std::collections::BTreeSet<String>> {
         if self.waited_for_startup.swap(true, Ordering::AcqRel) {
-            return false;
+            return None;
         }
         let config = self.current_config();
         let env_raw = std::env::var(crate::registration::DIRECT_TOOLS_ENV_VAR).ok();
         let env_override = crate::runtime::direct_tools_override(env_raw.as_deref());
-        crate::registration::declares_direct_tools(&config, env_override.as_deref())
+        Some(
+            crate::registration::direct_tool_servers(&config, env_override.as_deref())
+                .into_iter()
+                .filter(|(_, declaration)| {
+                    *declaration == crate::registration::DirectDeclaration::Eager
+                })
+                .map(|(server, _)| server)
+                .collect(),
+        )
     }
 
     /// The configuration the next build would run under: the programmatic one, else what the files say.
@@ -1573,107 +1817,265 @@ impl McpExtension {
         }
     }
 
-    /// Whether a `codemode` or `tool_search` call has already waited [`TOOL_CALL_WAIT`] for `task`.
-    fn waited_out(&self, task: &Arc<InitTask>) -> bool {
-        self.stalled_build
+    /// The servers of `build` a `codemode` or `tool_search` call has already waited
+    /// [`TOOL_CALL_WAIT`] for.
+    fn stalled_in(&self, build: &Arc<Build>) -> std::collections::BTreeSet<String> {
+        self.stalled_servers
             .lock()
             .ok()
-            .and_then(|slot| slot.as_ref().and_then(std::sync::Weak::upgrade))
-            .is_some_and(|stalled| Arc::ptr_eq(&stalled, task))
+            .and_then(|slot| {
+                slot.as_ref().and_then(|(stalled, servers)| {
+                    stalled
+                        .upgrade()
+                        .filter(|stalled| Arc::ptr_eq(stalled, build))
+                        .map(|_| servers.clone())
+                })
+            })
+            .unwrap_or_default()
     }
 
-    fn remember_waited_out(&self, task: &Arc<InitTask>) {
-        if let Ok(mut slot) = self.stalled_build.lock() {
-            *slot = Some(Arc::downgrade(task));
+    fn remember_stalled(&self, build: &Arc<Build>, servers: &[String]) {
+        if let Ok(mut slot) = self.stalled_servers.lock() {
+            let mut known = match slot.take() {
+                Some((stalled, known))
+                    if stalled
+                        .upgrade()
+                        .is_some_and(|stalled| Arc::ptr_eq(&stalled, build)) =>
+                {
+                    known
+                }
+                _ => std::collections::BTreeSet::new(),
+            };
+            known.extend(servers.iter().cloned());
+            *slot = Some((Arc::downgrade(build), known));
         }
     }
 
-    /// Waits for the build `task` for at most `wait`, then for the commit tail that publishes the
-    /// tools it built. The wait is a declared
-    /// [`cyrup_ext::native::SanctionedWaitKind::ServerConnect`] one: the dispatcher's budget forgives
-    /// it up to its own ceiling (`wait`, the grace and the dispatcher's 5 s check interval), so the
-    /// handler has always returned before the budget could cut it. `false` when the build had not
-    /// settled in time.
-    async fn wait_for_build(
+    /// Wait until none of `wanted` is still being discovered by `build`, for at most `wait`.
+    ///
+    /// The wait is a declared [`cyrup_ext::native::SanctionedWaitKind::ServerConnect`] one: the
+    /// dispatcher's budget forgives it up to its own ceiling (`wait` and the dispatcher's 5 s check
+    /// interval), so the handler has always returned before the budget could cut it. A server whose
+    /// tools are declared is published before it leaves the set, so a settled wait has nothing left
+    /// to wait for: the commit that publishes the rest is not this wait's business.
+    async fn wait_for_servers(
         &self,
-        task: &Arc<InitTask>,
-        owner: &McpRuntimeOwner,
-        ctx: &HostCtx,
+        build: &Arc<Build>,
+        servers: &std::collections::BTreeSet<String>,
+        through_build: &std::collections::BTreeSet<String>,
         wait: std::time::Duration,
-    ) -> bool {
+        ctx: &HostCtx,
+    ) -> crate::startup::Waited {
+        if build.startup.is_ready(servers, through_build) {
+            return crate::startup::Waited::Settled;
+        }
         let _wait = ctx.begin_sanctioned_wait(
             cyrup_ext::native::SanctionedWaitKind::ServerConnect,
-            wait + COMMIT_GRACE + cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET,
+            wait + cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET,
         );
-        // The build's outcome is reported by the tails `start_initialization` spawned; a build that
-        // failed or timed out leaves the caller to go on with what is registered.
-        if tokio::time::timeout(wait, (**task).clone()).await.is_err() {
-            return false;
-        }
-        // The commit tail clears the memo last, after the tools are registered
-        // ([`Self::commit_initialization`] step 8).
-        let grace = tokio::time::Instant::now() + COMMIT_GRACE;
-        while self.init_task_is(task) && owner.is_active() && tokio::time::Instant::now() < grace {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        true
+        build.startup.wait_for(servers, through_build, wait).await
     }
 
-    /// `pi.on("tool_call")` (`extensions/mcp/index.ts` @v1.0.4) — hold a `codemode` script or a
-    /// `tool_search` until the servers it needs have connected, so their tools are registered when
-    /// the script lists or calls them.
+    /// `pi.on("tool_call")` (`extensions/mcp/index.ts:1073-1089` @v1.0.4) — hold a `codemode`
+    /// script or a `tool_search` until the servers it needs have connected, so their tools are
+    /// registered when the script lists or calls them.
     ///
     /// Without it a `-p` run starts its first script while a cold server is still starting:
     /// `tools.<server>_<tool>` does not exist, `searchTools()` and `ALL_TOOLS` lack the server, and
     /// the model's only recourse is to retry. [`Self::on_input`] cannot close this: the dispatcher
     /// cuts it at its 5 s budget, and a first connect (`npx` downloading a package) takes longer.
     ///
-    /// A script waits only for what it names ([`script_needs_server`]); `tool_search` reaches every
-    /// server, so it waits for the build whatever the query. There is nothing to wait for once the
-    /// build has committed: a server connects in that build, and one that is not resident connects
-    /// on its first call.
+    /// A script waits only for the servers it names ([`script_needs_server`]), and `tool_search` for
+    /// the servers that declare tools. Of those, a server that declares tools is waited for only
+    /// while the build is still discovering it, each on its own ([`crate::startup::StartupPass`],
+    /// MCP-629): a server whose tools the cache holds is registered already. A named server reached
+    /// only through the `mcp` gateway waits for the build to end, because the gateway reads the
+    /// committed catalogue; a wait for it that gives up names what holds the build.
+    ///
+    /// [CYRUP-DELTA, upward] pi's `tool_search` waits for every server still starting
+    /// (`waiting = pendingServers`, `extensions/mcp/index.ts:1085-1086` @v1.0.4). `tool_search` finds
+    /// only declared tools, and a server reached through the gateway declares none, so here it does
+    /// not wait for one: what it can find is the same, sooner.
+    ///
+    /// A script's wait is charged to its `timeout_ms` ([`ScriptBudget`], MCP-628): the script starts
+    /// with what is left, and one whose whole limit went on the wait is not started. A call whose
+    /// servers were still connecting when the wait ended is told so in its own result
+    /// ([`still_connecting_note`]).
     ///
     /// **This handler must never fail.** `tool_call` fails closed (`EventKind::fails_closed`): an
     /// error or a timeout here would BLOCK the call. The wait is declared
     /// ([`cyrup_ext::native::SanctionedWaitKind::ServerConnect`]) so the 5 s budget does not cut it,
-    /// bounded by [`TOOL_CALL_WAIT`] inside the declared ceiling, and answers with no verdict.
-    async fn on_tool_call(&self, name: &str, input: &serde_json::Value, ctx: &HostCtx) {
+    /// bounded by [`TOOL_CALL_WAIT`] inside the declared ceiling, and the dispatcher races it
+    /// against the turn's abort, as pi's `waitForServers(waiting, ctx.signal)` is.
+    async fn on_tool_call(
+        &self,
+        call_id: &cyrup_core::ToolCallId,
+        name: &str,
+        input: &serde_json::Value,
+        ctx: &HostCtx,
+    ) -> HookOutcome {
+        self.forget_note(call_id);
         let is_codemode = name == CODEMODE_TOOL;
         if !is_codemode && name != TOOL_SEARCH_TOOL {
-            return;
+            return HookOutcome::Noop;
         }
-        let Some(owner) = self.owner().filter(|owner| owner.is_active()) else {
-            return;
+        let Some(_owner) = self.owner().filter(|owner| owner.is_active()) else {
+            return HookOutcome::Noop;
         };
-        let Some(task) = self.init_task() else {
-            return;
+        let Some(build) = self.init_task() else {
+            return HookOutcome::Noop;
         };
-        // [CYRUP-DELTA] A build already waited the whole bound for is not waited for again.
-        if self.waited_out(&task) {
+        let config = self.current_config();
+        let code = input
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let budget = if is_codemode {
+            // A source the `codemode` tool refuses is refused at once; waiting would only delay it.
+            let Some(budget) = ScriptBudget::of(code) else {
+                return HookOutcome::Noop;
+            };
+            budget
+        } else {
+            ScriptBudget::Default
+        };
+        let prefix = config.tool_prefix();
+        let env_raw = std::env::var(crate::registration::DIRECT_TOOLS_ENV_VAR).ok();
+        let env_override = crate::runtime::direct_tools_override(env_raw.as_deref());
+        let declaring = crate::registration::direct_tool_servers(&config, env_override.as_deref());
+        // A script reaches a server it names through the server's own tools when the server
+        // declares them, and through the `mcp` gateway when it does not; `tool_search` finds only
+        // declared tools, so it needs only the servers that declare them.
+        let named: std::collections::BTreeSet<String> = config
+            .enabled_servers()
+            .map(|(server, _)| server)
+            .filter(|server| {
+                if is_codemode {
+                    script_needs_server(code, server, prefix)
+                } else {
+                    declaring.contains_key(server.as_str())
+                }
+            })
+            .cloned()
+            .collect();
+        // [CYRUP-DELTA] A server already waited the whole bound for is not waited for again.
+        let waited_out = self.stalled_in(&build);
+        let (stalled, wanted): (
+            std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<String>,
+        ) = named
+            .into_iter()
+            .partition(|server| waited_out.contains(server));
+        let (servers, through_build): (
+            std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<String>,
+        ) = wanted
+            .into_iter()
+            .partition(|server| declaring.contains_key(server.as_str()));
+        let wait = budget.wait_bound(self.tool_call_wait);
+
+        let started = tokio::time::Instant::now();
+        let waited = self
+            .wait_for_servers(&build, &servers, &through_build, wait, ctx)
+            .await;
+        let elapsed = started.elapsed();
+
+        // Still missing: the ones the wait gave up on, and the stalled ones it did not wait for.
+        let mut missing: Vec<String> = match waited {
+            crate::startup::Waited::Settled => Vec::new(),
+            crate::startup::Waited::GaveUp(pending) => {
+                if wait >= self.tool_call_wait {
+                    // Not waited for again in this build: the servers still connecting, and a server
+                    // reached through the gateway, whose wait is the build's whoever holds it.
+                    let mut waited_out = pending.clone();
+                    waited_out.extend(through_build.iter().cloned());
+                    self.remember_stalled(&build, &waited_out);
+                }
+                self.notify_still_connecting();
+                pending
+            }
+        };
+        let (stalled_direct, stalled_through_build): (
+            std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<String>,
+        ) = stalled
+            .into_iter()
+            .partition(|server| declaring.contains_key(server.as_str()));
+        missing.extend(
+            build
+                .startup
+                .progress()
+                .waiting_on(&stalled_direct, &stalled_through_build),
+        );
+        missing.sort();
+        missing.dedup();
+
+        if !is_codemode {
+            self.remember_note(call_id, &missing);
+            return HookOutcome::Noop;
+        }
+        match charge_script(code, budget, elapsed) {
+            // The wait took the whole limit: the script would start out of time. Say why instead.
+            Err(limit) => {
+                let mut reason = format!(
+                    "The script was not run: its timeout_ms of {} ms went on waiting for MCP \
+                     servers to connect.",
+                    limit.as_millis()
+                );
+                if !missing.is_empty() {
+                    reason.push(' ');
+                    reason.push_str(&still_connecting_note(&missing));
+                }
+                HookOutcome::Block {
+                    reason: Some(reason),
+                    terminate: cyrup_core::TerminateHint::Unspecified,
+                }
+            }
+            Ok(charged) => {
+                self.remember_note(call_id, &missing);
+                match charged {
+                    Some(code) => {
+                        let mut input = input.clone();
+                        if let Some(slot) = input.get_mut("code") {
+                            *slot = serde_json::Value::String(code);
+                        }
+                        HookOutcome::Mutate(cyrup_ext::EventPatch::ToolInput(input))
+                    }
+                    None => HookOutcome::Noop,
+                }
+            }
+        }
+    }
+
+    /// The servers a `codemode` or `tool_search` call went ahead without, kept until its result.
+    fn remember_note(&self, call_id: &cyrup_core::ToolCallId, missing: &[String]) {
+        if missing.is_empty() {
             return;
         }
-        let mut wait = self.tool_call_wait;
-        if is_codemode {
-            let code = input
-                .get("code")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let config = self.current_config();
-            let prefix = config.tool_prefix();
-            if !config
-                .enabled_servers()
-                .any(|(server, _)| script_needs_server(code, server, prefix))
-            {
-                return;
+        if let Ok(mut notes) = self.still_connecting.lock() {
+            // One entry per call between its `tool_call` and its `tool_result`; a call that never
+            // reaches its result (another extension blocked it) leaves one behind, so the map is
+            // bounded rather than trusted to drain.
+            if notes.len() >= STILL_CONNECTING_NOTES {
+                notes.clear();
             }
-            wait = script_wait(code, self.tool_call_wait);
+            notes.insert(call_id.clone(), missing.to_vec());
         }
-        if !self.wait_for_build(&task, &owner, ctx, wait).await {
-            if wait >= self.tool_call_wait {
-                self.remember_waited_out(&task);
-            }
-            self.notify_still_connecting();
+    }
+
+    fn forget_note(&self, call_id: &cyrup_core::ToolCallId) {
+        if let Ok(mut notes) = self.still_connecting.lock() {
+            notes.remove(call_id);
         }
+    }
+
+    /// The `tool_result` half of [`Self::on_tool_call`]: the call's result says which servers it
+    /// went ahead without.
+    fn take_note(&self, call_id: &cyrup_core::ToolCallId) -> Option<Vec<String>> {
+        self.still_connecting
+            .lock()
+            .ok()
+            .and_then(|mut notes| notes.remove(call_id))
     }
 
     /// `session_shutdown` — the **only** teardown point (MCP-009, MCP-010).
@@ -1885,7 +2287,7 @@ impl McpExtension {
         let Some(task) = self.init_task() else {
             return Err("MCP not initialized".to_string());
         };
-        match (*task).clone().await {
+        match task.future.clone().await {
             Ok(state) => Ok(state),
             Err(error) => Err(format!("MCP initialization failed: {error}")),
         }
@@ -2647,9 +3049,33 @@ impl NativeExtension for McpExtension {
                 self.on_input(ctx).await;
                 HookOutcome::Noop
             }
-            HostEvent::ToolCall { name, input, .. } => {
-                self.on_tool_call(name, input, ctx).await;
-                HookOutcome::Noop
+            HostEvent::ToolCall {
+                call_id,
+                name,
+                input,
+            } => self.on_tool_call(call_id, name, input, ctx).await,
+            // MCP-628 — a `codemode` or `tool_search` call that went ahead without servers still
+            // connecting says so in its own result, which is the one place a `-p` run's model
+            // reads. The content is appended, so the structured content is handed back with it.
+            HostEvent::ToolResult {
+                call_id,
+                name,
+                content,
+                structured_content,
+                ..
+            } if (name == CODEMODE_TOOL || name == TOOL_SEARCH_TOOL)
+                && let Some(missing) = self.take_note(call_id) =>
+            {
+                let mut content = content.clone();
+                content.push(cyrup_core::Content::text(still_connecting_note(&missing)));
+                HookOutcome::Mutate(cyrup_ext::EventPatch::ToolResult {
+                    content: Some(content),
+                    details: None,
+                    structured_content: structured_content.clone().map(Box::new),
+                    is_error: None,
+                    usage: None,
+                    terminate: None,
+                })
             }
             HostEvent::SessionShutdown { reason, .. } => {
                 self.on_session_shutdown(reason).await;
@@ -2828,7 +3254,12 @@ pub fn mcp_extension_for_env(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -3406,9 +3837,9 @@ mod tests {
     }
 
     /// A memoised build that is already settled, so the commit tail can be driven directly.
-    fn settled_task(state: &Arc<McpState>) -> Arc<InitTask> {
+    fn settled_task(state: &Arc<McpState>) -> Arc<Build> {
         let state = Arc::clone(state);
-        Arc::new(async move { Ok(state) }.boxed().shared())
+        Build::detached(async move { Ok(state) }.boxed().shared())
     }
 
     /// **The wiring proof.** A `SessionStart` must reach [`crate::runtime::initialize_mcp`] and
@@ -3876,7 +4307,7 @@ done
             .map(str::to_string)
     }
 
-    /// `index.ts:2172` @v5.2.0: `if (!state && initPromise) await awaitWithTimeout(initPromise, …)`.
+    /// `index.ts:2174` @v5.2.0: `if (!state && initPromise) await awaitWithTimeout(initPromise, …)`.
     /// The model's first `mcp({...})` lands while a cold server is still starting, and the tool it
     /// calls was registered from the disk caches before any server was contacted. It used to find
     /// the generation's executor slot empty (the commit tail was the only installer) and answer
@@ -4067,7 +4498,6 @@ done
                 "codemode",
                 serde_json::json!({ "code": "return ALL_TOOLS.length" }),
             ),
-            ("tool_search", serde_json::json!({ "query": "anything" })),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let ext = start_unsettled(dir.path(), 2).await;
@@ -4078,6 +4508,43 @@ done
                 "{tool} {input}: released before the server was up"
             );
         }
+    }
+
+    /// `tool_search` finds declared tools only, so it waits for the servers that declare them —
+    /// until their tools are registered — and not for a server whose tools only the gateway
+    /// reaches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tool_search_waits_for_the_servers_whose_tools_it_can_find() {
+        let search = tool_call_event("tool_search", serde_json::json!({ "query": "echo" }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let ext = start_unsettled_where(
+            dir.path(),
+            2,
+            serde_json::json!({ "directTools": "search" }),
+            |ext| {
+                ext.set_late_registrar(Arc::clone(&registrar) as Arc<dyn cyrup_ext::LateRegistrar>);
+                ext
+            },
+        )
+        .await;
+        ext.on_event(&search, &event_ctx()).await;
+        assert!(
+            registrar.tools().contains(&"slow_echo".to_string()),
+            "released before the search-mode server's tools were registered: {:?}",
+            registrar.tools()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let ext = start_unsettled(dir.path(), 3).await;
+        let started = std::time::Instant::now();
+        ext.on_event(&search, &event_ctx()).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "waited {:?} for a server tool_search cannot find",
+            started.elapsed()
+        );
     }
 
     /// Which scripts name a server: the namespace form upstream matches, and this port's own
@@ -4091,8 +4558,12 @@ done
             "await tools.mcp__my_docs__find({})",
             ToolPrefix::Server
         ));
+        // A script writes a tool's codemode identifier, where `-` is `_`: `my-docs_find` is
+        // `tools.my_docs_find`, in every prefix mode.
+        assert!(needs("await tools.my_docs_find({})", ToolPrefix::Server));
+        assert!(needs("await tools.my_docs_find({})", ToolPrefix::Short));
+        assert!(needs("await tools.mcp__my_docs_find({})", ToolPrefix::Mcp));
         assert!(needs("await tools.my-docs_find({})", ToolPrefix::Server));
-        assert!(needs("await tools.mcp__my-docs_find({})", ToolPrefix::Mcp));
         assert!(!needs("await tools.other_find({})", ToolPrefix::Server));
         assert!(!needs("return 1", ToolPrefix::Server));
         // Discovery needs every server, but only as a word: `searchToolsNow` is a different name.
@@ -4186,11 +4657,15 @@ done
         use cyrup_ext::{Dispatcher, NativeHandle, Reduced, Subscriptions};
 
         let dir = tempfile::tempdir().unwrap();
+        let registrar = Arc::new(RecordingRegistrar::default());
         let ext = start_unsettled_where(
             dir.path(),
             2,
             serde_json::json!({ "directTools": true }),
-            |ext| ext,
+            |ext| {
+                ext.set_late_registrar(Arc::clone(&registrar) as Arc<dyn cyrup_ext::LateRegistrar>);
+                ext
+            },
         )
         .await;
         let subs = Subscriptions::empty().with(cyrup_ext::EventKind::Input);
@@ -4211,8 +4686,359 @@ done
             "the submission goes on: {reduced:?}"
         );
         assert!(
-            committed(&ext),
-            "the handler was cut at the budget before the server finished starting"
+            registrar.tools().contains(&"slow_echo".to_string()),
+            "the handler was cut at the budget before the server's tools were registered: {:?}",
+            registrar.tools()
+        );
+    }
+
+    /// MCP-629 — the first prompt waits for the servers whose tools it declares, each on its own,
+    /// not for the build: a fast server that declares tools next to a slow one that declares none
+    /// does not hold the first prompt for the slow one, and the fast one's tools are registered
+    /// when the prompt goes on. Before, the wait was on the whole build and the tools came at its
+    /// commit, so the prompt waited for the slow server and the fast server's tools came with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_prompt_waits_for_the_servers_that_declare_tools_and_no_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fast = fixture_server(&dir.path().join("fast-started"));
+        if let Some(entry) = fast.as_object_mut() {
+            entry.insert("directTools".to_string(), serde_json::json!(true));
+            entry.insert("lifecycle".to_string(), serde_json::json!("keep-alive"));
+        }
+        let slow = slow_fixture_server(&dir.path().join("slow-started"), 4);
+        let config: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": { "fast": fast, "slow": slow }
+        }))
+        .unwrap();
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let ext = McpExtension::with_config(
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            Some(config),
+        )
+        .with_home(dir.path().to_path_buf());
+        ext.set_late_registrar(Arc::clone(&registrar) as Arc<dyn cyrup_ext::LateRegistrar>);
+        let ext = ext.into_arc();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
+
+        let started = std::time::Instant::now();
+        let _ = ext.on_event(&input_event(), &event_ctx()).await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(3),
+            "the first prompt waited {waited:?}, as long as the server that declares no tools"
+        );
+        assert!(
+            registrar.tools().contains(&"fast_echo".to_string()),
+            "the fast server's tools are not in the first request: {:?}",
+            registrar.tools()
+        );
+        assert!(
+            ext.state().is_none() && ext.init_task().is_some(),
+            "the slow server is still starting: the build goes on"
+        );
+    }
+
+    /// MCP-631 — a direct call that lands while the build runs waits for the build itself, not
+    /// for a fixed 30 s, and ends at its own cancel. Before, it gave up at 30 s with
+    /// `init_timeout` whatever the build was doing, and an aborted turn sat out the 30 s because
+    /// the wait never looked at the call's token.
+    #[tokio::test(start_paused = true)]
+    async fn a_direct_call_waits_for_the_build_itself_and_ends_at_its_own_cancel() {
+        use crate::registration::McpToolDispatch;
+        let pending = || {
+            Build::detached(
+                futures::future::pending::<Result<Arc<McpState>, Arc<McpError>>>()
+                    .boxed()
+                    .shared(),
+            )
+        };
+        let spec = crate::registration::DirectToolSpec {
+            server_name: "slow".to_string(),
+            original_name: "echo".to_string(),
+            prefixed_name: "slow_echo".to_string(),
+            description: "echo".to_string(),
+            input_schema: None,
+            resource_uri: None,
+            lazy: false,
+        };
+        let ext = extension().into_arc();
+        let dispatch = crate::dispatch::McpDispatch::new(Arc::downgrade(&ext));
+        let call = |cancel: cyrup_core::CancelToken| {
+            dispatch.call_direct(
+                &spec,
+                cyrup_core::ToolCallId::from("call-1"),
+                serde_json::json!({}),
+                cancel,
+                Box::new(|_| {}),
+            )
+        };
+
+        // A build that settles after 40 s is answered then, not abandoned at 30 s.
+        let build = pending();
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&build));
+        let settler = {
+            let build = Arc::clone(&build);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+                build.settle(BuildState::Failed("the server never answered".to_string()));
+            })
+        };
+        // Each call is raced against a bound well past the instant it should end at, so a wait that
+        // misses its end fails here, on the paused clock, instead of parking the test forever.
+        let bound = std::time::Duration::from_secs(120);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(bound, call(cyrup_core::CancelToken::new()))
+            .await
+            .expect("the call is answered when its build settles")
+            .expect("a failed build is reported, not thrown");
+        assert_eq!(
+            result.details.as_ref().and_then(|d| d.get("error")),
+            Some(&serde_json::json!("init_failed")),
+            "{result:?}"
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(40));
+        settler.await.unwrap();
+
+        // A build that never settles: the call's own cancel ends the wait, at the cancel.
+        *ext.init_task.lock().unwrap() = Some(pending());
+        let cancel = cyrup_core::CancelToken::new();
+        let canceller = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                cancel.cancel();
+            })
+        };
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(bound, call(cancel))
+            .await
+            .expect("the call ends at its own cancel")
+            .expect_err("an aborted call throws");
+        assert_eq!(error.message, crate::abort::ABORTED_FALLBACK_REASON);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+        canceller.await.unwrap();
+
+        // `throwIfAborted(signal)`: a call cancelled before it began does not wait at all.
+        let cancel = cyrup_core::CancelToken::new();
+        cancel.cancel();
+        let started = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(bound, call(cancel))
+                .await
+                .expect("a call cancelled before it began does not wait")
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// MCP-628 (a) — a script's wait for the servers it names is charged to its `timeout_ms`: the
+    /// script starts with what is left. Before, the wait and the script were separate budgets, so
+    /// a script that asked for three seconds could take six.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scripts_wait_is_taken_off_its_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = start_unsettled_where(
+            dir.path(),
+            1,
+            serde_json::json!({ "directTools": true }),
+            |ext| ext,
+        )
+        .await;
+        let code = "// @options: {\"timeout_ms\": 6000}\nreturn await tools.slow_echo({})";
+
+        let started = std::time::Instant::now();
+        let outcome = ext
+            .on_event(
+                &tool_call_event("codemode", serde_json::json!({ "code": code })),
+                &event_ctx(),
+            )
+            .await;
+        let waited = started.elapsed();
+
+        let HookOutcome::Mutate(cyrup_ext::EventPatch::ToolInput(input)) = outcome else {
+            panic!("the script was not charged for its {waited:?} wait: {outcome:?}");
+        };
+        let charged =
+            cyrup_codemode::source::parse_codemode_source(input["code"].as_str().unwrap()).unwrap();
+        let left = charged.options.timeout_ms.unwrap();
+        let spent = 6000 - left;
+        // What is left is rounded down to whole milliseconds, so what is charged is the wait
+        // rounded up: within a millisecond above the wait seen from here, never below its start.
+        assert!(
+            waited >= std::time::Duration::from_millis(900)
+                && u128::from(spent) <= waited.as_millis() + 1
+                && u128::from(spent) + 50 >= waited.as_millis(),
+            "waited {waited:?}, charged {spent} ms"
+        );
+        assert_eq!(
+            charged.code,
+            cyrup_codemode::source::parse_codemode_source(code)
+                .unwrap()
+                .code,
+            "only the timeout changes"
+        );
+    }
+
+    /// MCP-628 (a) and (b) — a script whose whole `timeout_ms` went on the wait is not started:
+    /// the call ends at its own limit and says which server it was waiting for, in the result the
+    /// model reads (a block's reason is the tool result's text in every mode).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_script_whose_whole_timeout_went_on_the_wait_is_not_started_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = start_unsettled_where(
+            dir.path(),
+            4,
+            serde_json::json!({ "directTools": true }),
+            |ext| ext,
+        )
+        .await;
+        let code = "// @options: {\"timeout_ms\": 600}\nreturn await tools.slow_echo({})";
+
+        let started = std::time::Instant::now();
+        let outcome = ext
+            .on_event(
+                &tool_call_event("codemode", serde_json::json!({ "code": code })),
+                &event_ctx(),
+            )
+            .await;
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(600)
+                && waited < std::time::Duration::from_millis(1500),
+            "the call ended {waited:?} after it began, its limit is 600 ms"
+        );
+        let HookOutcome::Block {
+            reason: Some(reason),
+            ..
+        } = outcome
+        else {
+            panic!("the script was started with nothing left: {outcome:?}");
+        };
+        assert!(reason.contains("600 ms"), "{reason}");
+        assert!(reason.contains("\"slow\""), "{reason}");
+    }
+
+    /// MCP-628 (b) — a call that went ahead without a server says so in its own result, in every
+    /// mode, so a `-p` run's model learns why the server's tools are missing. Before, the only word
+    /// was a UI notice, which a `-p` run never shows and the model never reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_that_went_ahead_without_a_server_says_so_in_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = start_unsettled_where(
+            dir.path(),
+            4,
+            serde_json::json!({ "directTools": true }),
+            |ext| ext.with_tool_call_wait(std::time::Duration::from_millis(300)),
+        )
+        .await;
+        let call = tool_call_event(
+            "codemode",
+            serde_json::json!({ "code": "return await tools.slow_echo({})" }),
+        );
+        let outcome = ext.on_event(&call, &event_ctx()).await;
+        assert!(
+            matches!(outcome, HookOutcome::Noop),
+            "no timeout_ms, so nothing to charge: {outcome:?}"
+        );
+
+        let result = HostEvent::ToolResult {
+            call_id: "c1".into(),
+            name: "codemode".to_string(),
+            input: serde_json::json!({}),
+            content: vec![cyrup_core::Content::text(
+                "Script error: tools.slow_echo is not a function",
+            )],
+            details: None,
+            structured_content: Some(serde_json::json!({ "kept": true })),
+            is_error: true,
+            usage: None,
+            terminate: cyrup_core::TerminateHint::Unspecified,
+        };
+        let HookOutcome::Mutate(cyrup_ext::EventPatch::ToolResult {
+            content: Some(content),
+            structured_content,
+            is_error,
+            ..
+        }) = ext.on_event(&result, &event_ctx()).await
+        else {
+            panic!("the result does not say the server was still connecting");
+        };
+        let texts: Vec<String> = content
+            .iter()
+            .filter_map(|block| match block {
+                cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Script error: tools.slow_echo is not a function".to_string(),
+                "MCP server \"slow\" is still connecting; its tools were not available to this \
+                 call."
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            structured_content.as_deref(),
+            Some(&serde_json::json!({ "kept": true })),
+            "appending to the content must not drop the structured content"
+        );
+        assert_eq!(is_error, None, "the outcome of the call is the tool's");
+        assert!(
+            matches!(ext.on_event(&result, &event_ctx()).await, HookOutcome::Noop),
+            "the note belongs to one result"
+        );
+    }
+
+    /// A new session's start shuts the previous session's servers down before it builds its own,
+    /// and closing a server waits on the server. Under the dispatcher's 5 s budget a slow teardown
+    /// cut the handler before it started the build, and the new session had no MCP at all; the
+    /// teardown is a declared wait now, bounded by what it waits on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_teardown_of_the_previous_session_does_not_cost_the_next_one_its_build() {
+        use cyrup_ext::{Dispatcher, NativeHandle, Subscriptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        // A server that keeps running after its stdin closes: the close waits for it, then kills it.
+        let lingering = serde_json::json!({
+            "command": "sh",
+            "args": [
+                "-c",
+                format!("{LIVE_MCP}\nsleep 30"),
+                "sh",
+                rmcp::model::ProtocolVersion::LATEST.as_str(),
+                dir.path().join("started").to_string_lossy(),
+            ],
+            "lifecycle": "keep-alive",
+        });
+        let (ext, _state) = start_and_settle(
+            dir.path(),
+            serde_json::json!({ "lingering": lingering }),
+            "lingering",
+        )
+        .await;
+
+        let subs = Subscriptions::empty().with(cyrup_ext::EventKind::SessionStart);
+        let handle = Arc::new(NativeHandle::new(
+            Arc::clone(&ext) as Arc<dyn NativeExtension>,
+            subs,
+            event_ctx(),
+        ));
+        let dispatcher = Dispatcher::with_budget(std::time::Duration::from_millis(400));
+        dispatcher.add(handle).unwrap();
+        dispatcher
+            .dispatch_notify(&session_start_event(), &cyrup_core::CancelToken::new())
+            .await;
+
+        assert!(
+            ext.init_task().is_some() || ext.state().is_some(),
+            "the handler was cut while the previous session's server was closing, before it \
+             started the new session's build"
         );
     }
 
@@ -4255,21 +5081,27 @@ done
     /// A build that outlasts the wait's own bound ends the wait quietly: the handler returns
     /// before the dispatcher's budget could cut it, and the build carries on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_build_slower_than_the_wait_ends_it_without_failing_the_handler() {
+    async fn a_server_slower_than_the_wait_ends_it_without_failing_the_handler() {
         let dir = tempfile::tempdir().unwrap();
         let ext = start_unsettled(dir.path(), 3).await;
         let ctx = event_ctx();
         let gate = ctx.human_wait_gate();
-        let task = ext.init_task().unwrap();
+        let build = ext.init_task().unwrap();
 
         let started = std::time::Instant::now();
-        let owner = ext.owner().unwrap();
-        let resolved = ext
-            .wait_for_build(&task, &owner, &ctx, std::time::Duration::from_millis(150))
+        let waited = ext
+            .wait_for_servers(
+                &build,
+                &["slow".to_string()].into_iter().collect(),
+                &std::collections::BTreeSet::new(),
+                std::time::Duration::from_millis(150),
+                &ctx,
+            )
             .await;
 
-        assert!(
-            !resolved,
+        assert_eq!(
+            waited,
+            crate::startup::Waited::GaveUp(vec!["slow".to_string()]),
             "the server needs seconds, the wait allowed 150 ms"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
@@ -4318,14 +5150,15 @@ done
         )
         .await;
 
-        assert!(
-            ext.first_prompt_waits(),
+        assert_eq!(
+            ext.first_prompt_servers(),
+            Some(["slow".to_string()].into_iter().collect()),
             "the first prompt waits for a direct server"
         );
-        assert!(!ext.first_prompt_waits(), "the second does not");
+        assert_eq!(ext.first_prompt_servers(), None, "the second does not");
         let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
         assert!(
-            ext.first_prompt_waits(),
+            ext.first_prompt_servers().is_some(),
             "a new session start gives it back"
         );
     }
@@ -4373,6 +5206,126 @@ done
             )
             .await;
         assert!(search.elapsed() < std::time::Duration::from_millis(150));
+    }
+
+    /// What call `c1`'s `tool_result` hook appends to its result: the still-connecting note, or
+    /// nothing when it leaves the result alone.
+    async fn appended_to_result(ext: &McpExtension) -> Vec<String> {
+        let result = HostEvent::ToolResult {
+            call_id: "c1".into(),
+            name: "codemode".to_string(),
+            input: serde_json::json!({}),
+            content: vec![cyrup_core::Content::text("ran")],
+            details: None,
+            structured_content: None,
+            is_error: false,
+            usage: None,
+            terminate: cyrup_core::TerminateHint::Unspecified,
+        };
+        match ext.on_event(&result, &event_ctx()).await {
+            HookOutcome::Mutate(cyrup_ext::EventPatch::ToolResult {
+                content: Some(content),
+                ..
+            }) => content
+                .iter()
+                .skip(1)
+                .filter_map(|block| match block {
+                    cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A server reached through the `mcp` gateway waits for the build, so a script that names one
+    /// is held by whichever server holds the build. When that wait gives up, the script is told
+    /// which server that is, and the next script that names the gateway server does not wait for
+    /// the same build again. Before, a gateway server that had already settled gave up naming
+    /// nobody: nothing was noted and nothing remembered, and every script paid the whole wait
+    /// again for as long as the build was held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_script_through_the_gateway_is_told_what_holds_the_build_and_waits_for_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let servers = serde_json::json!({
+            "gw": fixture_server(&dir.path().join("gw-started")),
+            "slow": slow_fixture_server(&dir.path().join("slow-started"), 8),
+        });
+        let config: McpConfig =
+            serde_json::from_value(serde_json::json!({ "mcpServers": servers })).unwrap();
+        let ext = McpExtension::with_config(
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            Some(config),
+        )
+        .with_home(dir.path().to_path_buf())
+        .with_tool_call_wait(std::time::Duration::from_millis(400))
+        .into_arc();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
+        let build = ext.init_task().expect("the build is in flight");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !build.startup.progress().pending(["gw"]).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the gateway server settles while the slow one holds the build");
+        let call = tool_call_event(
+            "codemode",
+            serde_json::json!({
+                "code": "return await tools.mcp({ tool: \"gw_echo\", args: {} })"
+            }),
+        );
+        let told = [still_connecting_note(&["slow".to_string()])];
+
+        let first = std::time::Instant::now();
+        let _ = ext.on_event(&call, &event_ctx()).await;
+        let first = first.elapsed();
+        assert!(
+            first >= std::time::Duration::from_millis(350),
+            "the script waited for the build: {first:?}"
+        );
+        assert_eq!(appended_to_result(&ext).await, told);
+
+        let second = std::time::Instant::now();
+        let _ = ext.on_event(&call, &event_ctx()).await;
+        assert!(
+            second.elapsed() < std::time::Duration::from_millis(150),
+            "the second script waited {:?} for a build the first had waited out",
+            second.elapsed()
+        );
+        assert_eq!(appended_to_result(&ext).await, told, "and is told the same");
+        assert!(
+            ext.init_task().is_some(),
+            "the slow server still holds the build"
+        );
+    }
+
+    /// A wait that found every server ready took microseconds and costs the script nothing: its
+    /// source is left as it is, and a script that asked for one millisecond is run. A wait that
+    /// took time is charged in whole milliseconds.
+    #[test]
+    fn only_a_wait_that_took_time_is_charged_to_the_script() {
+        let limit = |ms| ScriptBudget::Limit(std::time::Duration::from_millis(ms));
+        let one = "// @options: {\"timeout_ms\": 1}\nreturn 1";
+        assert_eq!(
+            charge_script(one, limit(1), std::time::Duration::from_micros(40)),
+            Ok(None)
+        );
+        let six = "// @options: {\"timeout_ms\": 6000}\nreturn 1";
+        assert_eq!(
+            charge_script(six, limit(6000), std::time::Duration::from_micros(900)),
+            Ok(None)
+        );
+        let charged = charge_script(six, limit(6000), std::time::Duration::from_micros(1500))
+            .unwrap()
+            .unwrap();
+        assert!(charged.contains("5999"), "{charged}");
+        assert_eq!(
+            charge_script(six, limit(6000), std::time::Duration::from_millis(6000)),
+            Err(std::time::Duration::from_millis(6000))
+        );
     }
 
     /// [CYRUP-DELTA] A script's own `timeout_ms` bounds the wait that comes before it: it asked for

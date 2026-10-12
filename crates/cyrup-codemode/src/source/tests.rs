@@ -408,3 +408,67 @@ fn agrees_with_upstream_on_the_corpus() {
         }
     }
 }
+
+/// A budget spent before the script starts is taken off its `timeout_ms` by rewriting the one
+/// number: the other options, their order, the line's indentation and every line number stay.
+#[test]
+fn with_timeout_ms_rewrites_only_the_timeout() {
+    let source =
+        "  // @options: {\"max_output_tokens\": 500, \"timeout_ms\": 3000}\nconst a = 1;\ntext(a)";
+    let rewritten = with_timeout_ms(source, 1200).unwrap();
+    assert_eq!(
+        rewritten,
+        "  // @options: {\"max_output_tokens\":500,\"timeout_ms\":1200}\nconst a = 1;\ntext(a)"
+    );
+    let before = parse_codemode_source(source).unwrap();
+    let after = parse_codemode_source(&rewritten).unwrap();
+    assert_eq!(after.code, before.code, "the script and its line numbers");
+    assert_eq!(after.options.timeout_ms, Some(1200));
+    assert_eq!(after.options.max_output_tokens, Some(500));
+}
+
+/// A leading blank line, a CRLF and a fence are the shapes the parser accepts around the options
+/// line; the rewrite reads the same line the parser does.
+#[test]
+fn with_timeout_ms_finds_the_options_line_the_parser_finds() {
+    for source in [
+        "\n\n// @options: {\"timeout_ms\": 10}\r\ntext(1)",
+        "```js\n// @options: {\"timeout_ms\": 10}\ntext(1)\n```",
+    ] {
+        let rewritten = with_timeout_ms(source, 7).unwrap_or_else(|| panic!("{source:?}"));
+        let parsed = parse_codemode_source(&rewritten).unwrap();
+        assert_eq!(parsed.options.timeout_ms, Some(7), "{source:?}");
+        assert_eq!(
+            parsed.code,
+            parse_codemode_source(source).unwrap().code,
+            "{source:?}"
+        );
+    }
+}
+
+/// Nothing to rewrite: no options line, no `timeout_ms` in it, a source that does not parse, or a
+/// value an options line cannot carry. A `timeout_ms` is never added to a script that set none,
+/// because one replaces the default limits.
+#[test]
+fn with_timeout_ms_never_adds_or_invents_a_timeout() {
+    assert_eq!(with_timeout_ms("text(1)", 5), None);
+    assert_eq!(
+        with_timeout_ms("// @options: {\"max_output_tokens\": 5}\ntext(1)", 5),
+        None
+    );
+    assert_eq!(
+        with_timeout_ms("// @options: {\"timeout_ms\": 0}\ntext(1)", 5),
+        None
+    );
+    assert_eq!(
+        with_timeout_ms("// @options: {\"timeout_ms\": 9}\ntext(1)", 0),
+        None
+    );
+    assert_eq!(
+        with_timeout_ms(
+            "// @options: {\"timeout_ms\": 9}\ntext(1)",
+            MAX_TIMEOUT_MS + 1
+        ),
+        None
+    );
+}
