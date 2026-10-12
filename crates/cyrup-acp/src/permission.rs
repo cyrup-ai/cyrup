@@ -373,8 +373,11 @@ fn permission_option_kind(name: &str) -> PermissionOptionKind {
     match name {
         "Allow Once" => PermissionOptionKind::AllowOnce,
         "Allow Always" => PermissionOptionKind::AllowAlways,
-        // `"Reject All From This Script"` is `Reject` too, for every call of the script it refuses:
-        // the gate remembers it for that script and not beyond it.
+        // `"Reject All From This Script"` is a one-time `Reject` too: it refuses the call on
+        // screen and ends the script that made it (PERM-046), which is nothing the client has to
+        // remember. The reply is the option string itself, so the gate decides it exactly as it
+        // decides the TUI's and RPC's answer (`codemode_wire.rs`'s
+        // `rejecting_the_script_over_acp_ends_the_script_and_a_plain_reject_does_not`).
         "Reject" | "Reject with Reason" | "Reject All From This Script" => {
             PermissionOptionKind::RejectOnce
         }

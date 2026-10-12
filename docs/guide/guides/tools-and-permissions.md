@@ -223,7 +223,8 @@ When a rule says `ask`, you get a dialog naming the tool and what it wants to do
 - **Reject with Reason** — refuse and type a sentence the model sees, which is how you redirect it
   rather than just blocking it.
 - **Reject All From This Script** — offered only for a call a codemode script made: refuse it and
-  every other call that script makes, without a dialog for each.
+  end the script, so it makes no further call and you get no further dialog from it. What the script
+  already did is not undone.
 
 `Esc`, dismissing the dialog, or letting it time out all count as a plain reject.
 

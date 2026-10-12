@@ -688,7 +688,7 @@ Rule applied: a residual that names a behaviour gap, a bounded-but-unfixed resou
 | round 1 | a wasm guest never loaded under a limited address space | in `EXT-117`; under *Not done* |
 | round 1 | scripts need more than 32 GiB of address space | `CODE-044` note |
 | round 1 | an unattributed SIGKILL of the sandbox in the reviewer's 48-snippet session, no OOM evidence, not reproduced | recorded here only; **file it on the next sighting that comes with a log** |
-| round 2 | 'Reject All' does not abort the parent call | `PERM-046` |
+| round 2 | 'Reject All' does not abort the parent call | `PERM-046` (**CLOSED 2026-10-12**: the option ends the parent call) |
 | round 2 | a server that never answers `initialize` stays connecting | overtaken by `MCP-626` (60 s default; measured 60.7 s) |
 | round 2 | the script's `timeout_ms` is not subtracted from its deadline; nothing tells the model under `-p` | `MCP-628` |
 | round 2 | the first-prompt wait is on the whole connect pass | `MCP-629` |

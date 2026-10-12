@@ -47,7 +47,7 @@ pub struct PermissionPromptDecision {
     pub approved: bool,
     pub state: PermissionDecisionState,
     pub denial_reason: Option<String>,
-    /// [CYRUP-DELTA] The human also refused every call the same script has still to make
+    /// [CYRUP-DELTA] The human also refused the rest of the script, which ends it
     /// ([`REJECT_SCRIPT_OPTION`]). pi has no nested calls, so no such answer.
     pub reject_script: bool,
 }
@@ -119,9 +119,16 @@ pub const PERMISSION_DIALOG_OPTIONS: [&str; 4] = [
 ];
 
 /// [CYRUP-DELTA] The fifth option of the dialog for a call another tool made: refuse this call and
-/// every call the same script has still to make, without a dialog for each. The script's calls
-/// reject at once with the user's refusal; the script itself is not aborted, so it can handle
-/// them as it handles any other failed call.
+/// end the script that made it, without a dialog for each of its other calls. pi has no nested
+/// calls, so no such option.
+///
+/// The refusal is a block that asks its caller to stop ([`cyrup_core::TerminateHint::Terminate`],
+/// pi's `ToolCallEventResult.terminate`), and for a nested call the caller is the script: the
+/// `codemode` tool ends the script there (PERM-046), so the script never sees the refusal, makes no
+/// further call, and its result tells the model `Script stopped:` with this refusal. The calls of
+/// the same script that are still on their way through the gate are refused the same way without
+/// a dialog (the per-parent memory in `extension/prompt.rs`). What the script did before the
+/// refusal is not undone: nothing can retract a file written or a command run.
 pub const REJECT_SCRIPT_OPTION: &str = "Reject All From This Script";
 
 /// [`PERMISSION_DIALOG_OPTIONS`] with [`REJECT_SCRIPT_OPTION`] after them: the dialog of a call another
@@ -134,8 +141,9 @@ pub const PERMISSION_DIALOG_SCRIPT_OPTIONS: [&str; 5] = [
     REJECT_SCRIPT_OPTION,
 ];
 
-/// What the script is told by a call that was refused because the user refused its script.
-pub(crate) const SCRIPT_REJECTED_REASON: &str = "the user rejected this script's tool calls";
+/// The reason a call refused by [`REJECT_SCRIPT_OPTION`] carries: what the `codemode` result shows
+/// the model after `Script stopped:`.
+pub(crate) const SCRIPT_REJECTED_REASON: &str = "the user rejected this script and stopped it";
 
 const APPROVE_ONCE_OPTION: &str = "Allow Once";
 const APPROVE_ALWAYS_OPTION: &str = "Allow Always";
