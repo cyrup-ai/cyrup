@@ -1307,10 +1307,34 @@ pub async fn stop_callback_server() {
         }
     };
 
-    future.await;
+    if !is_owner {
+        future.await;
+        return;
+    }
 
-    if is_owner && let Ok(mut guard) = runtime.stopping.lock() {
-        *guard = None;
+    // MCP-638: the owner's clearing runs on a detached task with the stop, as `authenticate`'s
+    // does. Dropped in this frame, it never ran: the memo stayed set, and every later stop joined a
+    // finished future, stopped nothing and left the listener up.
+    let finish = {
+        let runtime = Arc::clone(runtime);
+        async move {
+            future.clone().await;
+            if let Ok(mut guard) = runtime.stopping.lock()
+                && guard
+                    .as_ref()
+                    .is_some_and(|held| Shared::ptr_eq(held, &future))
+            {
+                *guard = None;
+            }
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        // A `JoinError` means the stop task panicked or the runtime is shutting down; either way
+        // there is nothing more for this caller to wait on.
+        Ok(handle) => {
+            let _ = handle.spawn(finish).await;
+        }
+        Err(_) => finish.await,
     }
 }
 
@@ -2585,9 +2609,21 @@ impl AuthenticateOptions {
         }
     }
 
-    /// The combined abort — `combineAbortSignals(runtime.signal, options.signal)`.
-    fn combined_signal(&self, runtime: &Arc<McpOAuthRuntime>) -> CancelToken {
-        crate::abort::combine(runtime.token(), self.signal.as_ref())
+    /// The combined abort — `combineAbortSignals(runtime.signal, options.signal)` — for as long as
+    /// the returned scope lives (MCP-639).
+    ///
+    /// `combine` parks a joiner task until one of its inputs fires, and on the connect path both
+    /// are generation-long (`StoredCredentialAuth::authorize` passes the generation's signal), so
+    /// every token lookup left one task behind until the session ended. The scope reaps it on drop.
+    ///
+    /// **The scope belongs to the operation, not to the frame that built it.** Dropping it cancels
+    /// the combined token, so it must not be dropped while anything still runs on that token. Six of
+    /// the seven callers use the token only inside their own body, where the frame IS the
+    /// operation. [`authenticate`] is the seventh: its token drives a memoised operation that
+    /// joined callers keep awaiting after the installing call returns or is dropped, so it MOVES the
+    /// scope into that operation, which drops it when the operation ends.
+    fn combined_signal(&self, runtime: &Arc<McpOAuthRuntime>) -> crate::abort::ScopedSignal {
+        crate::abort::ScopedSignal::optional(runtime.token(), self.signal.as_ref())
     }
 }
 
@@ -3497,7 +3533,9 @@ pub async fn authenticate(
                     let definition = definition.cloned();
                     let server_name = server_name.to_string();
                     let server_url = server_url.to_string();
-                    let signal = signal.clone();
+                    // MCP-639: the scope moves INTO the operation. Left in this frame, a dropped
+                    // installer would cancel the token the joined callers' operation runs on.
+                    let signal = signal;
                     async move {
                         authenticate_inner(
                             &runtime,
@@ -3525,18 +3563,39 @@ pub async fn authenticate(
         return operation.await.map_err(|error| clone_error(&error));
     }
 
-    let result = operation.clone().await;
-
-    // Remove the dedup entry **only if it is still the one this call installed** — a later call
-    // that replaced it must keep its own entry. `Shared::ptr_eq` is the identity test.
-    {
-        let mut state = runtime.state.lock().await;
-        if let Some(current) = state.pending_authentications.get(&auth_key)
-            && Shared::ptr_eq(current, &operation)
-        {
-            state.pending_authentications.remove(&auth_key);
+    // The installer's `finally`: remove the dedup entry **only if it is still the one this call
+    // installed** — a later call that replaced it must keep its own entry (`Shared::ptr_eq` is the
+    // identity test).
+    //
+    // MCP-638: it runs on a detached task with the operation, not in this frame. A JS promise runs
+    // to its end whoever awaits it; a dropped Rust future runs nothing, so an installer cut short —
+    // a handler dropped at its budget — left the memo set for the rest of the process, and every
+    // later call for the server returned the first one's result. Detached, the operation and its
+    // clearing run to the end, and this call only waits for them. The lifecycle convergence memo
+    // is fixed the same way (`lifecycle.rs` `ensure_converged`).
+    let finish = {
+        let runtime = Arc::clone(&runtime);
+        let operation = operation.clone();
+        async move {
+            let result = operation.clone().await;
+            let mut state = runtime.state.lock().await;
+            if let Some(current) = state.pending_authentications.get(&auth_key)
+                && Shared::ptr_eq(current, &operation)
+            {
+                state.pending_authentications.remove(&auth_key);
+            }
+            result
         }
-    }
+    };
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.spawn(finish).await.unwrap_or_else(|join| {
+            Err(Arc::new(McpError::other(format!(
+                "MCP OAuth authentication did not finish: {join}"
+            ))))
+        }),
+        // Off a runtime nothing can be detached; the caller drives the operation as before.
+        Err(_) => finish.await,
+    };
 
     result.map_err(|error| clone_error(&error))
 }
@@ -5121,5 +5180,323 @@ mod tests {
         let port = configured_callback_port();
         assert!(port > 0);
         assert_eq!(port, configured_callback_port());
+    }
+
+    // --- MCP-638 / MCP-639: bookkeeping tied to the operation, not to the frame ------------------
+
+    /// A store whose `load` counts its calls, announces each one, and waits for a permit — the
+    /// deterministic point at which an `authenticate` is "mid-operation". It is reached before any
+    /// network: the client-credentials branch of `start_auth` opens with `get_auth_for_url`, whose
+    /// default body is `load`.
+    struct GatedStorage {
+        inner: InMemoryOAuthStorage,
+        loads: AtomicUsize,
+        entered: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl GatedStorage {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemoryOAuthStorage::new(PathBuf::from("/gated")),
+                loads: AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn open(&self) {
+            self.gate
+                .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpOAuthStorage for GatedStorage {
+        async fn load(&self, server_name: &str) -> McpResult<Option<AuthEntry>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            if let Ok(permit) = self.gate.acquire().await {
+                permit.forget();
+            }
+            self.inner.load(server_name).await
+        }
+        async fn save_credentials(
+            &self,
+            server_name: &str,
+            server_url: &str,
+            credentials: Option<StoredCredentials>,
+        ) -> McpResult<()> {
+            self.inner
+                .save_credentials(server_name, server_url, credentials)
+                .await
+        }
+        async fn save_client(
+            &self,
+            server_name: &str,
+            server_url: &str,
+            client: Option<StoredClientInfo>,
+        ) -> McpResult<()> {
+            self.inner
+                .save_client(server_name, server_url, client)
+                .await
+        }
+        async fn clear_all(&self, server_name: &str) -> McpResult<()> {
+            self.inner.clear_all(server_name).await
+        }
+        async fn oauth_state(&self, server_name: &str) -> McpResult<Option<String>> {
+            self.inner.oauth_state(server_name).await
+        }
+        async fn clear_oauth_state(&self, server_name: &str) -> McpResult<()> {
+            self.inner.clear_oauth_state(server_name).await
+        }
+        fn base_dir(&self) -> PathBuf {
+            self.inner.base_dir()
+        }
+    }
+
+    use std::sync::atomic::AtomicUsize;
+
+    const GATED_SERVER: &str = "gated";
+    const GATED_URL: &str = "https://gated.example.com/mcp";
+    /// What a client-credentials flow with no `clientId` ends in: an ordinary failure, reached
+    /// with no network, and distinguishable from an abort.
+    const NEEDS_CLIENT_ID: &str =
+        "MCP server \"gated\" client_credentials OAuth requires oauth.clientId";
+
+    fn client_credentials_entry() -> ServerEntry {
+        ServerEntry {
+            url: Some(GATED_URL.to_string()),
+            oauth: Some(OAuthSetting::Config(OAuthConfig {
+                grant_type: Some(OAuthGrantType::ClientCredentials),
+                ..OAuthConfig::default()
+            })),
+            ..ServerEntry::default()
+        }
+    }
+
+    /// Options as a tool call's ladder builds them: this runtime, and a caller signal that never
+    /// fires — the turn ends without cancelling it.
+    fn gated_options(
+        runtime: &Arc<McpOAuthRuntime>,
+        storage: &Arc<GatedStorage>,
+    ) -> AuthenticateOptions {
+        let storage: Arc<dyn McpOAuthStorage> = Arc::clone(storage) as Arc<dyn McpOAuthStorage>;
+        let mut options = AuthenticateOptions::new(storage);
+        options.runtime = Some(Arc::clone(runtime));
+        options.signal = Some(CancelToken::new());
+        options
+    }
+
+    fn spawn_authenticate(
+        options: AuthenticateOptions,
+    ) -> tokio::task::JoinHandle<McpResult<AuthStatus>> {
+        tokio::spawn(async move {
+            authenticate(
+                GATED_SERVER,
+                GATED_URL,
+                Some(&client_credentials_entry()),
+                &options,
+            )
+            .await
+        })
+    }
+
+    async fn memo_len(runtime: &Arc<McpOAuthRuntime>) -> usize {
+        runtime.state.lock().await.pending_authentications.len()
+    }
+
+    /// The handles to the one memoised operation: the memo's own, and one per caller awaiting it.
+    async fn memo_holders(runtime: &Arc<McpOAuthRuntime>) -> usize {
+        runtime
+            .state
+            .lock()
+            .await
+            .pending_authentications
+            .values()
+            .next()
+            .and_then(Shared::strong_count)
+            .unwrap_or(0)
+    }
+
+    /// Yield until `ready` holds, a bounded number of times — a scheduling handshake on a
+    /// current-thread runtime, not a timer.
+    async fn yield_until<F, Fut>(mut ready: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..10_000 {
+            if ready().await {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    /// MCP-638, the row's scenario. The installing call is dropped mid-operation (aborted, as a
+    /// handler cut at its budget is) while a second call has joined; the joiner finishes the
+    /// operation. The memo must then be clear, and a later `authenticate` must run a real
+    /// authentication (a second `load`) rather than return the first one's result.
+    ///
+    /// The joiner's result is the CONTROL: it is the operation's own failure, not an abort — the
+    /// installer going away must not cancel work another caller is waiting on (the cancellation a
+    /// frame-scoped MCP-639 fix would introduce).
+    ///
+    /// MEASURED at the base: the memo is still set after the joiner returns (`left: 1`), and the
+    /// later call returns the stale result with `loads` still 1.
+    #[tokio::test]
+    async fn mcp638_a_dropped_installer_leaves_the_authenticate_memo_clear() {
+        let runtime = create_oauth_runtime(None);
+        let storage = GatedStorage::new();
+
+        let installer = spawn_authenticate(gated_options(&runtime, &storage));
+        storage.entered.notified().await;
+        assert_eq!(
+            memo_len(&runtime).await,
+            1,
+            "the installer memoised its operation"
+        );
+
+        let joiner = spawn_authenticate(gated_options(&runtime, &storage));
+        assert!(
+            yield_until(|| async { memo_holders(&runtime).await >= 3 }).await,
+            "the second call joined the memoised operation"
+        );
+
+        installer.abort();
+        assert!(installer.await.unwrap_err().is_cancelled());
+        storage.open();
+
+        let joined = joiner.await.unwrap();
+        assert_eq!(
+            joined.map_err(|error| error.to_string()),
+            Err(NEEDS_CLIENT_ID.to_string()),
+            "the joined caller completes with the operation's own result, not an abort"
+        );
+        assert!(
+            yield_until(|| async { memo_len(&runtime).await == 0 }).await,
+            "the memo is cleared once the operation ends: {} left",
+            memo_len(&runtime).await
+        );
+
+        let later = authenticate(
+            GATED_SERVER,
+            GATED_URL,
+            Some(&client_credentials_entry()),
+            &gated_options(&runtime, &storage),
+        )
+        .await;
+        assert_eq!(
+            later.map_err(|error| error.to_string()),
+            Err(NEEDS_CLIENT_ID.to_string())
+        );
+        assert_eq!(
+            storage.loads.load(Ordering::SeqCst),
+            2,
+            "a later call ran a real authentication instead of the first one's result"
+        );
+        shutdown_oauth(&runtime).await;
+    }
+
+    /// MCP-638 with no joiner: the operation still runs to its end without the installer, and
+    /// clears its memo. MEASURED at the base: nothing polls the orphaned operation, so the memo
+    /// stays set and the next call joins it.
+    #[tokio::test]
+    async fn mcp638_an_installer_dropped_alone_still_clears_its_memo() {
+        let runtime = create_oauth_runtime(None);
+        let storage = GatedStorage::new();
+
+        let installer = spawn_authenticate(gated_options(&runtime, &storage));
+        storage.entered.notified().await;
+        installer.abort();
+        assert!(installer.await.unwrap_err().is_cancelled());
+        storage.open();
+
+        assert!(
+            yield_until(|| async { memo_len(&runtime).await == 0 }).await,
+            "the orphaned operation finished and cleared its memo"
+        );
+        shutdown_oauth(&runtime).await;
+    }
+
+    /// MCP-638, the callback server's `stopping` memo. The owning stop is dropped while its stop
+    /// is held at the listener lock. A later stop must then run a stop of its own (bump the
+    /// generation), and leave the memo clear. MEASURED at the base: the later stop joins the orphan,
+    /// so the generation does not move and `stopping` stays set.
+    #[tokio::test]
+    async fn mcp638_a_dropped_stop_owner_leaves_the_stopping_memo_clear() {
+        let runtime = callback_runtime();
+        let held = runtime.listener.lock().await;
+
+        let owner = tokio::spawn(stop_callback_server());
+        assert!(
+            yield_until(|| async { runtime.stopping.lock().is_ok_and(|g| g.is_some()) }).await,
+            "the owner installed its stop"
+        );
+        let after_owner = runtime.generation.load(Ordering::SeqCst);
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        drop(held);
+
+        assert!(
+            yield_until(|| async { runtime.stopping.lock().is_ok_and(|g| g.is_none()) }).await,
+            "the orphaned stop finished and cleared its memo"
+        );
+        stop_callback_server().await;
+        assert_eq!(
+            runtime.generation.load(Ordering::SeqCst),
+            after_owner + 1,
+            "a later stop ran a stop of its own"
+        );
+        assert!(runtime.stopping.lock().is_ok_and(|g| g.is_none()));
+    }
+
+    /// MCP-639. N connect-time token lookups through the provider production installs
+    /// (`StoredCredentialAuth::authorize`, both signals generation-long) leave no task behind.
+    /// MEASURED at the base: one parked joiner per lookup — `num_alive_tasks` grows by exactly N.
+    #[tokio::test]
+    async fn mcp639_connect_token_lookups_leave_no_joiner_behind() {
+        use crate::runtime::HttpAuthProvider as _;
+
+        const N: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::credentials::McpAuthStore::with_backends(
+            Arc::new(crate::credentials::MemorySecretStore::new()),
+            Arc::new(crate::credentials::MemorySecretStore::new()),
+            crate::dirs::McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            crate::credentials::AuthStorageOptions::with_base_dir(dir.path().join("mcp-oauth")),
+            Arc::new(|_| None),
+        );
+        let runtime = create_oauth_runtime(None);
+        let generation_signal = CancelToken::new();
+        let provider = crate::runtime::StoredCredentialAuth::new(
+            store,
+            Arc::clone(&runtime),
+            generation_signal.clone(),
+            std::collections::HashSet::new(),
+        );
+        let metrics = tokio::runtime::Handle::current().metrics();
+
+        let before = metrics.num_alive_tasks();
+        for _ in 0..N {
+            let token = provider
+                .authorize("srv", "https://srv.example.com/mcp", None)
+                .await
+                .unwrap();
+            assert_eq!(token, None, "nothing stored");
+        }
+        // Let every reaped joiner observe its cancellation and exit.
+        assert!(
+            yield_until(|| async { metrics.num_alive_tasks() == before }).await,
+            "{} joiner tasks parked after {N} lookups",
+            metrics.num_alive_tasks() - before
+        );
+        assert!(
+            !generation_signal.is_cancelled(),
+            "the generation is untouched"
+        );
+        shutdown_oauth(&runtime).await;
     }
 }

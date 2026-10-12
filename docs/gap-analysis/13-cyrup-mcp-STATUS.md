@@ -641,8 +641,8 @@ left as filed.
 | `MCP-635` | low | 13e | `parity-bug` | **partial** | M | a direct call mid-build waits for the whole build, not its own server (narrowed out of `MCP-631`) |
 | `MCP-636` | low | 13e | `port-divergence` | **partial** | S | the first prompt's convergence pass is cut at the dispatcher's 5 s budget |
 | `MCP-637` | low | 13e | `port-divergence` | **partial** | M | a reply nested past 127 levels is refused where a JavaScript client reads it (narrowed out of `MCP-630`) |
-| `MCP-638` | low | 13e | `cyrup-original` | **missing** | S | two OAuth memos are cleared only by the caller that installed them |
-| `MCP-639` | low | 13e | `cyrup-original` | **missing** | S | each OAuth token lookup on an HTTP connect parks one task until the session ends |
+| `MCP-638` | ~~low~~ | 13e | `cyrup-original` | **implemented** *(CLOSED 2026-10-12)* | S | two OAuth memos are cleared by the operation, so a dropped installer leaves neither set (measured first) |
+| `MCP-639` | ~~low~~ | 13e | `cyrup-original` | **implemented** *(CLOSED 2026-10-12)* | S | an OAuth token lookup's joiner is scoped to its operation (16 parked tasks per 16 connects, measured first) |
 
 `MCP-603` and `MCP-632` are untouched and stay open.
 
@@ -690,6 +690,10 @@ Arithmetic on the 2026-10-11 census (570: `implemented` 370, `partial` 71, `miss
 (`MCP-634`, `MCP-638`, `MCP-639`) = **97**; `not-applicable` **34**. 375 + 70 + 97 + 34 = 576.
 Severity of the new rows: 6 low. Next free id: `MCP-640`. Area 13 is counted in this file by the standing rule, so
 `scripts/count_open_items.py` does not see this change.
+
+**2026-10-12, later the same day:** `MCP-638` and `MCP-639` CLOSED (`missing` → `implemented`), both measured
+before the change (see the rows in `13e`): `implemented` 375 + 2 = **377**; `missing` 97 − 2 = **95**; `partial` **70**;
+`not-applicable` **34**. 377 + 70 + 95 + 34 = 576. `MCP-634`…`MCP-637`, `MCP-603` and `MCP-632` stay open.
 
 ### Additions — 2026-10-07 (area 18's pi `v1.0.1..v1.0.4` triage)
 
