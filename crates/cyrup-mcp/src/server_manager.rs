@@ -72,13 +72,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::stdio_child::StdioChild;
 use arc_swap::ArcSwapOption;
 use cyrup_core::CancelToken;
 use futures::future::{BoxFuture, FutureExt, Shared};
 use indexmap::IndexMap;
 use rmcp::model::{Prompt, Resource, Tool};
 use rmcp::service::{Peer, PeerRequestOptions, RoleClient};
-use rmcp::transport::TokioChildProcess;
 use tokio::io::AsyncReadExt;
 use tokio::process::ChildStderr;
 use tokio::task::JoinHandle;
@@ -573,7 +573,7 @@ pub trait ConnectionResource: Send + Sync + std::fmt::Debug {
 ///
 /// **MCP-131 is this type.** Two hazards, both of which this repository has been bitten by:
 ///
-/// 1. **The unread stderr pipe.** `TokioChildProcessBuilder::spawn` hands back a `ChildStderr` when
+/// 1. **The unread stderr pipe.** [`StdioChild::spawn`] hands back a `ChildStderr` when
 ///    stderr is piped (`definition.debug !== true`, §3.3 step 7). Upstream attaches a `"data"`
 ///    listener that drains it continuously into a bounded tail. A port that merely *holds* the
 ///    handle without reading it deadlocks the child as soon as it writes 64 KiB of diagnostics — the
@@ -581,11 +581,12 @@ pub trait ConnectionResource: Send + Sync + std::fmt::Debug {
 ///    [`StdioChildConnection::adopt`] therefore starts a drain task, and [`Self::close`] aborts it.
 /// 2. **Closing exactly once, and actually reaping.** `close` is `graceful_shutdown()`: close the
 ///    transport (which drops the child's stdin), then `select!` the child's `wait()` against
-///    `MAX_WAIT_ON_DROP_SECS = 3`, killing on timeout. The slot guard is held **across** that await
+///    [`crate::stdio_child::MAX_WAIT_ON_DROP`] (3 s), killing on timeout. The slot guard is held **across** that await
 ///    and the process surrendered only once it returns, so a second `close` is a no-op rather than a
 ///    second kill *and* a cancelled close leaves the process where the next caller can find it.
-///    `ChildWithCleanup::drop` is **not** a net for a future dropped mid-shutdown: rmcp moves the
-///    child out of it before its own first await, so nothing is left holding a kill-on-drop. The
+///    `StdioChild`'s kill-on-drop is **not** a net for a future dropped mid-shutdown:
+///    `graceful_shutdown` moves the child out of it before its own first await, as rmcp's does, so
+///    nothing is left holding a kill-on-drop. The
 ///    guarantee therefore has to come from never dropping the teardown — see
 ///    [`McpServerManager::close_inner`]'s detached driver.
 ///
@@ -599,16 +600,15 @@ pub trait ConnectionResource: Send + Sync + std::fmt::Debug {
 /// and independently of it a server that forks its own worker leaves that worker behind. The
 /// measurement is in this module's tests (`a_forking_child_leaves_its_grandchild_behind`), which
 /// asserts the *current* behaviour rather than the desired one so the residual cannot be mistaken
-/// for closed. Fixing it means `process_wrap::tokio::ProcessGroup::leader()` on the `CommandWrap`
-/// rmcp spawns from, which needs a `process-wrap` entry in `crates/cyrup-mcp/Cargo.toml` — outside
-/// this unit's files, so it is named here rather than smuggled in.
+/// for closed. Fixing it means a process group on the command [`StdioChild::spawn`] runs, and a
+/// kill of the group rather than of the pid — named here rather than smuggled in.
 ///
-/// `Debug` is hand-written because `TokioChildProcess` is not `Debug` and
+/// `Debug` is hand-written because `StdioChild` is not `Debug` and
 /// [`ConnectionResource`] requires it — the pid and whether the process is still held is the whole
 /// of what a diagnostic needs anyway.
 pub struct StdioChildConnection {
     /// `None` once shutdown has started, which is what makes [`Self::close`] once-only.
-    process: tokio::sync::Mutex<Option<TokioChildProcess>>,
+    process: tokio::sync::Mutex<Option<StdioChild>>,
     pid: Option<u32>,
     /// The stderr drain task. Aborted on close; it also ends by itself at EOF.
     pump: Mutex<Option<JoinHandle<()>>>,
@@ -639,7 +639,7 @@ impl StdioChildConnection {
     /// the only callers are this module's tests. Production stdio reaches
     /// [`crate::runtime::McpConnection`] instead, for the reason the type doc gives.
     #[must_use]
-    pub fn adopt(process: TokioChildProcess, stderr: Option<ChildStderr>) -> Arc<Self> {
+    pub fn adopt(process: StdioChild, stderr: Option<ChildStderr>) -> Arc<Self> {
         let pid = process.id();
         let tail = Arc::new(Mutex::new(VecDeque::new()));
         let pump = stderr.and_then(|stderr| {
@@ -704,11 +704,11 @@ impl ConnectionResource for StdioChildConnection {
             // buys with its `abortCleanupPromises` WeakMap) and leaves a cancelled shutdown's
             // process in the slot for the next caller.
             //
-            // Named residual, because holding the guard is *not* sufficient on its own: rmcp's
-            // `graceful_shutdown` does `self.child.inner.take()` before **its** first await
-            // (`rmcp-3.1.4/src/transport/child_process.rs:81`), so a future dropped inside it has
-            // already moved the child out of `ChildWithCleanup`'s kill-on-drop net, and neither
-            // `tokio::process::Child` nor `process-wrap` has one of its own. What actually keeps
+            // Named residual, because holding the guard is *not* sufficient on its own:
+            // `StdioChild::graceful_shutdown` takes the child before **its** first await, as rmcp's
+            // does (`transport/child_process.rs:81` @3.1.4), so a future dropped inside it has
+            // already moved the child out of the kill-on-drop net, and `tokio::process::Child` has
+            // none of its own. What actually keeps
             // that child from being orphaned is that the teardown is never dropped — see the
             // detached driver in [`McpServerManager::close_inner`].
             let mut slot = self.process.lock().await;
@@ -1195,10 +1195,10 @@ impl Drop for DisposeGuard<'_> {
 /// caller who drops a `connect` mid-flight could otherwise strand a *resolved* connection — and with
 /// it a live child process — with no code left to close it.
 ///
-/// This mirrors rmcp's own `ChildWithCleanup::drop`: if the record is dropped without having been
-/// disposed, schedule the disposal. It is a net, not the mechanism — every ordinary path disposes
-/// explicitly — and off a tokio runtime it degrades to a warning, because this crate denies
-/// `clippy::panic` and `tokio::spawn` panics off-runtime.
+/// This mirrors `StdioChild`'s kill-on-drop (rmcp's `ChildWithCleanup::drop`): if the record is
+/// dropped without having been disposed, schedule the disposal. It is a net, not the mechanism —
+/// every ordinary path disposes explicitly — and off a tokio runtime it degrades to a warning,
+/// because this crate denies `clippy::panic` and `tokio::spawn` panics off-runtime.
 ///
 /// The net only works because [`ServerConnection::dispose`] sets `disposed` on **completion**: a
 /// flag set on entry is already `true` by the time a cancelled teardown drops the record, and this
@@ -1601,6 +1601,11 @@ pub struct McpServerManager {
     /// `notifications/progress`. It is **not** nulled by `close_all`: a deadline outliving its
     /// generation is a timer, not a callback into a dead runtime, and its registration is `Weak`.
     call_deadlines: Arc<crate::call_deadline::CallDeadlines>,
+    /// Tests only: a hold the connect tail waits on between the attempt resolving and the
+    /// registration, so a test can stop the tail exactly where a deduped caller must not overtake
+    /// it, whatever order the runtime wakes them in (MCP-633).
+    #[cfg(test)]
+    registration_hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl std::fmt::Debug for McpServerManager {
@@ -1654,6 +1659,23 @@ impl McpServerManager {
             oauth_runtime: Mutex::new(None),
             auth_store: Mutex::new(None),
             call_deadlines: Arc::new(crate::call_deadline::CallDeadlines::default()),
+            #[cfg(test)]
+            registration_hold: Mutex::new(None),
+        }
+    }
+
+    /// Wait out [`Self::registration_hold`], when a test has set one.
+    #[cfg(test)]
+    async fn hold_registration(&self) {
+        let hold = self
+            .registration_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hold) = hold
+            && let Ok(permit) = hold.acquire().await
+        {
+            permit.forget();
         }
     }
 
@@ -2408,6 +2430,8 @@ impl McpServerManager {
                 // race must reach its own generation check even if its caller's signal fired,
                 // otherwise the connection it created is never disposed.
                 let connection = promise.await?;
+                #[cfg(test)]
+                manager.hold_registration().await;
 
                 if attempt.is_aborted() || manager.generation(&name) != generation {
                     // `await this.disposeConnection(connection)` — and its rejection propagates,
@@ -4031,6 +4055,69 @@ mod tests {
         }
     }
 
+    /// MCP-633: the test above on a multi-thread runtime, where no wake order can be relied on. The
+    /// tail is held between the attempt resolving and the registration, every deduped caller has the
+    /// attempt's result and the whole hold to return in, and none returns until the connection is in
+    /// the map.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_deduped_connect_waits_for_the_registration_whatever_the_wake_order() {
+        let gate = Gate::shut();
+        let factory = ScriptedFactory::new(Script::Connect, Some(gate.clone()));
+        let manager = manager(Arc::clone(&factory) as Arc<dyn ConnectionFactory>);
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *manager.registration_hold.lock().unwrap() = Some(Arc::clone(&hold));
+
+        let winner = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.connect("s", &entry(), None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while factory.call_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the attempt started");
+        let followers: Vec<_> = (0..5)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                tokio::spawn(async move {
+                    let connection = manager.connect("s", &entry(), None).await.unwrap();
+                    (connection, manager.get_connection("s"))
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            factory.call_count(),
+            1,
+            "the callers deduped onto the first attempt"
+        );
+
+        gate.open();
+        // The attempt has resolved; the tail is held short of the registration. A caller that does
+        // not wait for the tail returns now, with a connection the map does not hold.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            manager.get_connection("s").is_none(),
+            "precondition: the tail is held before the registration"
+        );
+        assert!(
+            followers.iter().all(|follower| !follower.is_finished()),
+            "a deduped connect returned before its connection was registered"
+        );
+
+        hold.add_permits(1);
+        let winner = winner.await.unwrap().unwrap();
+        for follower in followers {
+            let (connection, registered) = follower.await.unwrap();
+            let registered =
+                registered.expect("the connection is in the map when a deduped `connect` returns");
+            assert!(Arc::ptr_eq(&registered, &connection));
+            assert!(Arc::ptr_eq(&connection, &winner));
+        }
+    }
+
     /// **BLOCKER regression: `connect`'s single-flight must be one critical section.**
     ///
     /// The dedupe read and the matching insert used to live in two different `MutexGuard`s sixty
@@ -5372,7 +5459,7 @@ mod tests {
     /// dropped with its transport still open — MEASURED upstream as `disposedOld=0`, i.e. upstream
     /// simply leaks it. `ServerConnection::drop` closes it instead.
     ///
-    /// `InertResource` has no teardown of its own, unlike `TokioChildProcess`, so this test fails
+    /// `InertResource` has no teardown of its own, unlike `StdioChild`, so this test fails
     /// the moment the net is removed; the stdio one does not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_record_closes_a_resource_rmcp_does_not_own() {
@@ -6097,8 +6184,8 @@ mod tests {
         ///
         /// MEASURED, and the measurement is worth recording precisely because it says this crate is
         /// not what saves the child here: ablating `ServerConnection::drop`'s net leaves this test
-        /// GREEN, because rmcp's own `ChildWithCleanup::drop` spawns the `kill()`. The net is what
-        /// covers resources rmcp does *not* own — see
+        /// GREEN, because `StdioChild`'s own kill-on-drop spawns the `kill()`. The net is what
+        /// covers resources that have none — see
         /// `a_dropped_record_closes_a_resource_rmcp_does_not_own`, which is the test that actually
         /// discriminates it.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1855,7 +1855,6 @@ mod tests {
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use std::process::Stdio;
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -1890,9 +1889,7 @@ use rmcp::transport::streamable_http_client::{
     AuthRequiredError, InsufficientScopeError, StreamableHttpClient,
     StreamableHttpClientTransportConfig, StreamableHttpError, StreamableHttpPostResponse,
 };
-use rmcp::transport::{
-    ConfigureCommandExt, IntoTransport, StreamableHttpClientTransport, TokioChildProcess,
-};
+use rmcp::transport::{IntoTransport, StreamableHttpClientTransport};
 use rmcp::{ClientHandler, ErrorData};
 use tokio::process::ChildStderr;
 
@@ -2166,12 +2163,12 @@ impl StdioTransportSpec {
     }
 }
 
-/// Spawn the child and hand back rmcp's stdio transport plus, in non-debug mode, the stderr handle.
+/// Spawn the child and hand back its stdio transport plus, in non-debug mode, the stderr handle.
 ///
-/// The rmcp fit is exact and worth stating precisely, because it inverts the obvious reading of
-/// upstream: `TokioChildProcessBuilder`'s **default** is `Stdio::inherit()` — upstream's
-/// `debug: true` — so the port calls `.stderr(Stdio::piped())` on the `debug: false` arm rather than
-/// the other way round. `spawn()` then returns `Option<ChildStderr>`, `Some` exactly when piped.
+/// The transport is [`crate::stdio_child::StdioChild`], rmcp's `TokioChildProcess` with the child's
+/// stdout measured before rmcp's line codec reads it (MCP-630). Its stderr follows rmcp's builder:
+/// inherited — upstream's `debug: true` — unless piped, which the `debug: false` arm asks for, and
+/// handed back as `Option<ChildStderr>`, `Some` exactly when piped.
 ///
 /// Ordering follows §3.3 step 5 → 7: the plugin data directory is created *before* the process
 /// exists. Step 4's `throwIfAborted(signal)` sits one level up in the connection builder, between
@@ -2184,7 +2181,7 @@ impl StdioTransportSpec {
 /// the path is what makes it actionable.
 pub fn spawn_stdio_transport(
     spec: &StdioTransportSpec,
-) -> McpResult<(TokioChildProcess, Option<ChildStderr>)> {
+) -> McpResult<(crate::stdio_child::StdioChild, Option<ChildStderr>)> {
     // §3.3 step 5. `mkdirSync(definition.pluginDataDir, { recursive: true })`.
     if let Some(dir) = spec.plugin_data_dir.as_ref() {
         std::fs::create_dir_all(dir).map_err(|source| McpError::Io {
@@ -2193,26 +2190,19 @@ pub fn spawn_stdio_transport(
         })?;
     }
 
-    let mut builder = TokioChildProcess::builder(
-        tokio::process::Command::new(&spec.command).configure(|command| {
-            command.args(&spec.args);
-            // The replace-not-merge semantics of `StdioClientTransport`'s `env` option. See
-            // `StdioTransportSpec::env`.
-            command.env_clear();
-            command.envs(&spec.env);
-            // §3.3 step 6: the key is *omitted entirely* when neither the definition nor the
-            // manager supplies one, so `None` must not become `current_dir(".")`.
-            if let Some(cwd) = spec.cwd.as_ref() {
-                command.current_dir(cwd);
-            }
-        }),
-    );
-
-    if !spec.debug {
-        builder = builder.stderr(Stdio::piped());
+    let mut command = tokio::process::Command::new(&spec.command);
+    command.args(&spec.args);
+    // The replace-not-merge semantics of `StdioClientTransport`'s `env` option. See
+    // `StdioTransportSpec::env`.
+    command.env_clear();
+    command.envs(&spec.env);
+    // §3.3 step 6: the key is *omitted entirely* when neither the definition nor the manager
+    // supplies one, so `None` must not become `current_dir(".")`.
+    if let Some(cwd) = spec.cwd.as_ref() {
+        command.current_dir(cwd);
     }
 
-    builder.spawn().map_err(|source| McpError::Io {
+    crate::stdio_child::StdioChild::spawn(command, !spec.debug).map_err(|source| McpError::Io {
         path: PathBuf::from(&spec.command),
         source,
     })
@@ -2828,6 +2818,130 @@ fn capped_sse_stream(
     SseStream::from_bytes_stream(capped).boxed()
 }
 
+/// `bounded_sse_stream` (`rmcp-3.1.4/src/transport/common/client_side_sse.rs:144-155`) with its
+/// `SseEventSizeLimiter` (`:28-91`), which rmcp keeps `pub(crate)`: each SSE **event** is capped at
+/// `max_event_size` bytes, as rmcp caps it, for the request POSTs [`UnauthorizedProbe`] owns.
+///
+/// NAMED DELTA: rmcp recognises its own oversize error by type (`is_event_too_large_error`,
+/// `:157-166`) and ends a resumable stream on it at once; this port's error is an `io::Error` rmcp
+/// cannot recognise, so a stream that had already delivered an event id is retried from that id
+/// under the transport's retry policy before it fails. A stream with no event id ends at once,
+/// either way.
+fn event_capped_sse_stream<S, E>(
+    chunks: S,
+    max_event_size: usize,
+) -> BoxStream<'static, Result<Sse, SseError>>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let limited = futures::stream::unfold(
+        (
+            chunks.boxed(),
+            SseEventSizeLimiter::new(max_event_size),
+            false,
+        ),
+        |(mut inner, mut limiter, failed)| async move {
+            if failed {
+                return None;
+            }
+            match inner.next().await? {
+                Ok(chunk) => {
+                    if limiter.observe(&chunk) {
+                        Some((Ok(chunk), (inner, limiter, false)))
+                    } else {
+                        let error = std::io::Error::other(format!(
+                            "SSE event exceeded the maximum size of {} bytes",
+                            limiter.max_size
+                        ));
+                        Some((Err(error), (inner, limiter, true)))
+                    }
+                }
+                Err(error) => Some((Err(std::io::Error::other(error)), (inner, limiter, true))),
+            }
+        },
+    );
+    SseStream::from_bytes_stream(limited).boxed()
+}
+
+/// rmcp's `SseEventSizeLimiter`, field for field: the bytes the SSE parser retains for the event
+/// being read — its non-comment lines plus the newline it joins `data` lines with — never exceed the
+/// cap.
+#[derive(Debug)]
+struct SseEventSizeLimiter {
+    max_size: usize,
+    retained_size: usize,
+    line_size: usize,
+    line_is_comment: bool,
+    previous_was_cr: bool,
+}
+
+impl SseEventSizeLimiter {
+    fn new(max_size: usize) -> Self {
+        Self {
+            max_size,
+            retained_size: 0,
+            line_size: 0,
+            line_is_comment: false,
+            previous_was_cr: false,
+        }
+    }
+
+    /// `false` once the event being read is over the cap.
+    fn observe(&mut self, chunk: &[u8]) -> bool {
+        for &byte in chunk {
+            if self.previous_was_cr {
+                self.previous_was_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => {
+                    if !self.finish_line() {
+                        return false;
+                    }
+                    self.previous_was_cr = true;
+                }
+                b'\n' => {
+                    if !self.finish_line() {
+                        return false;
+                    }
+                }
+                _ => {
+                    if self.line_size == 0 {
+                        self.line_is_comment = byte == b':';
+                    }
+                    self.line_size = self.line_size.saturating_add(1);
+                    if !self.within_limit() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn finish_line(&mut self) -> bool {
+        if self.line_size == 0 {
+            self.retained_size = 0;
+        } else if !self.line_is_comment {
+            // The SSE parser inserts a newline when joining multiple data fields.
+            self.retained_size = self
+                .retained_size
+                .saturating_add(self.line_size)
+                .saturating_add(1);
+        }
+        self.line_size = 0;
+        self.line_is_comment = false;
+        self.within_limit()
+    }
+
+    fn within_limit(&self) -> bool {
+        self.retained_size.saturating_add(self.line_size) <= self.max_size
+    }
+}
+
 /// `error.status === 401` — the one bit rmcp's reqwest client throws away.
 ///
 /// # Why this OWNS the POST instead of decorating it
@@ -2841,15 +2955,22 @@ fn capped_sse_stream(
 /// the frame, so the status cannot be decorated out of rmcp: it can only be kept by a client that
 /// performs the POST itself.
 ///
-/// # Why only the handshake
+/// # Which POSTs it owns
 ///
+/// Every POST that carries a **request**. The 401 fix is the handshake's alone:
 /// [`unauthorized_challenge`] has exactly one caller (`runtime.rs:2672`) and it takes a
 /// [`ClientInitializeError`], so the startup POST is the only request whose 401 can start the OAuth
-/// ladder. Every other POST is delegated to rmcp verbatim — same SSE limiter, same 202 handling,
-/// same session-expiry — which keeps the blast radius at the handshake. The SSE cap in
-/// [`capped_sse_stream`] is total-bytes rather than rmcp's per-event, and that is safe ONLY because
-/// a handshake stream is drained to its first `Response` and dropped; a `tools/call` result stream
-/// is not, which is the second reason non-handshake POSTs must stay delegated.
+/// ladder, and every other request keeps rmcp's 401 arm, gated on the challenge header.
+///
+/// The others are owned for MCP-630: rmcp parses a JSON reply body itself and answers `Accepted` for
+/// one it cannot parse (`common/reqwest/streamable_http_client.rs:308-318`), so a reply nested past
+/// serde_json's limit was never seen and its request ran to its timeout. Owned, the body is measured
+/// first ([`crate::depth_guard::read_json_body`]) and a refused reply fails its request at once.
+/// Their SSE replies keep rmcp's per-event cap through a port of its limiter
+/// ([`event_capped_sse_stream`]); the handshake keeps [`capped_sse_stream`]'s total cap, which is
+/// safe only because a handshake stream is drained to its first `Response` and dropped. Notifications
+/// and responses this side sends are still delegated to rmcp verbatim: nothing waits on what comes
+/// back for them.
 ///
 /// # Why `AuthRequired` and not a new shape
 ///
@@ -2874,9 +2995,11 @@ impl UnauthorizedProbe {
     }
 
     /// A faithful port of `rmcp-3.1.4/src/transport/common/reqwest/streamable_http_client.rs:190-324`
-    /// with ONE behavioural difference — the 401 arm below — and two arms that cannot fire here:
-    /// one kept anyway, one omitted, each stated at the point it sits.
-    async fn post_handshake(
+    /// for a POST that carries a request, with three differences, each stated where it sits: the
+    /// handshake's 401 arm, the handshake's total SSE cap, and the depth measure on a reply
+    /// (MCP-630). One arm cannot fire for a request and is omitted.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_request(
         &self,
         uri: &str,
         message: &ClientJsonRpcMessage,
@@ -2884,6 +3007,7 @@ impl UnauthorizedProbe {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
+        handshake: bool,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
         // Byte-for-byte the request rmcp would have sent (`:196-211`), in rmcp's order: ACCEPT, the
         // separate bearer channel, the custom headers under the same reserved-header rejection, the
@@ -2909,24 +3033,39 @@ impl UnauthorizedProbe {
         }
         let response = request.json(message).send().await?;
 
-        // ── THE FIX ──────────────────────────────────────────────────────────────────────────────
+        // ── THE FIX (the handshake's) ────────────────────────────────────────────────────────────
         // The status is read BEFORE the body, and 401 wins over the JSON-RPC shortcut whether or not
         // a challenge came with it. rmcp gates its own 401 arm on the header being present
         // (`:212-213`), which is why a bare 401 with a JSON body falls through to `:289`. Upstream
         // reads the status first and unconditionally
         // (`@modelcontextprotocol/client/dist/index.mjs:5333-5334`), and confines its own JSON-RPC
-        // error passthrough to status 400 (`:5374-5381`).
+        // error passthrough to status 400 (`:5374-5381`). Every other request keeps rmcp's arm.
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             let challenge = response
                 .headers()
                 .get(http::header::WWW_AUTHENTICATE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
-                challenge,
-            )));
+                .map(|value| value.to_str());
+            match (handshake, challenge) {
+                (true, challenge) => {
+                    let challenge = challenge.and_then(Result::ok).unwrap_or_default();
+                    return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                        challenge.to_string(),
+                    )));
+                }
+                // rmcp `:212-226`.
+                (false, Some(Ok(challenge))) => {
+                    return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                        challenge.to_string(),
+                    )));
+                }
+                (false, Some(Err(_))) => {
+                    return Err(StreamableHttpError::UnexpectedServerResponse(Cow::from(
+                        "invalid www-authenticate header value",
+                    )));
+                }
+                (false, None) => {}
+            }
         }
         // ── everything below mirrors rmcp `:227-324` ─────────────────────────────────────────────
         // 403 is NOT widened: `InsufficientScope` is reproduced exactly so a scope denial keeps
@@ -2950,10 +3089,9 @@ impl UnauthorizedProbe {
         ) {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
-        // UNREACHABLE ARM 1 of 2 — rmcp's `404 => SessionExpired` (`:250-252`) is KEPT, but it can
-        // never fire here: the worker posts both startup requests with `session_id: None`
-        // (`…/streamable_http_client.rs:870`, `:776`). Kept anyway, because it costs three lines and
-        // an rmcp change that starts attaching one must not silently change meaning.
+        // rmcp `:250-252`. Never fires for the handshake — the worker posts both startup requests
+        // with `session_id: None` (`…/streamable_http_client.rs:870`, `:776`) — and is how every
+        // later request learns its session has expired.
         if status == reqwest::StatusCode::NOT_FOUND && session_was_attached {
             return Err(StreamableHttpError::SessionExpired);
         }
@@ -2970,7 +3108,7 @@ impl UnauthorizedProbe {
             .as_deref()
             .is_some_and(|ct| ct.starts_with(JSON_MIME_TYPE));
 
-        // UNREACHABLE ARM 2 of 2 — rmcp's empty-success => Accepted (`:265-277`) requires the OUTGOING
+        // UNREACHABLE ARM — rmcp's empty-success => Accepted (`:265-277`) requires the OUTGOING
         // message to be a Notification/Response/Error. This method only runs for a Request, so the
         // arm is unreachable by construction and is omitted rather than written-and-dead.
 
@@ -2996,17 +3134,28 @@ impl UnauthorizedProbe {
             .as_deref()
             .is_some_and(|ct| ct.starts_with(EVENT_STREAM_MIME_TYPE))
         {
+            let events = if handshake {
+                capped_sse_stream(response, max_sse_event_size)
+            } else {
+                event_capped_sse_stream(response.bytes_stream(), max_sse_event_size)
+            };
             return Ok(StreamableHttpPostResponse::Sse(
-                capped_sse_stream(response, max_sse_event_size),
+                crate::depth_guard::guard_sse(events),
                 session_id,
             ));
         }
         if is_json {
             // Same tolerance as rmcp `:308-318`: a body that is not a `ServerJsonRpcMessage` is
-            // treated as an accept rather than a failure.
-            return Ok(match response.json::<ServerJsonRpcMessage>().await {
-                Ok(message) => StreamableHttpPostResponse::Json(message, session_id),
-                Err(_) => StreamableHttpPostResponse::Accepted,
+            // treated as an accept rather than a failure — except one nested past what this port
+            // reads, whose request is failed instead (MCP-630). `bytes` then `from_slice` is what
+            // reqwest's `json` does.
+            let message = match response.bytes().await {
+                Ok(body) => crate::depth_guard::read_json_body(&body),
+                Err(_) => None,
+            };
+            return Ok(match message {
+                Some(message) => StreamableHttpPostResponse::Json(message, session_id),
+                None => StreamableHttpPostResponse::Accepted,
             });
         }
         Err(StreamableHttpError::UnexpectedContentType(content_type))
@@ -3047,15 +3196,16 @@ impl StreamableHttpClient for UnauthorizedProbe {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        if is_handshake_request(&message) {
+        if let JsonRpcMessage::Request(_) = &message {
             return self
-                .post_handshake(
+                .post_request(
                     &uri,
                     &message,
                     session_id,
                     auth_header,
                     custom_headers,
                     max_sse_event_size,
+                    is_handshake_request(&message),
                 )
                 .await;
         }
@@ -3082,6 +3232,7 @@ impl StreamableHttpClient for UnauthorizedProbe {
         self.inner
             .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
             .await
+            .map(crate::depth_guard::guard_sse)
     }
 
     async fn get_stream_with_max_sse_event_size(
@@ -3103,6 +3254,7 @@ impl StreamableHttpClient for UnauthorizedProbe {
                 max_sse_event_size,
             )
             .await
+            .map(crate::depth_guard::guard_sse)
     }
 
     async fn delete_session(
@@ -3791,7 +3943,7 @@ impl ClientHandler for McpClientHandler {
 ///   initialise-or-fail path and races the token itself, returning
 ///   [`ClientInitializeError::Cancelled`].
 /// * **The `abortCleanupPromises` `WeakMap`.** On `Err` the transport is dropped here, and
-///   `TokioChildProcess`'s `ChildWithCleanup::drop` spawns a `kill()`, so no child survives an
+///   [`crate::stdio_child::StdioChild`]'s kill-on-drop spawns a `kill()`, so no child survives an
 ///   aborted connect and there is no second `close()` to coordinate. What does *not* collapse is the
 ///   HTTP retry ladder's once-only teardown across attempts — that is adapter policy and stays in
 ///   `server_manager` (MCP-123).
@@ -3896,7 +4048,7 @@ where
     let (service, detach) = detachable_from(&ct);
     // Dropping the `connect_client` future is what tears the half-built connection down, and it is
     // the same drop the abort path relies on: `serve_client_with_ct_inner` holds the transport in a
-    // local, so the transport (and, for stdio, `ChildWithCleanup::drop`'s `kill()`) goes with it.
+    // local, so the transport (and, for stdio, `StdioChild`'s kill-on-drop) goes with it.
     let outcome = match tokio::time::timeout(
         budget,
         connect_client(handler, transport, lifecycle, service),
@@ -4021,13 +4173,16 @@ fn handshake_timeout_error(server: &str, stderr: Option<&StderrPump>) -> McpErro
 /// (`transport/async_rw.rs`, "Ignoring unparsable incoming message", which the other official SDKs
 /// do too) — ends the request at this budget.
 ///
-/// [CYRUP-DELTA] One reply that a JavaScript client reads is dropped here and so times out at this
-/// budget: a JSON-RPC message nested more than 128 levels deep, which serde_json refuses
-/// (`recursion limit exceeded`, reported as `Category::Syntax`, which rmcp's `async_rw.rs` treats
-/// as unparsable input). A `tools/list` whose schema nests that deeply fails the connect after a
-/// minute and a `tools/call` whose `structuredContent` does rejects after a minute. Reading such a
-/// message needs serde_json's `disable_recursion_limit`, which only the transport that reads the
-/// line could call, and that transport is rmcp's.
+/// [CYRUP-DELTA] One reply that a JavaScript client reads is refused here: a JSON-RPC message nested
+/// more than [`crate::depth_guard::MAX_READ_DEPTH`] levels deep, which serde_json — every JSON
+/// reader in this port — cannot read. It does **not** wait for this budget (MCP-630): the reply is
+/// measured before rmcp parses it, on stdio ([`crate::stdio_child`]) and HTTP
+/// ([`UnauthorizedProbe`]) alike, and its request fails at once with
+/// [`crate::depth_guard::refusal_message`] — a `tools/list` fails the connect, a `tools/call`
+/// rejects. Before, rmcp dropped it as unparsable and the request ran to this budget. It is refused
+/// rather than read, although this port now owns the reader that could disable the limit, because
+/// the session file and `mcp-cache.json` would carry the reply on, deeper still, to readers that
+/// cannot (see [`crate::depth_guard`]).
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `normalizeRequestTimeoutMs` (`server-manager.ts:1249-1253`): finite **and** strictly positive,
@@ -4624,12 +4779,12 @@ pub fn build_http_client() -> McpResult<reqwest::Client> {
 ///
 /// # Why this is not `StdioChildConnection`
 ///
-/// `server_manager::StdioChildConnection` adopts a raw `TokioChildProcess` and calls
+/// `server_manager::StdioChildConnection` adopts a raw [`crate::stdio_child::StdioChild`] and calls
 /// `graceful_shutdown` on it. That shape only exists for a caller that never handed the transport to
 /// rmcp. This builder *does* — `serve_client_with_lifecycle_and_ct` takes the transport **by value**
 /// — so the child is owned by the `RunningService` from the handshake onward and `close()` has to go
 /// through it. Closing the service cancels its task, which closes the transport, which is
-/// `TokioChildProcess::close` → the same `graceful_shutdown`. One owner, one close.
+/// `StdioChild::close` → the same `graceful_shutdown`. One owner, one close.
 pub struct McpConnection {
     /// `None` once shutdown has completed, which is what makes [`ConnectionResource::close`]
     /// idempotent. A `tokio::sync::Mutex` because the guard is held **across** the close await, for
@@ -5085,7 +5240,7 @@ impl ConnectionBuilder {
             Err(_budget) => {
                 // Same order as the failure arm below: let the drain settle so the tail is whole,
                 // then report. The child is already dying — dropping the `connect_client` future
-                // dropped the transport, and `ChildWithCleanup::drop` spawns `kill()`.
+                // dropped the transport, and `StdioChild`'s kill-on-drop spawns `kill()`.
                 if let Some(pump) = stderr.as_ref() {
                     pump.settle().await;
                 }
@@ -5105,8 +5260,8 @@ impl ConnectionBuilder {
                 // What happens to the child here, stated exactly, because "rmcp cleans up" is not
                 // precise enough to rely on: `serve_client_with_ct_inner` holds the transport in a
                 // local, so every `?` and the `tokio::select!` cancellation arm **drop** it — and
-                // `TokioChildProcess`'s `ChildWithCleanup::drop`
-                // (`rmcp-3.1.4/src/transport/child_process.rs:45-57`) spawns a fire-and-forget
+                // `StdioChild`'s kill-on-drop (rmcp's `ChildWithCleanup::drop`,
+                // `transport/child_process.rs:45-57` @3.1.4, ported) spawns a fire-and-forget
                 // `kill()`. NAMED DELTA: that is a SIGKILL with no graceful window, where upstream's
                 // catch runs `client.close()` and the TS SDK escalates close-stdin → 2 s → SIGTERM →
                 // 2 s → SIGKILL. A stdio server that would have flushed state on SIGTERM does not
@@ -6718,7 +6873,7 @@ mod wire_tests {
             plugin_data_dir: None,
             debug: false,
         };
-        // `TokioChildProcess` is not `Debug`, so `unwrap_err` is unavailable here.
+        // `StdioChild` is not `Debug`, so `unwrap_err` is unavailable here.
         let Err(err) = spawn_stdio_transport(&spec) else {
             panic!("spawning a nonexistent command must fail");
         };
@@ -7588,6 +7743,30 @@ done
         /// store-backed provider that always returns `None` pass a "connects on the first attempt"
         /// test. Gating on the token is what makes those tests honest.
         require_bearer: Option<&'static str>,
+        /// Answer `tools/call` with a reply nested [`DEEP_REPLY_DEPTH`] levels deep, in a JSON body
+        /// or an SSE event (MCP-630).
+        deep_tool_call: Option<DeepReply>,
+    }
+
+    /// How [`FixtureOptions::deep_tool_call`] sends its reply.
+    #[derive(Clone, Copy, Debug)]
+    enum DeepReply {
+        Json,
+        Sse,
+    }
+
+    /// How deep the fixtures' over-nested replies are: the message, `result` and
+    /// `structuredContent`, then arrays.
+    const DEEP_REPLY_DEPTH: usize = 200;
+
+    /// A `tools/call` reply to `id` nested [`DEEP_REPLY_DEPTH`] levels deep.
+    fn deep_reply(id: &str) -> String {
+        let arrays = DEEP_REPLY_DEPTH - 3;
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[],\"structuredContent\":{{\"v\":{}1{}}}}}}}",
+            "[".repeat(arrays),
+            "]".repeat(arrays),
+        )
     }
 
     impl Default for FixtureOptions {
@@ -7600,6 +7779,7 @@ done
                 stall_initialize: false,
                 cancel_before: None,
                 require_bearer: None,
+                deep_tool_call: None,
             }
         }
     }
@@ -7639,6 +7819,7 @@ done
                 stall_initialize,
                 cancel_before,
                 require_bearer,
+                deep_tool_call,
             } = options;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -7757,6 +7938,23 @@ done
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                             payload.len()
                         )
+                    } else if let Some(form) = deep_tool_call
+                        && recorded.body.contains("\"method\":\"tools/call\"")
+                    {
+                        let payload = deep_reply(&json_id(&recorded.body));
+                        match form {
+                            DeepReply::Json => format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                payload.len()
+                            ),
+                            DeepReply::Sse => {
+                                let events = format!("event: message\ndata: {payload}\n\n");
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+                                    events.len()
+                                )
+                            }
+                        }
                     } else if recorded.body.contains("\"id\":") {
                         let id = json_id(&recorded.body);
                         let payload =
@@ -8193,6 +8391,54 @@ done
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
+    /// MCP-633: the SDK's 60 s default bounds the HTTP handshake too, with no `requestTimeoutMs`
+    /// anywhere. The fixture reads `initialize` and holds the socket open; a spinner keeps the
+    /// runtime busy until it has, so the virtual clock cannot pass the minute before the request is
+    /// on the wire, and from then on the budget is the only timer left. The bounds are written out:
+    /// a different default, or a different budget applied on this arm, misses them.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_http_server_with_no_timeout_configured_fails_its_handshake_at_the_sdk_default()
+     {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            stall_initialize: true,
+            ..FixtureOptions::default()
+        })
+        .await;
+        let request = request("wedged-http", http_entry(&fixture.url));
+        let spinner = {
+            let log = Arc::clone(&fixture.log);
+            tokio::spawn(async move {
+                let initialized = || {
+                    log.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .any(|recorded| recorded.body.contains("\"method\":\"initialize\""))
+                };
+                while !initialized() {
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let started = tokio::time::Instant::now();
+        let error = builder()
+            .connect_http_client(&request)
+            .await
+            .expect_err("a silent HTTP server must not hang the connect");
+        spinner.abort();
+
+        assert_eq!(fixture.initializes(), 1, "the server was sent `initialize`");
+        assert!(
+            error.to_string().contains(HANDSHAKE_TIMED_OUT),
+            "expected `{HANDSHAKE_TIMED_OUT}`, got {error}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(60) && elapsed < Duration::from_secs(61),
+            "the connect gave up after {elapsed:?}, not at the SDK's 60 s"
+        );
+    }
+
     /// The SDK's 60 s default bounds the handshake when **no** `requestTimeoutMs` is configured, on
     /// the stdio arm. The first port read the unset value as "no timeout" and parked the connect — and
     /// the manager's per-name single-flight slot, and the first prompt held for the build — for as long
@@ -8214,10 +8460,10 @@ done
             error.to_string().contains(HANDSHAKE_TIMED_OUT),
             "expected `{HANDSHAKE_TIMED_OUT}`, got {error}"
         );
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() >= DEFAULT_REQUEST_TIMEOUT,
-            "the connect gave up after {:?}, before the SDK default",
-            started.elapsed()
+            elapsed >= Duration::from_secs(60) && elapsed < Duration::from_secs(61),
+            "the connect gave up after {elapsed:?}, not at the SDK's 60 s"
         );
     }
 
@@ -8260,10 +8506,14 @@ done
             error.to_string().contains(HANDSHAKE_TIMED_OUT),
             "expected `{HANDSHAKE_TIMED_OUT}`, got {error}"
         );
+        // The failed connect then closes the child gracefully, and on the virtual clock its 3 s
+        // grace (`stdio_child::MAX_WAIT_ON_DROP`) runs out before the child's real exit is seen:
+        // the minute plus those 3 s, and nothing else.
+        let elapsed = started.elapsed();
+        let grace = crate::stdio_child::MAX_WAIT_ON_DROP;
         assert!(
-            started.elapsed() >= DEFAULT_REQUEST_TIMEOUT,
-            "the list gave up after {:?}, before the SDK default",
-            started.elapsed()
+            elapsed >= Duration::from_secs(60) + grace && elapsed < Duration::from_secs(61) + grace,
+            "the list gave up after {elapsed:?}, not at the SDK's 60 s"
         );
     }
 
@@ -9325,6 +9575,91 @@ done
     /// connection — not as long as the attempt that built it. The manager reaps the attempt's two
     /// tokens the moment the attempt settles; a signing client that kept one of them refused every
     /// request after the connect as 'HTTP request headers command aborted'.
+    /// A stdio server whose `tools/list` declares a schema nested past what cyrup reads.
+    const DEEP_LIST_MCP: &str = r#"
+d=''; e=''; i=0
+while [ "$i" -lt 200 ]; do d="$d["; e="$e]"; i=$((i+1)); done
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}\n' "$id" "$PV"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"deep","inputSchema":{"type":"object","properties":{"x":%s1%s}}}]}}\n' "$id" "$d" "$e"
+      ;;
+    *'"method":"notifications/'*) : ;;
+    *)
+      if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi
+      ;;
+  esac
+done
+"#;
+
+    /// MCP-630 at connect: a `tools/list` reply nested 206 levels deep — the message, `result`,
+    /// `tools`, the tool, `inputSchema` and `properties`, then 200 arrays — fails the connect at
+    /// once and says why. It was dropped by rmcp's line codec, and the connect waited out its
+    /// 60 s request timeout to fail with `Request timed out`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tool_list_nested_past_what_cyrup_reads_fails_the_connect_at_once() {
+        let mut entry = stdio_entry(DEEP_LIST_MCP, &[]);
+        entry.env = Some(record(&[(
+            "PV",
+            rmcp::model::ProtocolVersion::LATEST.as_str(),
+        )]));
+        let request = request("deep", entry);
+        assert_eq!(request.request_timeout(), DEFAULT_REQUEST_TIMEOUT);
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            builder().create_connection(request),
+        )
+        .await
+        .expect("the connect waited for a tool list it had already been sent");
+        let error = outcome.err().expect("the connect fails");
+        let message = error.to_string();
+        assert!(
+            message.contains(&crate::depth_guard::refusal_message(206)),
+            "{message}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// MCP-630 over HTTP: a `tools/call` reply nested past what cyrup reads fails the call at once,
+    /// whether it comes as a JSON body — which rmcp's client took for an accepted POST, leaving the
+    /// call to its timeout — or as an SSE event, which rmcp skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_http_reply_nested_past_what_cyrup_reads_fails_its_call_at_once() {
+        for form in [DeepReply::Json, DeepReply::Sse] {
+            let fixture = HttpFixture::start_with(FixtureOptions {
+                deep_tool_call: Some(form),
+                ..FixtureOptions::default()
+            })
+            .await;
+            let connection = builder()
+                .connect_http_client(&request("deep", http_entry(&fixture.url)))
+                .await
+                .expect("connects");
+            let peer = connection.resource.peer().cloned().expect("a client");
+
+            let called = tokio::time::timeout(
+                Duration::from_secs(10),
+                peer.call_tool(rmcp::model::CallToolRequestParams::new("deep")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{form:?}: the call waited for a reply it had been sent"));
+            let Err(rmcp::service::ServiceError::McpError(error)) = called else {
+                panic!("{form:?}: the call fails with the refusal: {called:?}");
+            };
+            assert_eq!(
+                error.message,
+                crate::depth_guard::refusal_message(DEEP_REPLY_DEPTH),
+                "{form:?}"
+            );
+            connection.resource.close().await.expect("close");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_signing_client_outlives_the_attempt_that_built_it() {
         let fixture = HttpFixture::start(0).await;
@@ -9638,10 +9973,10 @@ done
 
     /// A failed handshake must not leak the child, and the *mechanism* is worth pinning because it
     /// is not the obvious one: nothing in this port calls `close()` on that path.
-    /// `serve_client_with_ct_inner` drops the transport, and `ChildWithCleanup::drop`
-    /// (`rmcp-3.1.4/src/transport/child_process.rs:45-57`) spawns a `kill()`. If a future rmcp
-    /// version moves the child out of that guard before its first await — which is exactly what
-    /// `graceful_shutdown` already does — this test is what notices.
+    /// `serve_client_with_ct_inner` drops the transport, and `StdioChild`'s kill-on-drop (rmcp's
+    /// `ChildWithCleanup::drop`, `transport/child_process.rs:45-57` @3.1.4, ported) spawns a
+    /// `kill()`. If a change moves the child out of that guard before its first await — which is
+    /// exactly what `graceful_shutdown` already does — this test is what notices.
     ///
     /// The fixture ignores stdin closure and never answers `initialize`, so only the kill can end
     /// it. Linux-only because it reads `/proc`, the same gate `server_manager`'s child-process
@@ -9703,6 +10038,109 @@ done
         assert!(
             !alive(pid),
             "the child survived a failed handshake (pid {pid})"
+        );
+    }
+}
+
+/// rmcp's own tests of `bounded_sse_stream` (`client_side_sse.rs:565-685` @3.1.4), run against the
+/// port, so the cap on every request's reply stream is rmcp's to the byte.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod sse_event_cap_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn chunks(
+        parts: &'static [&'static [u8]],
+    ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+        futures::stream::iter(parts.iter().map(|part| Ok(Bytes::from_static(part))))
+    }
+
+    #[tokio::test]
+    async fn rejects_an_unterminated_event_over_the_limit() {
+        let mut stream = event_capped_sse_stream(chunks(&[b"data: aaaaa", b"aaaaaa"]), 16);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("maximum size of 16 bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resets_the_limit_after_an_event_terminator() {
+        let mut stream = event_capped_sse_stream(chunks(&[b"data: a\r", b"\n\r\ndata: b\n\n"]), 8);
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            (first.data.as_deref(), second.data.as_deref()),
+            (Some("a"), Some("b"))
+        );
+    }
+
+    #[tokio::test]
+    async fn passes_an_event_at_exactly_the_limit() {
+        let mut stream = event_capped_sse_stream(chunks(&[b"data: ab\n\n"]), 9);
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.data.as_deref(), Some("ab"));
+    }
+
+    #[tokio::test]
+    async fn rejects_an_oversize_event_split_across_many_chunks() {
+        const PARTS: [&[u8]; 20] = [b"data: x"; 20];
+        let mut stream = event_capped_sse_stream(chunks(&PARTS), 32);
+        let mut found_error = false;
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                found_error = true;
+                break;
+            }
+        }
+        assert!(found_error, "expected oversize error");
+    }
+
+    #[tokio::test]
+    async fn handles_crlf_split_across_chunks() {
+        let mut stream =
+            event_capped_sse_stream(chunks(&[b"data: hello\r", b"\n\ndata: world\n\n"]), 64);
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.data.as_deref(), Some("hello"));
+        assert_eq!(second.data.as_deref(), Some("world"));
+    }
+
+    #[tokio::test]
+    async fn does_not_count_completed_comment_lines() {
+        let mut stream = event_capped_sse_stream(chunks(&[b": ping\n: ping\n: ping\n"]), 6);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn comments_do_not_reset_accumulated_data() {
+        let mut stream = event_capped_sse_stream(chunks(&[b"data: a\n: ping\ndata: b\n"]), 14);
+        assert!(stream.next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn counts_the_newlines_multiline_data_is_joined_with() {
+        let mut stream = event_capped_sse_stream(chunks(&[b"data: aaa\ndata: bbb\n\n"]), 18);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("maximum size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn propagates_a_source_error() {
+        let source = futures::stream::iter([Err::<Bytes, _>(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ))]);
+        let mut stream = event_capped_sse_stream(source, 1024);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("connection reset"),
+            "unexpected error: {error}"
         );
     }
 }

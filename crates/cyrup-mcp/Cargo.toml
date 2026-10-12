@@ -193,6 +193,10 @@ ratatui = "0.30.2"
 # `transport-streamable-http-client-reqwest`, so neither adds a resolution surface.
 http = "1.4.2"
 sse-stream = "0.2.5"
+# The chunk type of the reply stream the per-event SSE cap reads (`runtime::event_capped_sse_stream`,
+# MCP-630), named so the cap can be fed a stream that is not a live response. Already in the lock
+# through reqwest.
+bytes = { workspace = true }
 
 # --- the HTTP client the streamable transport runs on (MCP-109/MCP-114/MCP-115) -----------------
 # Named for the same reason `http` and `sse-stream` are: the moment `runtime::connect_http_client`

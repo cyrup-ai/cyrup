@@ -335,7 +335,7 @@ const STILL_CONNECTING_NOTICE: &str =
 /// per OAuth request (`transport/auth.rs:31` @3.1.4); then the connections close together, an HTTP
 /// session's `DELETE` under rmcp's 5 s (`SESSION_CLEANUP_TIMEOUT`,
 /// `transport/streamable_http_client.rs:35`) and a stdio child's exit under its 3 s before the kill
-/// (`MAX_WAIT_ON_DROP_SECS`, `transport/child_process.rs:10`).
+/// ([`crate::stdio_child::MAX_WAIT_ON_DROP`], rmcp's `MAX_WAIT_ON_DROP_SECS`).
 const PREVIOUS_GENERATION_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(35);
 
 /// How many calls' still-connecting notes are kept at once (see `McpExtension::remember_note`).

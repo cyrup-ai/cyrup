@@ -2100,6 +2100,11 @@ while IFS= read -r line; do
         *'"name":"boom"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"it went wrong"}],"isError":true}}\n' "$id"
           ;;
+        *'"name":"deep"'*)
+          d=''; e=''; i=0
+          while [ "$i" -lt 197 ]; do d="$d["; e="$e]"; i=$((i+1)); done
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[],"structuredContent":{"v":%s1%s}}}\n' "$id" "$d" "$e"
+          ;;
         *'"name":"structured"'*)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[],"structuredContent":{"ok":true}}}\n' "$id"
           ;;
@@ -2511,6 +2516,32 @@ done
         // without the cancel.
         deadlines.prompt_closed("fixture");
         assert_eq!(deadlines.open_prompts("fixture"), 0);
+    }
+
+    /// MCP-630 on stdio: a `tools/call` reply nested 200 levels deep fails its call at once with
+    /// the refusal, under the 60 s default it used to run to — rmcp's line codec dropped the line and
+    /// the call ended `MCP request timed out after 60000 ms`.
+    #[tokio::test]
+    async fn a_reply_nested_past_what_cyrup_reads_fails_its_call_at_once() {
+        let (_attempt, _resource, peer) = live_peer().await;
+        let params = CallToolRequestParams::new("deep").with_arguments(JsonMap::new());
+        let started = Instant::now();
+        let failure = tokio::time::timeout(
+            Duration::from_secs(10),
+            request_on_peer(
+                &peer,
+                CallToolRequest::new(params).into(),
+                PeerRequestOptions::with_timeout(crate::runtime::DEFAULT_REQUEST_TIMEOUT),
+                &CancelToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("the call waited for a reply it had already been sent")
+        .expect_err("a refused reply fails its call");
+        assert_eq!(failure.message, crate::depth_guard::refusal_message(200));
+        assert_eq!(failure.protocol_code, Some(-32700));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     /// A cancelled call returns at its cancel even when the server has stopped reading.
@@ -3241,10 +3272,10 @@ done
             "the SDK default, named in the message: {}",
             text_of(&result.content)
         );
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() >= crate::runtime::DEFAULT_REQUEST_TIMEOUT,
-            "the minute really passed before the call gave up: {:?}",
-            started.elapsed()
+            elapsed >= Duration::from_secs(60) && elapsed < Duration::from_secs(61),
+            "the call gave up after {elapsed:?}, not at the SDK's 60 s"
         );
     }
 }

@@ -356,7 +356,7 @@ where
 /// silently drops those instead. That filter is also the closest analogue of upstream's
 /// `if (value !== undefined)` guard: a variable the child cannot be handed as a string is simply not
 /// in the record. A non-UTF-8 variable is unrepresentable in `StdioTransportSpec::env` regardless,
-/// since `TokioChildProcess` is handed `HashMap<String, String>`.
+/// since the child's `Command` is handed `HashMap<String, String>`.
 #[must_use]
 pub fn process_env_snapshot() -> HashMap<String, String> {
     std::env::vars_os()

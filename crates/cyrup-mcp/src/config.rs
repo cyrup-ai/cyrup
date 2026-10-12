@@ -1022,8 +1022,8 @@ pub struct ServerEntry {
     )]
     pub approve_tools: Option<ApproveTools>,
     /// `true` ⇒ the child's stderr is **inherited** (visible in the terminal); `false`/absent ⇒
-    /// piped. rmcp's `TokioChildProcessBuilder` defaults to `Stdio::inherit()`, so the port sets
-    /// `.stderr(Stdio::piped())` on the `false` arm rather than the other way round.
+    /// piped. rmcp's `TokioChildProcessBuilder` defaults to `Stdio::inherit()`, and so does its port
+    /// [`crate::stdio_child::StdioChild::spawn`], which pipes it on the `false` arm.
     #[serde(
         default,
         deserialize_with = "lenient",
