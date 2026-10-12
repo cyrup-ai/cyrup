@@ -670,48 +670,18 @@ impl<B: Backend> App<B> {
                 kind: SelectorKind::Login,
                 value,
             } => {
-                // `OAuthSelectorComponent`'s onSelect (`interactive-mode.ts:5106-5117`): re-find the
-                // chosen option and `startProviderLogin(providerOption)`. The value is the row INDEX
-                // (see `SelectorKind::Login`), which is what `(providerId, authType)` collapses to.
-                let Some(option) = value
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|i| self.state.login_options.get(i))
-                    .cloned()
-                else {
-                    // `if (!providerOption) return;` (`:5113-5115`).
-                    return;
-                };
-                self.begin_provider_login(session, option);
+                // `OAuthSelectorComponent`'s onSelect (`interactive-mode.ts:5106-5117`) →
+                // `startProviderLogin(providerOption, onBack)`; see `App::confirm_login_provider`.
+                self.confirm_login_provider(session, &value);
             }
 
             C::ConfirmSelection {
                 kind: SelectorKind::LoginAuthType,
                 value,
             } => {
-                // `showLoginAuthTypeSelector`'s onSelect (`interactive-mode.ts:5063-5073`): with a
-                // pinned provider, start ITS option of the chosen kind; otherwise open the provider
-                // picker filtered to that kind.
-                let auth_type = if value == AuthType::Oauth.as_str() {
-                    AuthType::Oauth
-                } else {
-                    AuthType::ApiKey
-                };
-                match self.state.login_auth_type_options.take() {
-                    Some(options) => {
-                        // `providerOptions.find(p => p.authType === authType)` (`:5066`).
-                        if let Some(option) =
-                            options.iter().find(|o| o.auth_type == auth_type).cloned()
-                        {
-                            self.begin_provider_login(session, option);
-                        }
-                    }
-                    // `this.showLoginProviderSelector(authType)` (`:5071`).
-                    None => {
-                        let inputs = self.login_provider_inputs(session).await;
-                        self.open_login_provider_selector(&inputs, Some(auth_type), None);
-                    }
-                }
+                // `showLoginAuthTypeSelector`'s onSelect (`interactive-mode.ts:5063-5073`), plus the
+                // TUI-144 Radius row; see `App::confirm_login_auth_type`.
+                self.confirm_login_auth_type(session, &value).await;
             }
 
             C::ConfirmSelection {

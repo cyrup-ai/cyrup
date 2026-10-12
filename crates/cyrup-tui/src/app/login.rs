@@ -302,11 +302,12 @@ impl<B: Backend> App<B> {
         let inputs = self.login_provider_inputs(session).await;
         let options = cyrup_config::login::login_provider_options(&inputs, None);
         match cyrup_config::login::resolve_login_command(arg.as_deref(), &options) {
-            // `startProviderLogin(providerOptions[0])` (`:5000-5003`).
-            LoginCommand::Start(option) => self.begin_provider_login(session, *option),
+            // `startProviderLogin(providerOptions[0])` (`:5000-5003`) — no `onBack`: a login
+            // started by name has no menu to return to.
+            LoginCommand::Start(option) => self.begin_provider_login(session, *option, None),
             // `showLoginAuthTypeSelector(providerOptions?)` (`:4997`, `:5010`).
             LoginCommand::AuthTypeSelector { options } => {
-                self.open_login_auth_type_selector(session, options)
+                self.open_login_auth_type_selector(session, &inputs, options)
             }
             // `showLoginProviderSelector(undefined, providerRef)` (`:5013`).
             LoginCommand::ProviderSelector {
@@ -316,11 +317,32 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// `showLoginAuthTypeSelector(providerOptions?)` (`interactive-mode.ts:5028-5051`), routed
-    /// through the ported [`cyrup_config::login::resolve_auth_type_selector`].
+    /// TUI-144 — pi's `radiusOption` (`interactive-mode.ts:5886-5889` @f1b2e77f5): "The top-level
+    /// selector offers Radius directly, as its last option." It is
+    /// `getLoginProviderOptions("oauth").find(p => p.id === RADIUS_PROVIDER_ID)` — the SAME option,
+    /// status included, that the OAuth provider picker would list for `radius`, so the menu's
+    /// status is whatever `/login`'s provider rows already report and is never spelled here.
+    fn radius_login_option(
+        &self,
+        inputs: &[ProviderLoginInput],
+    ) -> Option<cyrup_config::login::LoginProviderOption> {
+        let mut options =
+            cyrup_config::login::login_provider_options(inputs, Some(AuthType::Oauth));
+        self.apply_extension_oauth_subscription(&mut options);
+        options
+            .into_iter()
+            .find(|o| o.id.as_str() == cyrup_provider::RADIUS_PROVIDER_ID)
+    }
+
+    /// `showLoginAuthTypeSelector(providerOptions?)` (`interactive-mode.ts:5885-5960` @f1b2e77f5),
+    /// routed through the ported [`cyrup_config::login::resolve_auth_type_selector`].
+    ///
+    /// `inputs` are the registry reads the Radius row's status comes from; they are consulted only
+    /// for a bare `/login` (`providerOptions ? undefined : …`, `:5887-5889`).
     fn open_login_auth_type_selector(
         &mut self,
         session: &Arc<AgentSession>,
+        inputs: &[ProviderLoginInput],
         options: Option<Vec<LoginProviderOption>>,
     ) {
         match cyrup_config::login::resolve_auth_type_selector(options.as_deref()) {
@@ -330,10 +352,12 @@ impl<B: Backend> App<B> {
                     .transcript
                     .push_status(cyrup_config::login::NO_LOGIN_METHODS);
             }
-            // One provider, one method: the selector is skipped entirely (`:5049-5055`).
+            // One provider, one method: the selector is skipped entirely (`:5049-5055`), and the
+            // login starts with no `onBack` (`void this.startProviderLogin(providerOption)`, `:5914`).
             cyrup_config::login::AuthTypeSelector::Start(option) => {
                 self.state.login_auth_type_options = None;
-                self.begin_provider_login(session, *option);
+                self.state.login_radius_option = None;
+                self.begin_provider_login(session, *option, None);
             }
             cyrup_config::login::AuthTypeSelector::Choose {
                 title,
@@ -348,13 +372,137 @@ impl<B: Backend> App<B> {
                 if let Some(label) = api_key_label {
                     rows.push((AuthType::ApiKey.as_str().to_string(), label, None));
                 }
+                // TUI-144 — `if (radiusLabel) options.push(radiusLabel)` (`:5907`): LAST, and only
+                // on the bare top-level menu.
+                let radius = options
+                    .is_none()
+                    .then(|| self.radius_login_option(inputs))
+                    .flatten();
                 self.state.login_auth_type_options = options;
-                self.open_data_selector(SelectorKind::LoginAuthType, rows, 0);
+                match radius {
+                    Some(option) => {
+                        let radius = crate::radius_login_selector::RadiusOption {
+                            // `` `Sign in with ${radiusOption.name}` `` (`:5890`).
+                            text: format!("Sign in with {}", option.name),
+                            // `formatAuthSelectorProviderStatus(radiusOption)` (`:5891`).
+                            status: crate::auth_select::status_indicator_runs(&option),
+                        };
+                        rows.push((RADIUS_MENU_VALUE.to_string(), radius.label(), None));
+                        let list = crate::selector::ListSelector::data(
+                            SelectorKind::LoginAuthType,
+                            rows,
+                            0,
+                        )
+                        .with_upstream_chrome(
+                            SelectorKind::LoginAuthType,
+                            &self.state.select_keymap,
+                        );
+                        // `createLoginMenuSelector(…)` (`:5947-5955`).
+                        let menu = crate::radius_login_selector::RadiusLoginMenu::new(list, radius);
+                        self.state.login_radius_option = Some(option);
+                        self.open_boxed_selector(SelectorKind::LoginAuthType, Box::new(menu));
+                    }
+                    // `new ExtensionSelectorComponent(title, options, onSelect, onCancel)` (`:5956`).
+                    None => {
+                        self.state.login_radius_option = None;
+                        self.open_data_selector(SelectorKind::LoginAuthType, rows, 0);
+                    }
+                }
                 if let Some(active) = self.state.selector.as_mut() {
                     active.inner.set_title(title);
                 }
             }
         }
+    }
+
+    /// `showLoginAuthTypeSelector`'s `onSelect` (`interactive-mode.ts:5926-5940` @f1b2e77f5),
+    /// for the value the menu confirmed with.
+    ///
+    /// * the Radius row → `startProviderLogin(radiusOption, () => this.showLoginAuthTypeSelector())`
+    ///   (`:5928-5930`): the login, whose cancel comes back to this top-level menu;
+    /// * a method with a pinned provider → that provider's option of the kind, whose cancel comes
+    ///   back to the same pinned chooser (`:5933-5936`);
+    /// * a method on the bare menu → the provider picker filtered to it (`:5939`).
+    pub(crate) async fn confirm_login_auth_type(
+        &mut self,
+        session: &Arc<AgentSession>,
+        value: &str,
+    ) {
+        let radius = self.state.login_radius_option.take();
+        if value == RADIUS_MENU_VALUE {
+            self.state.login_auth_type_options = None;
+            if let Some(option) = radius {
+                self.begin_provider_login(session, option, Some(LoginBack::Menu));
+            }
+            return;
+        }
+        let auth_type = if value == AuthType::Oauth.as_str() {
+            AuthType::Oauth
+        } else {
+            AuthType::ApiKey
+        };
+        match self.state.login_auth_type_options.take() {
+            Some(options) => {
+                // `providerOptions.find(p => p.authType === authType)` (`:5934`).
+                if let Some(option) = options.iter().find(|o| o.auth_type == auth_type).cloned() {
+                    self.begin_provider_login(session, option, Some(LoginBack::AuthType(options)));
+                }
+            }
+            // `this.showLoginProviderSelector(authType)` (`:5939`).
+            None => {
+                let inputs = self.login_provider_inputs(session).await;
+                self.open_login_provider_selector(&inputs, Some(auth_type), None);
+            }
+        }
+    }
+
+    /// `OAuthSelectorComponent`'s `onSelect` inside `showLoginProviderSelector`
+    /// (`interactive-mode.ts:5975-5987` @f1b2e77f5): re-find the chosen option and
+    /// `startProviderLogin(providerOption, () => this.showLoginProviderSelector(authType,
+    /// initialSearchInput))`. The value is the row INDEX (see `SelectorKind::Login`), which is what
+    /// `(providerId, authType)` collapses to.
+    pub(crate) fn confirm_login_provider(&mut self, session: &Arc<AgentSession>, value: &str) {
+        let args = self.state.login_picker_args.take();
+        let Some(option) = value
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| self.state.login_options.get(i))
+            .cloned()
+        else {
+            // `if (!providerOption) return;` (`:5981-5983`).
+            return;
+        };
+        let back = args.map(|(auth_type, initial_search)| LoginBack::Providers {
+            auth_type,
+            initial_search,
+        });
+        self.begin_provider_login(session, option, back);
+    }
+
+    /// pi's `onBack` (`interactive-mode.ts:5874`: "`onBack` reopens the selector the login was
+    /// started from when the user cancels it"), run once a cancelled login has unwound.
+    ///
+    /// Reopens nothing when something else already holds the input slot: a dialog an extension
+    /// raised while the login ran must not be replaced by a menu the user did not ask for.
+    async fn return_to_login_menu(&mut self, session: &Arc<AgentSession>, back: LoginBack) {
+        if self.state.selector.is_some() {
+            return;
+        }
+        let inputs = self.login_provider_inputs(session).await;
+        match back {
+            // `() => this.showLoginAuthTypeSelector()` (`:5929`).
+            LoginBack::Menu => self.open_login_auth_type_selector(session, &inputs, None),
+            // `() => this.showLoginAuthTypeSelector(providerOptions)` (`:5935`).
+            LoginBack::AuthType(options) => {
+                self.open_login_auth_type_selector(session, &inputs, Some(options))
+            }
+            // `() => this.showLoginProviderSelector(authType, initialSearchInput)` (`:5985`).
+            LoginBack::Providers {
+                auth_type,
+                initial_search,
+            } => self.open_login_provider_selector(&inputs, auth_type, initial_search),
+        }
+        self.frames.request();
     }
 
     /// `showLoginProviderSelector(authType?, initialSearchInput?)`
@@ -378,6 +526,7 @@ impl<B: Backend> App<B> {
         // filter, coloured status runs — in place of the bare `ListSelector`. `initialSearchInput`
         // (`:5124`) now lands where upstream puts it: seeded into the search box (`:99`), not
         // reported as a status line.
+        self.state.login_picker_args = Some((auth_type, initial_search.clone()));
         let selector = crate::OAuthSelector::new(crate::OAuthMode::Login, &options, initial_search);
         self.state.login_options = options;
         self.open_boxed_selector(SelectorKind::Login, Box::new(selector));
@@ -391,11 +540,18 @@ impl<B: Backend> App<B> {
     /// `showLoginDialog` / `showApiKeyLoginDialog` only because of two cosmetic differences — the
     /// amazon-bedrock `showDetails` block (`:5266-5272`; that provider is unported, see
     /// `providers/all.rs`) and the failure-message wording, which [`LoginFinished::oauth`] carries.
+    ///
+    /// `back` is pi's `onBack` (`startProviderLogin(providerOption, onBack?)`,
+    /// `interactive-mode.ts:5874-5882` @f1b2e77f5): the menu a cancel of THIS login returns to, or
+    /// `None` for a login started with none.
     pub(crate) fn begin_provider_login(
         &mut self,
         session: &Arc<AgentSession>,
         option: LoginProviderOption,
+        back: Option<LoginBack>,
     ) {
+        self.state.login_back = back;
+        self.state.login_back_requested = None;
         match cyrup_config::login::start_provider_login(&option) {
             // `showAmbientAuthDialog(providerOption)` (`:5023`, `:5229-5250`): a dialog with a
             // single info line and a close hint. Nothing to run, so no task is spawned.
@@ -543,6 +699,14 @@ impl<B: Backend> App<B> {
                 }
             }
             LoginUiMsg::Finished(finished) => self.finish_login(session, *finished).await,
+            // TUI-144 — the flow-less (ambient) dialog was cancelled: pi's `restoreEditor();
+            // onBack?.()` (`interactive-mode.ts:6172-6176` @f1b2e77f5), deferred to here because the
+            // cancel arm closes the slot only AFTER [`Self::cancel_login`] returns.
+            LoginUiMsg::Back => {
+                if let Some(back) = self.state.login_back_requested.take() {
+                    self.return_to_login_menu(session, back).await;
+                }
+            }
         }
     }
 
@@ -561,6 +725,10 @@ impl<B: Backend> App<B> {
         }
         self.state.login_cancel = None;
         self.state.login_provider_name = None;
+        // TUI-144 — `onBack` is consumed by every settle; only a cancel the user asked for
+        // ([`Self::cancel_login`] moved it to `login_back_requested`) acts on it.
+        self.state.login_back = None;
+        let back = self.state.login_back_requested.take();
         let name = &finished.provider_name;
         match &finished.result {
             Ok(()) => {
@@ -631,8 +799,14 @@ impl<B: Backend> App<B> {
                     previous_model,
                 );
             }
-            // `if (errorMsg !== "Login cancelled")` (`:5294`, `:5401`) — a cancel is silent.
-            Err(_) if finished.cancelled => {}
+            // `} else if (errorMsg === "Login cancelled") { onBack?.(); }` (`interactive-mode.ts:6365-6366`,
+            // `:6235-6236` @f1b2e77f5) — a cancel prints nothing and returns to the menu the login
+            // was started from (TUI-144); with no `onBack` it simply leaves the editor.
+            Err(_) if finished.cancelled => {
+                if let Some(back) = back {
+                    self.return_to_login_menu(session, back).await;
+                }
+            }
             Err(message) => {
                 let banner = if finished.oauth {
                     format!("Failed to login to {name}: {message}")
@@ -646,13 +820,27 @@ impl<B: Backend> App<B> {
 
     /// `dialog.cancel()` (`login-dialog.ts:82-88`): abort the flow's signal AND reject the prompt it
     /// is blocked on with `"Login cancelled"`. Called from the selector `Cancel` arm.
+    ///
+    /// TUI-144 — this is the USER's cancel, so it is what arms pi's `onBack`: the settle half
+    /// ([`Self::finish_login`]) returns to the menu only when this ran. A dialog with no flow
+    /// behind it (the ambient "configured outside cyrup" notice) has no settle to wait for, so its
+    /// `onBack` is posted straight onto the login channel ([`LoginUiMsg::Back`]) — after this
+    /// returns, the cancel arm closes the slot, and only then may the menu reopen in it.
     pub(crate) fn cancel_login(&mut self) {
         if let Some(reply) = self.state.pending_login_prompt.take() {
             let _ = reply.send(Err(OAuthError::Cancelled));
         }
         self.state.login_provider_name = None;
-        if let Some(cancel) = self.state.login_cancel.take() {
-            cancel.cancel();
+        self.state.login_back_requested = self.state.login_back.take();
+        match self.state.login_cancel.take() {
+            Some(cancel) => cancel.cancel(),
+            None => {
+                if self.state.login_back_requested.is_some()
+                    && let Some(tx) = self.login_tx.as_ref()
+                {
+                    let _ = tx.send(LoginUiMsg::Back);
+                }
+            }
         }
     }
 }
@@ -895,6 +1083,31 @@ impl<B: Backend> App<B> {
         self.refresh_subscription_marker();
         self.frames.request();
     }
+}
+
+/// TUI-144 — the value the top-level `/login` menu's "Sign in with Radius" row confirms with. pi
+/// compares the confirmed LABEL (`option === radiusLabel`, `interactive-mode.ts:5928`); cyrup's
+/// rows carry a separate value column, and this one cannot collide with the two method values
+/// (`"oauth"`, `"api_key"`).
+pub(crate) const RADIUS_MENU_VALUE: &str = "radius";
+
+/// TUI-144 — pi's `onBack` closure, as data: the `/login` menu a cancelled login returns to
+/// (`interactive-mode.ts:5874` "`onBack` reopens the selector the login was started from when the
+/// user cancels it").
+#[derive(Clone, Debug)]
+pub(crate) enum LoginBack {
+    /// The bare top-level menu — `() => this.showLoginAuthTypeSelector()` (`:5929`), where the
+    /// Radius row starts its login.
+    Menu,
+    /// A pinned provider's method chooser — `() => this.showLoginAuthTypeSelector(providerOptions)`
+    /// (`:5935`).
+    AuthType(Vec<LoginProviderOption>),
+    /// The provider picker — `() => this.showLoginProviderSelector(authType, initialSearchInput)`
+    /// (`:5985`).
+    Providers {
+        auth_type: Option<AuthType>,
+        initial_search: Option<String>,
+    },
 }
 
 /// `"llama.cpp"` — matches `LLAMA_PROVIDER_ID` from `extensions/llama/provider.ts`, kept inline to

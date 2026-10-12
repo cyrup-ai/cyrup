@@ -786,6 +786,18 @@ pub trait Selector: Send {
     fn handle_paste(&mut self, _text: &str) -> SelectorOutcome {
         SelectorOutcome::Ignored
     }
+    /// The redraw period this selector needs RIGHT NOW to animate, or `None` (the default) when
+    /// nothing it drew last frame moves with time.
+    ///
+    /// TUI-144. pi gives an animating component its own `setInterval` that calls
+    /// `tui.requestRender()` (`radius-login-selector.ts:68-71` @f1b2e77f5). cyrup has ONE animation
+    /// clock — the run loop's spinner tick — so a selector instead reports the period it wants and
+    /// the loop arms that tick from it ([`crate::app::App::animation_period`]). Because the answer
+    /// is read from whatever occupies the slot, closing the selector by ANY path stops the
+    /// animation: there is no timer of its own to leak.
+    fn animation_frame(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// A full-width `─` rule [`Line`] in an arbitrary `style` — the primitive behind [`border_rule`] and

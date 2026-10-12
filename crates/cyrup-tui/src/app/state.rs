@@ -470,6 +470,22 @@ pub struct AppState {
     /// provider picker filtered to it, `:5063-5070`); `Some` when `/login <provider>` already
     /// pinned one provider that offers both methods (`:4998-5009`).
     pub(super) login_auth_type_options: Option<Vec<cyrup_config::login::LoginProviderOption>>,
+    /// TUI-144 — the Radius option the open top-level `/login` menu offers as its last row
+    /// (pi's `radiusOption`, `interactive-mode.ts:5887-5889` @f1b2e77f5). `None` when the menu
+    /// carries no Radius row (a pinned provider's method choice, or no `radius` provider).
+    pub(super) login_radius_option: Option<cyrup_config::login::LoginProviderOption>,
+    /// TUI-144 — the `(authType, initialSearchInput)` the open `/login` provider picker was built
+    /// from: what pi's `onBack` closure re-calls `showLoginProviderSelector` with
+    /// (`interactive-mode.ts:5967-5969`).
+    pub(super) login_picker_args: Option<(Option<AuthType>, Option<String>)>,
+    /// TUI-144 — pi's `onBack` for the login currently running: the menu a CANCEL of it returns
+    /// to (`startProviderLogin(option, onBack)`, `interactive-mode.ts:5874-5882`). `None` for a
+    /// login started straight from `/login <provider>`, which pi starts with no `onBack`.
+    pub(super) login_back: Option<super::login::LoginBack>,
+    /// TUI-144 — [`Self::login_back`] once the USER cancelled the dialog ([`App::cancel_login`]).
+    /// The settle half consumes it: only a cancel the user asked for walks back to the menu, never
+    /// a flow that unwound because its dialog was torn down underneath it (a session swap).
+    pub(super) login_back_requested: Option<super::login::LoginBack>,
     /// The REPLY half of the login prompt the flow is currently blocked on — the login twin of
     /// [`Self::pending_ui_reply`]. The spawned login task's `AuthInteraction::prompt` awaits this
     /// one-shot (`login_dialog::TuiAuthInteraction::prompt`, Pi's `inputResolver`/`inputRejecter`
@@ -695,6 +711,10 @@ impl AppState {
             login_options: Vec::new(),
             logout_options: Vec::new(),
             login_auth_type_options: None,
+            login_radius_option: None,
+            login_picker_args: None,
+            login_back: None,
+            login_back_requested: None,
             pending_login_prompt: None,
             login_cancel: None,
             login_provider_name: None,

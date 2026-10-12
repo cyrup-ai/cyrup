@@ -255,6 +255,17 @@ impl App<InlineBackend<TuiStdout>> {
                 }
                 self.draw_synchronized()?;
             }
+            // TUI-144 — the animation tick's period follows what is on screen: a selector that
+            // animates (the `/login` menu's Radius shimmer, 50 ms) shortens it, and closing that
+            // selector by any path puts it back. Checked after the frame because a selector learns
+            // whether it animates while it renders (pi's `animating`, set in `render`). Same
+            // re-arm the `SetWorkingIndicator` and session-swap arms do; a no-op on every other
+            // iteration.
+            if ctx.spinner.period() != self.animation_period() {
+                ctx.spinner = tokio::time::interval(self.animation_period());
+                ctx.spinner
+                    .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            }
             let theme_changed = async {
                 match theme_rx.as_mut() {
                     Some(rx) => rx.changed().await.is_ok(),
@@ -422,10 +433,15 @@ impl App<InlineBackend<TuiStdout>> {
                 // this clause the handler is never reached with only a loader up and
                 // `state.loader_tick` — the phase index `render.rs` feeds the loader — stays on
                 // frame 0 for the whole upload.
+                //
+                // TUI-144 — the fourth: a selector that animates (`Selector::animation_frame`, the
+                // `/login` menu's Radius shimmer). It is read from the slot, so the arm disarms on
+                // the iteration after the menu closes, by whatever path it closed.
                 _ = ctx.spinner.tick(),
                     if self.state.indicator.is_active()
                         || self.state.transcript.bash_running()
-                        || self.state.loader.is_some() =>
+                        || self.state.loader.is_some()
+                        || self.selector_animation_frame().is_some() =>
                 {
                     self.on_spinner_tick()?
                 }
