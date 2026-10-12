@@ -127,6 +127,21 @@ impl ScopedSignal {
         let token = combine(owner, Some(&scope));
         Self { token, scope }
     }
+
+    /// [`Self::new`] when there is a caller's token, else the owner's token alone — upstream's
+    /// single-signal arm of `combineAbortSignals`, which spawns nothing, so there is nothing to
+    /// reap. The scope is then a fresh token nothing else holds, and cancelling it on drop reaches
+    /// no one.
+    #[must_use]
+    pub fn optional(owner: &CancelToken, caller: Option<&CancelToken>) -> Self {
+        match caller {
+            Some(caller) => Self::new(owner, caller),
+            None => Self {
+                token: owner.clone(),
+                scope: CancelToken::new(),
+            },
+        }
+    }
 }
 
 impl std::ops::Deref for ScopedSignal {
