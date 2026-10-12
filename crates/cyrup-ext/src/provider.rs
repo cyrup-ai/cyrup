@@ -14,8 +14,9 @@
 //! export and a `cyrup-ext-sdk` wrapper. **None of the five has a production caller** (workspace
 //! grep at HEAD: only `crates/cyrup-it/tests/ext/{wasm_provider,ergonomic}.rs`). The one consumer
 //! of a registration is `cyrup_session_svc::GuestProviderRegistry::upsert_provider`, which calls
-//! [`ProviderRegistration::build_provider`] and gets a `ConfigProvider` over `baseUrl` with the
-//! api-key string resolved ONCE at registration time.
+//! [`ProviderRegistration::build_provider`] (a fresh id: a `ConfigProvider` over `baseUrl`) or
+//! [`ProviderRegistration::compose_over`] (an id a base owns, PROV-162), with the api-key string
+//! resolved ONCE at registration time.
 //!
 //! So a guest-registered provider is selectable and streamable, but statically: its login flow
 //! never runs, an expired token is never refreshed, `getApiKey` never resolves a per-request key,
@@ -56,8 +57,12 @@ pub struct ProviderConfig {
     pub auth_header: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
-    #[serde(default)]
-    pub models: Vec<ProviderModelConfig>,
+    /// The registration's model definitions (pi `models?: ProviderModelConfig[]`,
+    /// `core/provider-composer.ts:106` @f1b2e77f5). ABSENT and EMPTY differ, as upstream: composed
+    /// over a built-in id, `None` keeps the built-in's models with only `baseUrl` replaced and
+    /// `Some(vec![])` lists nothing (`applyExtension`, `:347-350`). PROV-162.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<ProviderModelConfig>>,
     /// OAuth metadata (`{name, isSubscription?}`): a static marker that this provider
     /// authenticates via OAuth. The dynamic callbacks (login/refreshToken/getApiKey/modifyModels)
     /// are guest closures invoked via the `provider-*` exports
@@ -258,21 +263,18 @@ impl ProviderRegistration {
         self.config.has_stream_simple
     }
 
-    /// Realize this registration as a concrete [`cyrup_provider::Provider`]: a
-    /// [`cyrup_provider::ConfigProvider`] over the parsed model catalog + the resolved api key. At
-    /// f1b2e77f5 pi's `ModelRuntime.registerProvider` stores the registration and recomposes the id
-    /// through `composeModelProvider` (`core/model-runtime.ts:921-933`), whose base-less provider
-    /// streams through the process-wide api registry (`provider-composer.ts:583-603`); the
-    /// `ConfigProvider` declares that dispatch (PROV-157). The model registry (arch-08 §5.6) installs
-    /// the returned provider so a guest `registerProvider` model becomes selectable AND streamable in
-    /// the assembled run.
+    /// Realize a registration under an id NO base owns as a concrete
+    /// [`cyrup_provider::Provider`]: a [`cyrup_provider::ConfigProvider`] over the parsed model
+    /// catalog + the resolved api key. At f1b2e77f5 pi's `ModelRuntime.registerProvider` stores the
+    /// registration and recomposes the id through `composeModelProvider`
+    /// (`core/model-runtime.ts:921-933`), whose base-less provider streams through the process-wide
+    /// api registry (`provider-composer.ts:583-603`); the `ConfigProvider` declares that dispatch
+    /// (PROV-157). A registration over an id a base DOES own is [`Self::compose_over`] (PROV-162).
     ///
     /// Per-model wire fields are folded as pi's `extensionModelFromDefinition` does
     /// (`provider-composer.ts:275-298` @f1b2e77f5, reached through `applyExtension` `:341-351`):
     /// `api = definition.api ?? config.api` (`:283`), `baseUrl = definition.baseUrl ?? config.baseUrl`
-    /// (`:289`). pi's third fallback, a matching row of the base (`?? defaults?.api`,
-    /// `findExtensionModelDefaults`), needs the base a registration is composed over, which cyrup
-    /// does not have (PROV-162).
+    /// (`:289`); with no base there is no `defaults` row for the third fallback.
     ///
     /// `[CYRUP-DELTA, intentional]` A model that resolves no `api` or `baseUrl` is skipped, where pi
     /// throws (`:284-288`, `:290`) and so rejects the whole registration; and an absent
@@ -299,91 +301,246 @@ impl ProviderRegistration {
         .into_arc()
     }
 
-    /// Parse this registration's model catalog into concrete [`cyrup_provider::Model`]s (pi
-    /// `extensionModelFromDefinition`, `provider-composer.ts:275-298` @f1b2e77f5). Open-shaped fields (`thinkingLevelMap`, `compat`) are deserialized
-    /// from their carried JSON; a malformed block is dropped (never a panic) rather than failing the
-    /// whole registration.
+    /// Compose this registration over `base`, the provider a built-in (or native extension) already
+    /// registers under the id — pi's `composeProvider` (`core/model-runtime.ts:301-310`
+    /// @f1b2e77f5) handing `composeModelProvider` the registration as its `extension` layer. The
+    /// composition is the ONE composer, [`cyrup_provider::compose::compose_over_base`], so the
+    /// result keeps the base's auth layers (a stored credential, then this registration's key,
+    /// then the base's own ambient resolution), its name and `baseUrl` where the registration sets
+    /// none, and streams a model whose api the base lists through the base. The catalog is pi's
+    /// `applyExtension` (`provider-composer.ts:341-351`, see [`Self::models_over`]).
+    ///
+    /// `store` and `auth_context` are the session's own (pi's `ModelRuntime` `credentials` and
+    /// `authContext`): a credential stored under the id still owns it.
+    ///
+    /// # Errors
+    ///
+    /// pi's `Provider <id>: no authentication method configured.` when neither the base nor the
+    /// registration has a way to authenticate.
+    pub fn compose_over(
+        &self,
+        base: Arc<dyn cyrup_provider::Provider>,
+        store: Arc<dyn cyrup_provider::CredentialStore>,
+        auth_context: Option<Arc<dyn cyrup_provider::AuthContext>>,
+    ) -> Result<Arc<dyn cyrup_provider::Provider>, String> {
+        use cyrup_provider::AnyModel;
+        use cyrup_provider::compose::{AuthLayer, LiteralValues, ProviderLayer};
+
+        let base_url = self.config.base_url.clone();
+        let (models, image_models, classifier_models) = match &self.config.models {
+            // `if (!config.models) return config.baseUrl ? models.map((model) => ({ ...model,
+            // baseUrl: config.baseUrl! })) : [...models]` (`:347-348`) — every type.
+            None => {
+                let mut chat = Vec::new();
+                let mut images = Vec::new();
+                let mut classifiers = Vec::new();
+                for row in base.get_all_models() {
+                    match row {
+                        AnyModel::Chat(mut m) => {
+                            if let Some(url) = &base_url {
+                                m.base_url = url.clone();
+                            }
+                            chat.push(m);
+                        }
+                        AnyModel::Image(mut m) => {
+                            if let Some(url) = &base_url {
+                                m.base_url = url.clone();
+                            }
+                            images.push(m);
+                        }
+                        AnyModel::Classifier(mut m) => {
+                            if let Some(url) = &base_url {
+                                m.base_url = url.clone();
+                            }
+                            classifiers.push(m);
+                        }
+                    }
+                }
+                (chat, images, classifiers)
+            }
+            // `return config.models.map((definition) => extensionModelFromDefinition(...))`
+            // (`:350`): the definitions REPLACE the catalog (an empty list is an empty catalog).
+            Some(_) => (self.models_over(base.models()), Vec::new(), Vec::new()),
+        };
+
+        // The registration's auth inputs (pi `configuredApiKey`/`configuredHeaders`/`authHeader`/
+        // `rawModelHeaders`, `provider-composer.ts:388-401`, `:429`, `:508-527`). The key was
+        // resolved at registration ([`resolve_api_key`]), so it rides through as a literal.
+        let mut auth = AuthLayer::new(Arc::new(LiteralValues));
+        auth.api_key = self.resolved_api_key.clone().filter(|k| !k.is_empty());
+        if !self.config.headers.is_empty() {
+            auth.headers = Some(
+                self.config
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            );
+        }
+        for definition in self.config.models.iter().flatten() {
+            if !definition.headers.is_empty() {
+                auth.model_headers.insert(
+                    definition.id.clone(),
+                    definition
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                );
+            }
+        }
+        auth.auth_header = self.config.auth_header.unwrap_or(false);
+
+        let layer = ProviderLayer {
+            // `name: extension?.name ?? … ?? base?.name` (`:607`): an unnamed registration keeps
+            // the base's display name.
+            name: (!self.config.name.is_empty()).then(|| self.config.name.clone()),
+            base_url,
+            models,
+            image_models,
+            classifier_models,
+            auth,
+        };
+        let provider = cyrup_provider::compose::compose_over_base(
+            &self.id,
+            Some(base),
+            layer,
+            store,
+            Arc::new(cyrup_provider::builtin_registry()),
+            auth_context,
+        )?;
+        Ok(Arc::new(provider))
+    }
+
+    /// Parse this registration's model catalog into concrete [`cyrup_provider::Model`]s with no
+    /// base (pi `extensionModelFromDefinition`, `provider-composer.ts:275-298` @f1b2e77f5).
+    /// Open-shaped fields (`thinkingLevelMap`, `compat`) are deserialized from their carried JSON; a
+    /// malformed block is dropped (never a panic) rather than failing the whole registration.
     pub fn build_models(&self) -> Vec<cyrup_provider::Model> {
+        self.config
+            .models
+            .iter()
+            .flatten()
+            .filter_map(|m| self.model_from_definition(m, None, true))
+            .collect()
+    }
+
+    /// pi `applyExtension`'s definition arm over a base's chat catalog `base`
+    /// (`provider-composer.ts:350`): each definition becomes a model, its gaps filled from the base
+    /// row `findExtensionModelDefaults` picks (`:261-273`) — `api = definition.api ?? config.api ??
+    /// defaults?.api` (`:283`), `baseUrl = definition.baseUrl ?? config.baseUrl ?? defaults?.baseUrl`
+    /// (`:289`). Per-model headers are NOT on the row (pi `headers: undefined`, `:297`); the composed
+    /// auth applies them per request.
+    pub fn models_over(&self, base: &[cyrup_provider::Model]) -> Vec<cyrup_provider::Model> {
+        self.config
+            .models
+            .iter()
+            .flatten()
+            .filter_map(|m| {
+                let defaults = cyrup_provider::compose::find_extension_model_defaults(
+                    base,
+                    &m.id,
+                    m.api.as_deref(),
+                );
+                self.model_from_definition(m, defaults, false)
+            })
+            .collect()
+    }
+
+    /// One definition → one model (pi `extensionModelFromDefinition`). `defaults` is the base row
+    /// that fills `api` and `baseUrl`; `row_headers` keeps the registration's headers ON the row
+    /// (the base-less [`cyrup_provider::ConfigProvider`] path, whose auth does not carry them).
+    fn model_from_definition(
+        &self,
+        m: &ProviderModelConfig,
+        defaults: Option<&cyrup_provider::Model>,
+        row_headers: bool,
+    ) -> Option<cyrup_provider::Model> {
         use cyrup_provider::{Modality, Model, ModelCost};
 
-        let mut out: Vec<Model> = Vec::with_capacity(self.config.models.len());
-        for m in &self.config.models {
-            // `api = definition.api ?? config.api` (pi `provider-composer.ts:283`); required.
-            let Some(api) = m.api.clone().or_else(|| self.config.api.clone()) else {
-                continue;
-            };
-            // `baseUrl = definition.baseUrl ?? config.baseUrl` (`:289`); required.
-            let Some(base_url) = m.base_url.clone().or_else(|| self.config.base_url.clone()) else {
-                continue;
-            };
-            let input: Vec<Modality> = if m.input.is_empty() {
-                vec![Modality::Text]
-            } else {
-                m.input
-                    .iter()
-                    .filter_map(|s| match s.as_str() {
-                        "image" => Some(Modality::Image),
-                        "text" => Some(Modality::Text),
-                        _ => None,
-                    })
-                    .collect()
-            };
-            let thinking_level_map = m
-                .thinking_level_map
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
-            let compat = m
-                .compat
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
-            let headers = Self::merge_headers(&self.config.headers, &m.headers);
+        // `api = definition.api ?? config.api ?? defaults?.api` (pi `provider-composer.ts:283`);
+        // required.
+        let api = m
+            .api
+            .clone()
+            .or_else(|| self.config.api.clone())
+            .or_else(|| defaults.map(|d| d.api.as_str().to_string()))?;
+        // `baseUrl = definition.baseUrl ?? config.baseUrl ?? defaults?.baseUrl` (`:289`); required.
+        let base_url = m
+            .base_url
+            .clone()
+            .or_else(|| self.config.base_url.clone())
+            .or_else(|| defaults.map(|d| d.base_url.clone()))?;
+        let input: Vec<Modality> = if m.input.is_empty() {
+            vec![Modality::Text]
+        } else {
+            m.input
+                .iter()
+                .filter_map(|s| match s.as_str() {
+                    "image" => Some(Modality::Image),
+                    "text" => Some(Modality::Text),
+                    _ => None,
+                })
+                .collect()
+        };
+        let thinking_level_map = m
+            .thinking_level_map
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let compat = m
+            .compat
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let headers = if row_headers {
+            Self::merge_headers(&self.config.headers, &m.headers)
+        } else {
+            None
+        };
 
-            out.push(Model {
-                id: m.id.as_str().into(),
-                name: m.name.clone().unwrap_or_else(|| m.id.clone()),
-                api: api.into(),
-                provider: self.id.as_str().into(),
-                base_url,
-                reasoning: m.reasoning,
-                input,
-                input_limits: m.input_limits.clone(),
-                cost: ModelCost {
-                    input: m.cost.input,
-                    output: m.cost.output,
-                    cache_read: m.cost.cache_read,
-                    cache_write: m.cost.cache_write,
-                    tiers: m.cost.tiers.as_ref().map(|tiers| {
-                        tiers
-                            .iter()
-                            .map(|t| cyrup_provider::ModelCostTier {
-                                input_tokens_above: t.input_tokens_above,
-                                input: t.input,
-                                output: t.output,
-                                cache_read: t.cache_read,
-                                cache_write: t.cache_write,
-                            })
-                            .collect()
-                    }),
-                },
-                // `[CYRUP-DELTA, intentional]` (see `build_provider`): pi's extension type requires
-                // both; an absent value takes the `models.json` defaults (`:242-243`).
-                context_window: m.context_window.unwrap_or(128_000),
-                max_tokens: m.max_tokens.unwrap_or(16_384),
-                // AGENT-026 / CFG-104 — pi's `extensionModelFromDefinition` spreads the whole
-                // definition onto the model (`{ ...definition, api, provider, baseUrl, headers:
-                // undefined }`, `core/provider-composer.ts:297` @f1b2e77f5), so both sampling keys
-                // reach `Model` unchanged; `resolve_sampling_params` merges them per request.
-                sampling_params: cyrup_provider::ModelSamplingParams::new(
-                    m.sampling_params.clone(),
-                    m.sampling_params_by_thinking_level.clone(),
-                ),
-                prompt_cache: m.prompt_cache.clone(),
-                thinking_level_map,
-                compat,
-                headers,
-            });
-        }
-        out
+        Some(Model {
+            id: m.id.as_str().into(),
+            name: m.name.clone().unwrap_or_else(|| m.id.clone()),
+            api: api.into(),
+            provider: self.id.as_str().into(),
+            base_url,
+            reasoning: m.reasoning,
+            input,
+            input_limits: m.input_limits.clone(),
+            cost: ModelCost {
+                input: m.cost.input,
+                output: m.cost.output,
+                cache_read: m.cost.cache_read,
+                cache_write: m.cost.cache_write,
+                tiers: m.cost.tiers.as_ref().map(|tiers| {
+                    tiers
+                        .iter()
+                        .map(|t| cyrup_provider::ModelCostTier {
+                            input_tokens_above: t.input_tokens_above,
+                            input: t.input,
+                            output: t.output,
+                            cache_read: t.cache_read,
+                            cache_write: t.cache_write,
+                        })
+                        .collect()
+                }),
+            },
+            // `[CYRUP-DELTA, intentional]` (see `build_provider`): pi's extension type requires
+            // both; an absent value takes the `models.json` defaults (`:242-243`).
+            context_window: m.context_window.unwrap_or(128_000),
+            max_tokens: m.max_tokens.unwrap_or(16_384),
+            // AGENT-026 / CFG-104 — pi's `extensionModelFromDefinition` spreads the whole
+            // definition onto the model (`{ ...definition, api, provider, baseUrl, headers:
+            // undefined }`, `core/provider-composer.ts:297` @f1b2e77f5), so both sampling keys
+            // reach `Model` unchanged; `resolve_sampling_params` merges them per request.
+            sampling_params: cyrup_provider::ModelSamplingParams::new(
+                m.sampling_params.clone(),
+                m.sampling_params_by_thinking_level.clone(),
+            ),
+            prompt_cache: m.prompt_cache.clone(),
+            thinking_level_map,
+            compat,
+            headers,
+        })
     }
 
     /// Merge provider-level and per-model custom headers into a [`cyrup_provider::HeaderMap`] (per-model
@@ -537,11 +694,11 @@ impl ProviderHub {
     /// Register a provider from the guest's JSON config: parse → resolve api key → store, and either
     /// upsert into the bound sink or queue for the next [`Self::bind`] (Pi defer→bindCore).
     pub fn register(&mut self, id: String, config_json: &Value) -> Result<(), String> {
-        let mut config: ProviderConfig =
+        // An unnamed registration stays unnamed here: realized under a fresh id it displays as
+        // the id (`build_provider`), composed over a base it keeps the base's name (pi `name:
+        // extension?.name ?? … ?? base?.name`, `provider-composer.ts:607`; PROV-162).
+        let config: ProviderConfig =
             serde_json::from_value(config_json.clone()).map_err(|e| e.to_string())?;
-        if config.name.is_empty() {
-            config.name = id.clone();
-        }
         let resolved_api_key = resolve_api_key(config.api_key.as_deref())?;
         let reg = ProviderRegistration {
             id: id.clone(),

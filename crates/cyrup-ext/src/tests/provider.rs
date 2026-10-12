@@ -292,13 +292,13 @@ async fn sdk_provider_model_config_sampling_keys_reach_the_request() {
         api_key: Some("sk-x".into()),
         api: Some("openai-completions".into()),
         base_url: Some("http://127.0.0.1:9/v1".into()),
-        models: vec![cyrup_ext_sdk::ProviderModelConfig {
+        models: Some(vec![cyrup_ext_sdk::ProviderModelConfig {
             id: "acme-think".into(),
             reasoning: true,
             sampling_params: Some(sampling),
             sampling_params_by_thinking_level: Some(json!({"high": {"temperature": 0.6}})),
             ..Default::default()
-        }],
+        }]),
         auth_header: None,
         headers: std::collections::BTreeMap::new(),
         oauth: None,
@@ -307,9 +307,14 @@ async fn sdk_provider_model_config_sampling_keys_reach_the_request() {
     let wire = serde_json::to_value(&sdk_cfg).unwrap();
 
     let host: crate::provider::ProviderConfig = serde_json::from_value(wire.clone()).unwrap();
-    assert!(host.models[0].sampling_params.is_some(), "{wire}");
     assert!(
-        host.models[0].sampling_params_by_thinking_level.is_some(),
+        host.models.as_ref().unwrap()[0].sampling_params.is_some(),
+        "{wire}"
+    );
+    assert!(
+        host.models.as_ref().unwrap()[0]
+            .sampling_params_by_thinking_level
+            .is_some(),
         "{wire}"
     );
 
@@ -365,8 +370,9 @@ fn provider_hub_defers_until_bind_then_flushes() {
     let reg = hub.get("acme").expect("registration stored");
     assert_eq!(reg.resolved_api_key.as_deref(), Some("sk-x"));
     assert_eq!(reg.config.api.as_deref(), Some("openai"));
-    assert_eq!(reg.config.models.len(), 1);
-    assert_eq!(reg.config.models[0].id, "m1");
+    let models = reg.config.models.as_ref().expect("models present");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "m1");
 
     // Bind: the pending registration flushes into the sink (Pi bindCore).
     let sink = Arc::new(FakeSink::default());
@@ -465,4 +471,238 @@ fn a_registered_provider_answers_its_registrations_base_url() {
         .build_provider();
     assert_eq!(provider.base_url(), Some("http://127.0.0.1:9/v1"));
     assert_eq!(provider.name(), "Acme");
+}
+
+// ---- PROV-162: a registration over a built-in id composes over it --------------------------
+
+/// Register `config` under `id` through the hub (the guest path: parse, resolve the key) and hand
+/// back the stored registration.
+fn registration(id: &str, config: serde_json::Value) -> ProviderRegistration {
+    let mut hub = ProviderHub::new();
+    hub.register(id.to_string(), &config).unwrap();
+    hub.get(id).unwrap().clone()
+}
+
+fn composed_over(
+    reg: &ProviderRegistration,
+    base: Arc<dyn cyrup_provider::Provider>,
+) -> Arc<dyn cyrup_provider::Provider> {
+    reg.compose_over(
+        base,
+        Arc::new(cyrup_provider::InMemoryCredentialStore::new()),
+        None,
+    )
+    .expect("the base has auth")
+}
+
+/// PROV-162 behaviour 4 — `registerProvider("anthropic", { baseUrl })` with NO `models` keeps the
+/// built-in's models with only `baseUrl` replaced (pi `applyExtension`,
+/// `provider-composer.ts:347-348` @f1b2e77f5), and keeps its name.
+///
+/// RED at `360dc2bb`: no `compose_over` (does not compile); the guest path's `build_provider`
+/// listed ZERO models for this registration. Named mutation: `compose_over`'s `None` arm returning
+/// empty catalogs turns it red.
+#[test]
+fn a_registration_without_models_keeps_the_bases_models_with_only_its_base_url_replaced() {
+    let base: Arc<dyn cyrup_provider::Provider> = Arc::new(cyrup_provider::anthropic_provider());
+    let reg = registration("anthropic", json!({ "baseUrl": "http://proxy.test" }));
+    assert!(reg.config.models.is_none(), "no `models` key is no models");
+    let composed = composed_over(&reg, base.clone());
+
+    assert_eq!(composed.name(), "Anthropic");
+    assert_eq!(composed.base_url(), Some("http://proxy.test"));
+    let expected: Vec<cyrup_provider::Model> = base
+        .models()
+        .iter()
+        .cloned()
+        .map(|mut m| {
+            m.base_url = "http://proxy.test".to_string();
+            m
+        })
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(composed.models(), expected.as_slice());
+}
+
+/// PROV-162 behaviour 4, the other half — `models` PRESENT replaces the catalog, and an EMPTY list
+/// is an empty catalog (pi `:350`: `config.models.map(...)` over `[]`), which is why absent and
+/// empty must stay distinguishable across the seam, from the SDK's `ProviderConfig` through the
+/// host's.
+///
+/// RED at `360dc2bb`: both configs carried `models: Vec` (`#[serde(default)]`), so an absent key
+/// and `[]` parsed to the same value — the file does not compile there (`models` is not an
+/// `Option`). Named mutation: the host field back to `#[serde(default)] Vec` cannot express it; the
+/// SDK's `skip_serializing_if` dropped to `Vec::is_empty` collapses `Some([])` to absent and turns
+/// the SDK assertion red.
+#[test]
+fn absent_and_empty_models_stay_distinct_and_empty_lists_nothing() {
+    // The SDK side: absent is not serialized, an empty list is.
+    let mut sdk = cyrup_ext_sdk::ProviderConfig {
+        name: String::new(),
+        base_url: Some("http://proxy.test".into()),
+        api: None,
+        api_key: None,
+        auth_header: None,
+        headers: Default::default(),
+        models: None,
+        oauth: None,
+        has_stream_simple: false,
+    };
+    let absent = serde_json::to_value(&sdk).unwrap();
+    assert!(absent.get("models").is_none(), "{absent}");
+    sdk.models = Some(Vec::new());
+    let empty = serde_json::to_value(&sdk).unwrap();
+    assert_eq!(empty.get("models"), Some(&json!([])), "{empty}");
+
+    // The host side, through the hub.
+    let base: Arc<dyn cyrup_provider::Provider> = Arc::new(cyrup_provider::anthropic_provider());
+    let keep = registration("anthropic", absent);
+    assert!(keep.config.models.is_none());
+    assert!(!composed_over(&keep, base.clone()).models().is_empty());
+    let replace = registration("anthropic", empty);
+    assert_eq!(replace.config.models.as_ref().map(Vec::len), Some(0));
+    assert!(composed_over(&replace, base).models().is_empty());
+}
+
+fn base_row(id: &str, api: &str, base_url: &str) -> cyrup_provider::Model {
+    serde_json::from_value(json!({
+        "id": id,
+        "name": id,
+        "api": api,
+        "provider": "acme",
+        "baseUrl": base_url,
+        "reasoning": false,
+        "input": ["text"],
+        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+        "contextWindow": 32000,
+        "maxTokens": 4096
+    }))
+    .unwrap()
+}
+
+fn acme_base(rows: Vec<cyrup_provider::Model>) -> Arc<dyn cyrup_provider::Provider> {
+    Arc::new(cyrup_provider::wire::WireProvider::new(
+        "acme",
+        "Acme",
+        rows,
+        cyrup_provider::ProviderAuth::with_api_key(cyrup_provider::env_key(
+            "Acme API key",
+            ["ACME_API_KEY"],
+        )),
+        Arc::new(cyrup_provider::InMemoryCredentialStore::new()),
+        Arc::new(cyrup_provider::builtin_registry()),
+    ))
+}
+
+/// PROV-162 behaviour 3 — a model definition's gaps (`api`, `baseUrl`) are filled from the base's
+/// matching row, `findExtensionModelDefaults` (`provider-composer.ts:261-273` @f1b2e77f5): the
+/// same id, else the first row on the definition's own api, else the first `openai-completions`
+/// row, else the first row; `api = definition.api ?? config.api ?? defaults?.api` (`:283`),
+/// `baseUrl = definition.baseUrl ?? config.baseUrl ?? defaults?.baseUrl` (`:289`).
+///
+/// RED at `360dc2bb`: no base reached the registration, so every one of these definitions (no
+/// `api`/`baseUrl` of its own or at provider level) was skipped by `build_models` — the file does
+/// not compile there (no `compose_over`). Named mutation: `models_over` passing `None` for
+/// `defaults` turns it red.
+#[test]
+fn a_model_definition_fills_its_gaps_from_the_bases_matching_row() {
+    let base = acme_base(vec![
+        base_row("x-first", "x-wire", "https://x.example"),
+        base_row("oc", "openai-completions", "https://oc.example/v1"),
+        base_row("same-id", "y-wire", "https://y.example"),
+    ]);
+    let reg = registration(
+        "acme",
+        json!({
+            "models": [
+                { "id": "same-id" },
+                { "id": "by-api", "api": "x-wire" },
+                { "id": "by-completions" },
+                { "id": "own-url", "baseUrl": "https://own.example" },
+            ]
+        }),
+    );
+    let composed = composed_over(&reg, base);
+    let row = |id: &str| {
+        composed
+            .get_model(id)
+            .unwrap_or_else(|| panic!("{id} composed"))
+            .clone()
+    };
+    let same = row("same-id");
+    assert_eq!(
+        (same.api.as_str(), same.base_url.as_str()),
+        ("y-wire", "https://y.example")
+    );
+    let by_api = row("by-api");
+    assert_eq!(
+        (by_api.api.as_str(), by_api.base_url.as_str()),
+        ("x-wire", "https://x.example")
+    );
+    let by_oc = row("by-completions");
+    assert_eq!(
+        (by_oc.api.as_str(), by_oc.base_url.as_str()),
+        ("openai-completions", "https://oc.example/v1")
+    );
+    let own = row("own-url");
+    assert_eq!(
+        (own.api.as_str(), own.base_url.as_str()),
+        ("openai-completions", "https://own.example")
+    );
+    assert_eq!(
+        composed.models().len(),
+        4,
+        "the definitions replace the catalog"
+    );
+
+    // The last rung: no row on the api, no `openai-completions` row — the first row.
+    let base = acme_base(vec![
+        base_row("x-first", "x-wire", "https://x.example"),
+        base_row("y", "y-wire", "https://y.example"),
+    ]);
+    let reg = registration("acme", json!({ "models": [{ "id": "fallback" }] }));
+    let fallback = composed_over(&reg, base)
+        .get_model("fallback")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (fallback.api.as_str(), fallback.base_url.as_str()),
+        ("x-wire", "https://x.example")
+    );
+}
+
+/// GUARD (green at `360dc2bb`) — a registration under an id NO base owns is realized exactly as
+/// before: `build_provider`'s `ConfigProvider`, its key seeded, its rows built from the
+/// registration alone (a definition with no `api`/`baseUrl` anywhere is still skipped, the
+/// `[CYRUP-DELTA]` on `build_provider`).
+#[test]
+fn a_registration_under_an_unknown_id_builds_the_base_less_provider_as_before() {
+    let reg = registration(
+        "acme-fresh",
+        json!({
+            "name": "Acme Fresh",
+            "baseUrl": "https://fresh.example/v1",
+            "api": "openai-completions",
+            "apiKey": "sk-fresh",
+            "headers": { "x-team": "core" },
+            "models": [{ "id": "fresh-1" }, { "id": "fresh-2", "baseUrl": "https://two.example" }],
+        }),
+    );
+    let provider = reg.build_provider();
+    assert_eq!(provider.name(), "Acme Fresh");
+    assert_eq!(provider.base_url(), Some("https://fresh.example/v1"));
+    let ids: Vec<&str> = provider.models().iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["fresh-1", "fresh-2"]);
+    let two = provider.get_model("fresh-2").unwrap();
+    assert_eq!(two.base_url, "https://two.example");
+    assert_eq!(
+        two.headers
+            .as_ref()
+            .and_then(|h| h.get("x-team").cloned().flatten())
+            .as_deref(),
+        Some("core")
+    );
+    let unnamed = registration("acme-unnamed", json!({ "models": [] }));
+    assert_eq!(unnamed.build_provider().name(), "acme-unnamed");
+    assert!(unnamed.build_provider().models().is_empty());
 }

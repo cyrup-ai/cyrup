@@ -105,6 +105,23 @@ pub enum ProviderError {
     /// func-01 R-01-017 code].
     #[error("No API provider registered for api: {0}")]
     UnregisteredApi(ApiId),
+    /// The provider has no login for the requested auth type — pi `Models.login`
+    /// (`packages/ai/src/models.ts:772-775` @f1b2e77f5):
+    /// ``if (!method?.login) throw new ModelsError("auth", `${provider.name} does not support
+    /// ${type} login`)``. `provider_name` is the provider's display name (pi `provider.name`), and
+    /// `auth_type` pi's `AuthType` string, `api_key` or `oauth`. PROV-161. Code `auth`.
+    #[error("{provider_name} does not support {auth_type} login")]
+    LoginUnsupported {
+        provider_name: String,
+        auth_type: &'static str,
+    },
+    /// A login flow's own failure, propagated as pi does: `Models.login` awaits `method.login(…)`
+    /// bare (`models.ts:776-777` @f1b2e77f5), so the caller sees the flow's message. PROV-161.
+    ///
+    /// Code `auth` — pi's rejection is whatever the flow threw, which carries no `ModelsError`
+    /// code [CYRUP-DELTA, unrepresentable — every variant carries a func-01 R-01-017 code].
+    #[error(transparent)]
+    Login(crate::auth::oauth::OAuthError),
     /// Dynamic model-catalog refresh failed. Code `model_source`.
     #[error("model source refresh failed: {0}")]
     ModelSource(#[source] BoxErr),
@@ -150,7 +167,9 @@ impl ProviderError {
     pub fn code(&self) -> &'static str {
         match self {
             ProviderError::UnknownProvider(_) => "provider",
-            ProviderError::NotConfigured(_) => "auth",
+            ProviderError::NotConfigured(_)
+            | ProviderError::LoginUnsupported { .. }
+            | ProviderError::Login(_) => "auth",
             ProviderError::NoApiImpl { .. } | ProviderError::UnregisteredApi(_) => "stream",
             ProviderError::ModelSource(_) => "model_source",
             ProviderError::Http { .. } | ProviderError::RetryDelay(_) => "http",
@@ -186,6 +205,14 @@ impl ProviderError {
                 api: api.clone(),
             },
             ProviderError::UnregisteredApi(a) => ProviderError::UnregisteredApi(a.clone()),
+            ProviderError::LoginUnsupported {
+                provider_name,
+                auth_type,
+            } => ProviderError::LoginUnsupported {
+                provider_name: provider_name.clone(),
+                auth_type,
+            },
+            ProviderError::Login(e) => ProviderError::Decode(e.to_string()),
             ProviderError::ModelSource(e) => ProviderError::ModelSource(e.to_string().into()),
             ProviderError::Http { status, message } => ProviderError::Http {
                 status: *status,

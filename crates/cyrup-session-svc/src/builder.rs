@@ -1855,6 +1855,30 @@ impl SessionBuilder {
             auth.clone(),
             Arc::new(cyrup_config::login::StoreAuthContext(auth.clone())),
         );
+        // PROV-162 — what a registration under a built-in id composes over: pi's `base =
+        // nativeExtensionProviders.get(id) ?? builtins.get(id)` (`model-runtime.ts:301-310`
+        // @f1b2e77f5), with this session's `models.json` layer and catalog overlay applied, over the
+        // session's own store and auth context — the provider pi's `rebuildProviders` would hand
+        // `composeModelProvider` as `base` after its `config` layer. Attached BEFORE the bind below,
+        // so the extensions' startup registrations compose over it.
+        {
+            let model_config = Arc::clone(&model_config);
+            let catalog_overlay = Arc::clone(&catalog_overlay);
+            let store: Arc<dyn cyrup_provider::CredentialStore> = auth.clone();
+            let ctx: Arc<dyn cyrup_provider::AuthContext> =
+                Arc::new(cyrup_config::login::StoreAuthContext(auth.clone()));
+            guest_providers.attach_base_resolver(Arc::new(move |id: &str| {
+                let (models, _errors) = cyrup_config::compose_provider_registry(
+                    &model_config,
+                    cyrup_provider::CreateModelsOptions {
+                        credentials: Some(Arc::clone(&store)),
+                        auth_context: Some(Arc::clone(&ctx)),
+                        catalog_overlay: catalog_overlay.load(),
+                    },
+                );
+                models.get_provider(id)
+            }));
+        }
         host_services.attach_provider_refresher(guest_providers.clone());
         // EXT-093 — `HostServices::flag_value` answers from the extension host's registry (the CLI
         // overrides applied above, then the registered default). Weak: the host holds `host_services`.

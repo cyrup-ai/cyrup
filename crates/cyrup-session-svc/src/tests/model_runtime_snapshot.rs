@@ -359,3 +359,189 @@ async fn the_hoisted_filter_answers_exactly_what_has_configured_auth_answers() {
         "the offline-faux arm is exercised"
     );
 }
+
+// ---- PROV-162: a registration over a BUILT-IN id composes over it ---------------------------
+
+/// The registry's rows of `provider`, in order.
+fn rows_of(session: &AgentSession, provider: &str) -> Vec<Model> {
+    session
+        .full_model_catalog()
+        .into_iter()
+        .filter(|m| m.provider.as_str() == provider)
+        .collect()
+}
+
+/// PROV-162 — `registerProvider("anthropic", { baseUrl })` lists Anthropic's models at the new URL.
+///
+/// What `compose_model_registry` (`session/model.rs`) did at `360dc2bb`, established by this
+/// test there: it unions `current.models()`, the guest providers' models, `default_models` and then
+/// composes `models.json` over the union, first row wins on `(provider, id)`. The guest
+/// registration was a base-less `ConfigProvider` with no rows (no `models` key), so the union kept
+/// the compiled-in anthropic rows unchanged: the run at `360dc2bb` fails the URL assertion with
+/// `https://api.anthropic.com` (count unchanged). pi lists the composed provider's rows
+/// (`applyExtension`, `provider-composer.ts:347-348` @f1b2e77f5): the same models, the new URL.
+#[tokio::test]
+async fn a_base_url_registration_over_a_builtin_lists_its_models_at_the_new_url() {
+    let fx = fixture();
+    let (provider, _calls) = CountingProvider::install("faux-1");
+    let session = session_with(&fx, provider).await;
+    let before = rows_of(&session, "anthropic");
+    assert!(!before.is_empty());
+    assert!(
+        before
+            .iter()
+            .all(|m| m.base_url == "https://api.anthropic.com"),
+        "fixture: the built-in rows"
+    );
+
+    session
+        .services()
+        .ext_host
+        .registry()
+        .register_provider(
+            ExtensionId::from("e"),
+            "anthropic",
+            serde_json::json!({ "baseUrl": "http://proxy.test" }),
+        )
+        .unwrap();
+
+    let after = rows_of(&session, "anthropic");
+    let urls: Vec<&str> = after.iter().map(|m| m.base_url.as_str()).collect();
+    assert!(urls.iter().all(|u| *u == "http://proxy.test"), "{urls:?}");
+    let ids = |rows: &[Model]| -> Vec<String> {
+        rows.iter().map(|m| m.id.as_str().to_string()).collect()
+    };
+    assert_eq!(
+        ids(&after),
+        ids(&before),
+        "the same models, in the same order"
+    );
+}
+
+/// PROV-162 — a registration WITH `models` over a built-in lists only its own rows for that id
+/// (pi `applyExtension`, `:350`: the definitions replace the catalog), each filled from the base
+/// (`findExtensionModelDefaults`, `:261-273`): no id match, no api, no `openai-completions` row in
+/// anthropic's catalog, so the first row's `anthropic-messages` and `baseUrl`.
+///
+/// RED at `360dc2bb`: the definition has no `api`/`baseUrl` of its own, so `build_models` skipped
+/// it, and the anthropic rows were the 17 built-ins.
+#[tokio::test]
+async fn a_registration_with_models_over_a_builtin_lists_only_its_rows() {
+    let fx = fixture();
+    let (provider, _calls) = CountingProvider::install("faux-1");
+    let session = session_with(&fx, provider).await;
+    session
+        .services()
+        .ext_host
+        .registry()
+        .register_provider(
+            ExtensionId::from("e"),
+            "anthropic",
+            serde_json::json!({
+                "models": [{ "id": "proxy-only", "contextWindow": 1000, "maxTokens": 100 }]
+            }),
+        )
+        .unwrap();
+    let rows = rows_of(&session, "anthropic");
+    let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["proxy-only"]);
+    assert_eq!(rows[0].api.as_str(), "anthropic-messages");
+    assert_eq!(rows[0].base_url, "https://api.anthropic.com");
+}
+
+/// The env vars anthropic's own strategy reads (`providers/anthropic.rs` `anthropic_auth()`).
+fn anthropic_env_is_set() -> bool {
+    [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ]
+    .iter()
+    .any(|name| std::env::var(name).is_ok_and(|v| !v.is_empty()))
+}
+
+/// PROV-162 — a key-less registration over a built-in does not, by itself, configure the id: pi's
+/// `configuredProviders` comes from `checkAuth` over the COMPOSED provider (`model-runtime.ts:343`),
+/// whose `check` with no stored credential and no registration key is the inherited strategy's
+/// (`provider-composer.ts:453-455`). A registration that carries a key is configured
+/// (`:445-451`).
+///
+/// RED at `360dc2bb`: any guest registration marked its id configured
+/// (`physical_provider_is_configured`'s guest arm), key or no key.
+#[tokio::test]
+async fn a_keyless_registration_over_a_builtin_is_configured_only_through_its_auth() {
+    if anthropic_env_is_set() {
+        eprintln!("skipped: an ANTHROPIC_* credential is set in this environment");
+        return;
+    }
+    let fx = fixture();
+    let (provider, _calls) = CountingProvider::install("faux-1");
+    let session = session_with(&fx, provider).await;
+    let register = |config: serde_json::Value| {
+        session
+            .services()
+            .ext_host
+            .registry()
+            .register_provider(ExtensionId::from("e"), "anthropic", config)
+            .unwrap();
+    };
+
+    register(serde_json::json!({ "baseUrl": "http://proxy.test" }));
+    let row = rows_of(&session, "anthropic").remove(0);
+    assert!(
+        !session.has_configured_auth(&row),
+        "a key-less registration over anthropic, with no anthropic credential, is not configured"
+    );
+    assert!(
+        !session
+            .available_model_catalog()
+            .iter()
+            .any(|m| m.provider.as_str() == "anthropic")
+    );
+
+    register(serde_json::json!({ "baseUrl": "http://proxy.test", "apiKey": "sk-registration" }));
+    let row = rows_of(&session, "anthropic").remove(0);
+    assert!(session.has_configured_auth(&row));
+}
+
+/// PROV-162 — the registration composes over the base AS THE SESSION HAS IT, `models.json` layer
+/// included, and its own layer sits on top (pi's order: built-in → `models.json` → extension,
+/// `provider-composer.ts:555-560` @f1b2e77f5). A `models.json` `baseUrl` for anthropic therefore
+/// reaches a definition's gaps (its `defaults` row is the composed base's), while the registration's
+/// own `baseUrl` wins over it for a registration without `models` (`extension?.baseUrl ??
+/// config?.baseUrl`, `:608`, and `applyExtension` over `applyModelsJson`'s rows, `:556-560`).
+///
+/// RED at `360dc2bb`: no base reached the registration, so the definition (no `api`/`baseUrl` of
+/// its own) was skipped and the 17 built-in rows were listed — and there `models.json` was composed
+/// over the whole union LAST, which would put its `baseUrl` back over a registration's. Named
+/// mutations: the builder's base resolver detached (the base is the bare built-in) turns the first
+/// assertion red; re-applying `models.json` over the guest-owned rows turns the second red.
+#[tokio::test]
+async fn a_registration_composes_over_the_models_json_layer_and_sits_above_it() {
+    let fx = fixture();
+    std::fs::write(
+        fx.agent_dir.join("models.json"),
+        r#"{ "providers": { "anthropic": { "baseUrl": "https://models-json.test" } } }"#,
+    )
+    .unwrap();
+    let (provider, _calls) = CountingProvider::install("faux-1");
+    let session = session_with(&fx, provider).await;
+    let register = |config: serde_json::Value| {
+        session
+            .services()
+            .ext_host
+            .registry()
+            .register_provider(ExtensionId::from("e"), "anthropic", config)
+            .unwrap();
+    };
+
+    register(serde_json::json!({ "models": [{ "id": "proxy-only" }] }));
+    let rows = rows_of(&session, "anthropic");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].base_url, "https://models-json.test");
+
+    register(serde_json::json!({ "baseUrl": "http://proxy.test" }));
+    let rows = rows_of(&session, "anthropic");
+    assert!(rows.len() > 1);
+    assert!(rows.iter().all(|m| m.base_url == "http://proxy.test"));
+}

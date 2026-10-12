@@ -19,6 +19,7 @@ pub mod catalog;
 pub mod catalog_refresh;
 pub mod classifier;
 pub mod collection;
+pub mod compose;
 pub mod config_provider;
 pub mod context;
 pub mod env_api_keys;
@@ -115,7 +116,8 @@ pub use provider::{
 };
 pub use providers::all::{
     BUILTIN_CATALOG_MANIFEST_JSON, all_providers, all_providers_with, all_providers_with_overlay,
-    builtin_model_data_generated_at, builtin_model_data_generated_at_by_provider, default_models,
+    builtin_model_data_generated_at, builtin_model_data_generated_at_by_provider, builtin_provider,
+    default_models,
 };
 pub use providers::builtin_provider_oauth;
 pub use providers::fleet::{

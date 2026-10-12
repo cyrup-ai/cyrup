@@ -292,10 +292,12 @@ impl AgentSession {
         // A guest-registered provider carries its own credentials (apiKey/oauth in the registration,
         // Pi `providerRequestConfigs`, model-registry.ts:659-662), so its models are always available
         // in the selector — exactly as Pi's `hasConfiguredAuth` returns true when a provider request
-        // config supplies a key.
+        // config supplies a key. PROV-162: a KEY-LESS registration composed over a base does not:
+        // pi's composed `check` is then the inherited strategy's (`provider-composer.ts:453-455`),
+        // which `provider_has_configured_auth` above already asked for this id.
         self.services
             .guest_providers
-            .has_provider(provider.as_str())
+            .carries_own_credentials(provider.as_str())
     }
 
     /// The provider a native extension registered LIVE under `id` (`register_provider_live`), as
@@ -582,10 +584,29 @@ impl AgentSession {
         // shadows the compiled-in catalog, and the compiled-in catalog fills in the rest. The
         // session's own installed provider comes first because it also carries the offline faux
         // models and any custom-id model that is not a registry entry.
-        let mut base: Vec<Model> = current.models().to_vec();
+        //
+        // PROV-162 — a guest-registered id is the COMPOSED provider pi lists: the registration over
+        // its base, already through the base's `models.json` layer (the guest registry composes
+        // over the session's composed base). So its rows REPLACE every other row of that id — the
+        // installed provider's and the compiled-in ones alike — rather than joining them first-wins:
+        // `registerProvider(id, { baseUrl })` lists the base's models at the new URL, and a
+        // registration with `models` lists only its own (pi `applyExtension`,
+        // `provider-composer.ts:345-350` @f1b2e77f5).
+        let guest = self.services.guest_providers.providers();
+        let guest_owned = |m: &Model| {
+            guest
+                .iter()
+                .any(|(id, _)| id.as_str() == m.provider.as_str())
+        };
+        let mut base: Vec<Model> = current
+            .models()
+            .iter()
+            .filter(|m| !guest_owned(m))
+            .cloned()
+            .collect();
         // Guest-registered providers (Pi folds `registerProvider` models into the same `ModelRegistry`
         // that `find`/`getAvailable`/`setModel` read, model-registry.ts:917-940).
-        for m in self.services.guest_providers.models() {
+        for m in guest.iter().flat_map(|(_, p)| p.models().to_vec()) {
             if !base
                 .iter()
                 .any(|e| e.provider == m.provider && e.id == m.id)
@@ -604,9 +625,10 @@ impl AgentSession {
         })
         .get_models(None)
         {
-            if !base
-                .iter()
-                .any(|e| e.provider == m.provider && e.id == m.id)
+            if !guest_owned(&m)
+                && !base
+                    .iter()
+                    .any(|e| e.provider == m.provider && e.id == m.id)
             {
                 base.push(m);
             }
@@ -621,7 +643,25 @@ impl AgentSession {
         // uncomposed entries from shadowing their composed counterparts. Composition errors were
         // already reported at startup (`StartupDiagnostics::models`); here a rejected provider block
         // simply keeps its built-ins.
-        let (composed, _errors) = self.services.model_config.compose(&base);
+        //
+        // A guest-owned id is NOT composed again: its rows already carry its base's `models.json`
+        // layer UNDER the registration (pi's layer order, built-in → `models.json` → extension,
+        // `provider-composer.ts:556-560`), and re-applying the block here would put a `models.json`
+        // `baseUrl` back over the registration's (PROV-162).
+        let guest_free;
+        let model_config: &cyrup_config::ModelFile = if guest
+            .iter()
+            .any(|(id, _)| self.services.model_config.providers.contains_key(id))
+        {
+            let mut file = self.services.model_config.as_ref().clone();
+            file.providers
+                .retain(|id, _| !guest.iter().any(|(guest_id, _)| guest_id == id));
+            guest_free = file;
+            &guest_free
+        } else {
+            self.services.model_config.as_ref()
+        };
+        let (composed, _errors) = model_config.compose(&base);
         // --- VIRTUAL layer, applied LAST (pi `recomposeProvider`, model-runtime.ts:171-178) ---
         // pi composes the provider — which is where `models.json` lands — and only THEN wraps the
         // result with `withVirtualModels`, so the virtual rows sit on top of everything above.

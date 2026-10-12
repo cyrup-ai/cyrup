@@ -842,9 +842,14 @@ pub struct ProviderConfig {
     /// [`ProviderModelConfig::headers`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub headers: std::collections::BTreeMap<String, String>,
-    /// The models this provider offers, each a [`ProviderModelConfig`].
-    #[serde(default)]
-    pub models: Vec<ProviderModelConfig>,
+    /// The models this provider offers, each a [`ProviderModelConfig`] (pi `models?:
+    /// ProviderModelConfig[]`, `core/provider-composer.ts:106` @f1b2e77f5).
+    ///
+    /// ABSENT and EMPTY differ, as upstream: over a built-in id, `None` keeps the built-in's models
+    /// with only `baseUrl` replaced, while `Some(vec![])` replaces the catalog with nothing
+    /// (`applyExtension`, `:347-350`). PROV-162.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<ProviderModelConfig>>,
     /// OAuth metadata (`{name}`): a static marker that this provider authenticates via OAuth. The
     /// dynamic `login`/`refreshToken`/`getApiKey`/`modifyModels` callbacks live guest-side in
     /// [`crate::ProviderHandlers`] and are invoked across the `provider-*` exports (sdk gap #1).
