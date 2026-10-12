@@ -190,6 +190,10 @@ pub enum ApprovalOutcome {
     Denied,
     /// `{ok: false, reason: …}` — approval is required and there is no interactive session.
     NoInteractiveSession,
+    /// The call was cancelled while its dialog was open: `abortable(ui.select(...), ownedSignal)`
+    /// rejects with the signal's reason (`tool-approval.ts` @v5.2.0), so the call fails as aborted
+    /// rather than as declined.
+    Aborted,
 }
 
 /// The per-call-site half of `guardMcpOutput`'s options.

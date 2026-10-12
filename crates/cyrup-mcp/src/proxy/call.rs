@@ -828,6 +828,17 @@ pub async fn execute_call(
         .await
     {
         ApprovalOutcome::Approved => {}
+        // Cancelled while the dialog was open: the call fails as aborted, as `abortable` rejects,
+        // so a script that timed out records it as cancelled rather than as a tool that answered.
+        ApprovalOutcome::Aborted => {
+            throw_if_aborted(
+                &owned,
+                ctx.owner().stop_reason().as_deref().map(String::as_str),
+            )?;
+            return Err(crate::errors::McpError::Aborted(
+                crate::abort::ABORTED_FALLBACK_REASON.to_string(),
+            ));
+        }
         outcome => {
             let denied = outcome == ApprovalOutcome::Denied;
             let message = if denied {
@@ -1520,6 +1531,32 @@ mod tests {
             0,
             "the slot is released once the call returns"
         );
+    }
+
+    /// A call cancelled while its approval dialog was open fails as aborted, as upstream's
+    /// `abortable(ui.select(...), ownedSignal)` rejects: a codemode script records it as cancelled.
+    /// Answered as a decline instead, the script recorded a tool that had run and answered. The slot
+    /// is released on this return too.
+    #[tokio::test]
+    async fn a_call_aborted_at_its_dialog_fails_as_aborted() {
+        let config = config_with(&[("srv", stdio("a"))]);
+        let env = FakeEnv::default()
+            .with_connection("srv", ConnectionStatus::Connected)
+            .with_approval(ApprovalOutcome::Aborted);
+        let (ctx, env) = ctx_with(
+            config,
+            &[("srv", vec![ToolMetadata::new("srv_run", "run", "")])],
+            &[],
+            env,
+        );
+        let error = execute_call(&ctx, "srv_run", None, None, &CancelToken::new(), None, None)
+            .await
+            .expect_err("an aborted approval fails the call");
+        assert!(
+            matches!(error, crate::errors::McpError::Aborted(_)),
+            "expected an abort, got {error}"
+        );
+        assert_eq!(env.in_flight_of("srv"), 0, "the slot is released");
     }
 
     /// The other half of upstream's `finally`: the denied and `approval_required` early returns sit

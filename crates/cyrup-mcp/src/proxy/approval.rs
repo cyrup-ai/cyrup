@@ -399,13 +399,14 @@ pub async fn ensure_tool_call_approved(
         approval_argument_preview(args)
     );
     // `await abortable(ui.select(...), ownedSignal)` (`tool-approval.ts:197` @v5.0.0): the call's
-    // cancel, or the generation's, ends the wait for the human. Awaited bare, an aborted turn sat
-    // in front of an approval nobody was going to give.
+    // cancel, or the generation's, ends the wait for the human, and the call fails as aborted, as
+    // `abortable` rejects. Awaited bare, an aborted turn sat in front of an approval nobody was
+    // going to give.
     let owner = state.owner.token();
     let decision = tokio::select! {
         biased;
-        () = cancel.cancelled() => return ApprovalOutcome::Denied,
-        () = owner.cancelled() => return ApprovalOutcome::Denied,
+        () = cancel.cancelled() => return ApprovalOutcome::Aborted,
+        () = owner.cancelled() => return ApprovalOutcome::Aborted,
         decision = dialog.select(&prompt, &APPROVAL_OPTIONS) => decision,
     };
     if cancelled() {
@@ -1126,11 +1127,11 @@ mod tests {
     }
 
     /// `await abortable(ui.select(...), ownedSignal)` (`tool-approval.ts:197`): a call cancelled
-    /// while its approval dialog is open stops waiting for the human and is denied. Before, the
-    /// cancel was read before and after the dialog only, so an aborted turn sat in front of a
-    /// dialog nobody was going to answer.
+    /// while its approval dialog is open stops waiting for the human and is aborted, not declined.
+    /// Before, the cancel was read before and after the dialog only, so an aborted turn sat in front
+    /// of a dialog nobody was going to answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_call_cancelled_while_its_dialog_is_open_stops_waiting_and_is_denied() {
+    async fn a_call_cancelled_while_its_dialog_is_open_stops_waiting_and_is_aborted() {
         let tool = demo_tool();
         let metadata = metadata_with(&[("demo", vec![tool.clone()])]);
         let (ui, answer) = ScriptedUi::held();
@@ -1169,7 +1170,7 @@ mod tests {
             .await
             .expect("the call went on waiting for the human after it was cancelled")
             .expect("the approval task");
-        assert_eq!(outcome, ApprovalOutcome::Denied);
+        assert_eq!(outcome, ApprovalOutcome::Aborted);
         let _ = answer.send(Some(APPROVE_ONCE_OPTION.to_string()));
     }
 
