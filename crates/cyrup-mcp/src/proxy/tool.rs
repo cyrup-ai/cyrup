@@ -215,6 +215,8 @@ enum InitWait {
     TimedOut,
     Failed(String),
     NotInitialized,
+    /// The call's own token was cancelled while it waited.
+    Aborted,
 }
 
 impl ProxyInitGate {
@@ -237,9 +239,15 @@ impl ProxyInitGate {
         self.owner.load_full()
     }
 
-    /// Race the live init against [`INIT_WAIT_TIMEOUT_MS`], with the already-settled phases
-    /// short-circuiting.
-    async fn wait(&self) -> InitWait {
+    /// Race the live init against [`INIT_WAIT_TIMEOUT_MS`] — one deadline for the whole wait, as
+    /// upstream's one `setTimeout` is — with the already-settled phases short-circuiting.
+    ///
+    /// [CYRUP-DELTA, upward] The call's own `cancel` ends the wait too. Upstream's
+    /// `awaitWithTimeout(initPromise, INIT_WAIT_TIMEOUT_MS)` (`index.ts:172-185`, `:2174`
+    /// @v5.2.0) takes no signal, so an aborted turn sat out the rest of the 30 s (MCP-631).
+    async fn wait(&self, cancel: &CancelToken) -> InitWait {
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(INIT_WAIT_TIMEOUT_MS);
         let mut rx = self.phase.clone();
         loop {
             match rx.borrow_and_update().clone() {
@@ -248,11 +256,11 @@ impl ProxyInitGate {
                 InitPhase::NotInitialized => return InitWait::NotInitialized,
                 InitPhase::Pending => {}
             }
-            let changed = tokio::time::timeout(
-                std::time::Duration::from_millis(INIT_WAIT_TIMEOUT_MS),
-                rx.changed(),
-            )
-            .await;
+            let changed = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return InitWait::Aborted,
+                changed = tokio::time::timeout_at(deadline, rx.changed()) => changed,
+            };
             match changed {
                 // Timer won the race. Upstream's timer is `unref`'d; a `tokio::time::timeout`
                 // future is dropped here, which is the same "does not hold the process open".
@@ -387,8 +395,11 @@ impl Tool for McpTool {
         }
 
         // 2 · The init-wait gate. These three envelopes carry **no `mode` key**.
-        let ctx = match self.gate.wait().await {
+        let ctx = match self.gate.wait(&cancel).await {
             InitWait::Ready(ctx) => ctx,
+            InitWait::Aborted => {
+                return Err(ToolError::new(crate::abort::ABORTED_FALLBACK_REASON));
+            }
             InitWait::TimedOut => {
                 let mut map = JsonMap::new();
                 map.insert(
@@ -838,6 +849,71 @@ mod tests {
         assert_eq!(details["error"], json!("init_timeout"));
         assert_eq!(details["timeoutMs"], json!(30_000));
         assert!(details.get("mode").is_none());
+    }
+
+    /// The 30 s is one deadline for the whole wait, as upstream's one `setTimeout` is: a phase
+    /// change that is not an outcome does not start it again.
+    #[tokio::test(start_paused = true)]
+    async fn the_thirty_seconds_are_one_deadline_for_the_whole_wait() {
+        let (keep, rx) = tokio::sync::watch::channel(InitPhase::Pending);
+        let gate = Arc::new(ProxyInitGate::new(rx));
+        let tool = McpTool::new(String::new(), &McpSettings::default(), gate);
+        let nudger = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let _ = keep.send(InitPhase::Pending);
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            drop(keep);
+        });
+        let started = tokio::time::Instant::now();
+        let result = tool
+            .execute(
+                ToolCallId::from("call-4"),
+                json!({}),
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
+            .await
+            .expect("the timeout envelope is returned, not thrown");
+        assert_eq!(
+            result.details.expect("details")["error"],
+            json!("init_timeout")
+        );
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::from_millis(INIT_WAIT_TIMEOUT_MS),
+            "the wait restarted its 30 s at the nudge"
+        );
+        nudger.abort();
+    }
+
+    /// [CYRUP-DELTA, upward] A gateway call cancelled while it waits for the build ends at its
+    /// cancel, not at the 30 s (MCP-631's sibling: upstream's `awaitWithTimeout` takes no signal).
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_gateway_call_stops_waiting_for_the_build() {
+        let (_keep, rx) = tokio::sync::watch::channel(InitPhase::Pending);
+        let gate = Arc::new(ProxyInitGate::new(rx));
+        let tool = McpTool::new(String::new(), &McpSettings::default(), gate);
+        let cancel = CancelToken::new();
+        let canceller = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                cancel.cancel();
+            })
+        };
+        let started = tokio::time::Instant::now();
+        let error = tool
+            .execute(
+                ToolCallId::from("call-5"),
+                json!({}),
+                cancel,
+                Box::new(|_| {}),
+            )
+            .await
+            .expect_err("an aborted call throws, as `throwIfAborted` does");
+        assert_eq!(error.message, crate::abort::ABORTED_FALLBACK_REASON);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+        canceller.await.expect("the canceller ran");
     }
 
     #[tokio::test]

@@ -116,6 +116,10 @@ pub struct InitializeOptions {
     /// (a container, CI, a headless Linux box) every `auth: "oauth"` HTTP server in a real session
     /// fails its connect with `NoDefaultStore` and the failure is unprovable.
     pub auth_store: Option<crate::credentials::McpAuthStore>,
+    /// The startup pass this build reports to, server by server (MCP-629): which servers it is
+    /// discovering, and each one as it settles. `None` builds report nothing; the extension always
+    /// passes one, because its first-prompt and script waits wait on it.
+    pub startup: Option<Arc<crate::startup::StartupPass>>,
 }
 
 /// How many of a load's diagnostics the startup notice spells out.
@@ -746,6 +750,25 @@ pub async fn initialize_mcp(
     // the `throw_if_inactive` immediately below turns the same condition into the same `Err` — the
     // only difference is that the remaining in-flight connects finish first, and they are already
     // racing a cancelled runtime signal.
+    // MCP-629 — the per-server half of this pass. The servers whose tools are not known until they
+    // answer are the ones a first prompt or a script can be waiting on; a server whose catalogue
+    // the cache holds had its tools registered before any server was contacted. Of those, the ones
+    // that declare direct tools are written and published the moment they settle rather than with
+    // the whole pass at the commit, so a fast server's tools reach the first request while a slow
+    // one is still starting.
+    let pass = options.startup.clone();
+    let publishing: std::collections::HashSet<String> = {
+        let env_raw = std::env::var(crate::registration::DIRECT_TOOLS_ENV_VAR).ok();
+        let env_override = direct_tools_override(env_raw.as_deref());
+        crate::registration::direct_tool_servers(&state.config, env_override.as_deref())
+            .into_keys()
+            .filter(|name| needs_discovery.contains(name))
+            .collect()
+    };
+    let startup_snapshot = Arc::new(startup_snapshot);
+    if let Some(pass) = pass.as_ref() {
+        pass.plan(needs_discovery.iter().cloned());
+    }
     let results = crate::live::parallel_limit(
         startup.clone(),
         crate::live::STARTUP_CONNECT_CONCURRENCY,
@@ -753,80 +776,36 @@ pub async fn initialize_mcp(
             let state = Arc::clone(&state);
             let dirs = dirs.clone();
             let signal = runtime_signal.clone();
+            let pass = pass.clone();
+            let publishes = publishing.contains(&name);
+            let startup_snapshot = Arc::clone(&startup_snapshot);
             async move {
-                let manager = Arc::clone(&state.manager);
-                match manager.connect(&name, &definition, Some(&signal)).await {
-                    Ok(connection) if connection.status() == ConnectionStatus::NeedsAuth => {
-                        // BYTE-EXACT (`init.ts:354`). The `/mcp-auth {name}` form is what the user
-                        // copies; a reworded line is a support burden, not a style choice.
-                        let message =
-                            format!("OAuth authentication required. Run /mcp-auth {name}.");
-                        StartupResult {
-                            name,
-                            definition,
-                            resident,
-                            connection: None,
-                            error: Some(message),
-                            transient: false,
-                            entry: None,
-                        }
-                    }
-                    Ok(connection) => {
-                        // `captureMetadata(state, name, connection, () => cache); if (!resident)
-                        // await manager.close(name);` (`init.ts:365-367`) — in this order, because
-                        // `capture_metadata` reads the connection out of the manager's table and a
-                        // closed server is no longer in it. The `Arc` in `connection` keeps its
-                        // catalogue for §12's publication either way.
-                        let entry = crate::live::capture_metadata(
-                            &state,
-                            &dirs,
-                            &name,
-                            crate::live::MetadataCacheOptions::preserving(),
-                        );
-                        if !resident {
-                            // `await manager.close(name)` — a close that fails has nothing
-                            // left to do about it, and upstream does not await a rejection
-                            // either; the server is out of the connection table regardless.
-                            if let Err(error) = manager.close(&name).await {
+                let result =
+                    connect_at_startup(&state, &dirs, &signal, name, definition, resident).await;
+                if let Some(pass) = pass.as_ref() {
+                    if publishes
+                        && result.connection.is_some()
+                        && let Some(entry) = result.entry.clone()
+                    {
+                        let cache_path = dirs.metadata_cache();
+                        pass.publish(|| {
+                            let mut one = crate::dirs::MetadataCache::default();
+                            one.servers.insert(result.name.clone(), entry);
+                            if let Err(error) = crate::dirs::save_metadata_cache_with(
+                                &cache_path,
+                                &one,
+                                Some(startup_snapshot.as_ref()),
+                            ) {
                                 tracing::debug!(
-                                    "MCP: closing {name} after startup discovery failed: {error}"
+                                    "MCP: failed to write {}'s startup catalogue: {error}",
+                                    result.name
                                 );
                             }
-                        }
-                        StartupResult {
-                            name,
-                            definition,
-                            resident,
-                            connection: Some(connection),
-                            error: None,
-                            transient: false,
-                            entry,
-                        }
+                        });
                     }
-                    Err(error) if crate::abort::is_abort_error(&error, Some(&signal)) => {
-                        StartupResult {
-                            name,
-                            definition,
-                            resident,
-                            connection: None,
-                            error: None,
-                            transient: false,
-                            entry: None,
-                        }
-                    }
-                    Err(error) => {
-                        let transient = is_transient_http_connect_error(&error);
-                        StartupResult {
-                            name,
-                            definition,
-                            resident,
-                            connection: None,
-                            error: Some(error.to_string()),
-                            transient,
-                            entry: None,
-                        }
-                    }
+                    pass.settle(&result.name);
                 }
+                result
             }
         },
     )
@@ -869,8 +848,11 @@ pub async fn initialize_mcp(
             }
         }
         if !batch.servers.is_empty()
-            && let Err(error) =
-                crate::dirs::save_metadata_cache_with(&cache_path, &batch, Some(&startup_snapshot))
+            && let Err(error) = crate::dirs::save_metadata_cache_with(
+                &cache_path,
+                &batch,
+                Some(startup_snapshot.as_ref()),
+            )
         {
             tracing::debug!("MCP: failed to write the startup metadata cache: {error}");
         }
@@ -1340,6 +1322,86 @@ pub async fn initialize_mcp(
     }
     state.publish_status(crate::live::create_mcp_status_snapshot(&state));
     Ok(state)
+}
+
+/// One server of §11's startup pass: connect it, capture its catalogue, and close it again if it
+/// is not resident (`init.ts:351-374`).
+async fn connect_at_startup(
+    state: &Arc<McpState>,
+    dirs: &McpDirs,
+    signal: &CancelToken,
+    name: String,
+    definition: ServerEntry,
+    resident: bool,
+) -> StartupResult {
+    let manager = Arc::clone(&state.manager);
+    match manager.connect(&name, &definition, Some(signal)).await {
+        Ok(connection) if connection.status() == ConnectionStatus::NeedsAuth => {
+            // BYTE-EXACT (`init.ts:354`). The `/mcp-auth {name}` form is what the user
+            // copies; a reworded line is a support burden, not a style choice.
+            let message = format!("OAuth authentication required. Run /mcp-auth {name}.");
+            StartupResult {
+                name,
+                definition,
+                resident,
+                connection: None,
+                error: Some(message),
+                transient: false,
+                entry: None,
+            }
+        }
+        Ok(connection) => {
+            // `captureMetadata(state, name, connection, () => cache); if (!resident)
+            // await manager.close(name);` (`init.ts:365-367`) — in this order, because
+            // `capture_metadata` reads the connection out of the manager's table and a
+            // closed server is no longer in it. The `Arc` in `connection` keeps its
+            // catalogue for §12's publication either way.
+            let entry = crate::live::capture_metadata(
+                state,
+                dirs,
+                &name,
+                crate::live::MetadataCacheOptions::preserving(),
+            );
+            if !resident {
+                // `await manager.close(name)` — a close that fails has nothing
+                // left to do about it, and upstream does not await a rejection
+                // either; the server is out of the connection table regardless.
+                if let Err(error) = manager.close(&name).await {
+                    tracing::debug!("MCP: closing {name} after startup discovery failed: {error}");
+                }
+            }
+            StartupResult {
+                name,
+                definition,
+                resident,
+                connection: Some(connection),
+                error: None,
+                transient: false,
+                entry,
+            }
+        }
+        Err(error) if crate::abort::is_abort_error(&error, Some(signal)) => StartupResult {
+            name,
+            definition,
+            resident,
+            connection: None,
+            error: None,
+            transient: false,
+            entry: None,
+        },
+        Err(error) => {
+            let transient = is_transient_http_connect_error(&error);
+            StartupResult {
+                name,
+                definition,
+                resident,
+                connection: None,
+                error: Some(error.to_string()),
+                transient,
+                entry: None,
+            }
+        }
+    }
 }
 
 /// `saveMetadataCache({version: 1, servers: {}})` (`init.ts:233`, `:236`) — §9's two write arms.

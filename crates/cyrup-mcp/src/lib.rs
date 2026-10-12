@@ -159,6 +159,7 @@ pub mod sampling;
 pub mod schema;
 pub mod secrets;
 pub mod server_manager;
+pub mod startup;
 pub mod state;
 pub mod trace;
 pub mod ui;

@@ -39,37 +39,20 @@
 //! for the one honest divergence it carries.
 
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use serde_json::{Map as JsonMap, Value, json};
 
 use cyrup_core::{CancelToken, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 
 use crate::config::McpSettings;
-use crate::extension::{InitTask, McpExtension};
+use crate::extension::{Build, BuildState, McpExtension};
 use crate::owner::McpRuntimeOwner;
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::results::text_result;
 use crate::proxy::{
-    ApprovalOrigin, INIT_WAIT_TIMEOUT_MS, InitPhase, McpTool, OriginatingCall, ProxyCtx,
-    ProxyInitGate, execute_call,
+    ApprovalOrigin, InitPhase, McpTool, OriginatingCall, ProxyCtx, ProxyInitGate, execute_call,
 };
 use crate::registration::{DirectToolSpec, McpToolDispatch};
-
-/// One re-read of `proxy_ctx` while the commit tail runs.
-///
-/// The build's future and the driver that commits it settle on the same wakeup: the driver awaits
-/// the memoised [`InitTask`], and so does [`join_build`]. Whichever the runtime schedules first,
-/// the commit's write of the context is a handful of synchronous statements away — it takes the
-/// state slot, records the human-wait ctx and installs the runtime env with no await between them.
-/// Re-reading closes that scheduling window instead of reporting `not_initialized` for a build that
-/// in fact succeeded a microsecond ago.
-const COMMIT_SETTLE_STEP: Duration = Duration::from_millis(5);
-
-/// How many times [`committed_ctx`] re-reads before it concludes the commit is not coming — 200 ms
-/// against a window that is one scheduler turn wide, so a stale generation's shutdown path (which
-/// *does* await) is the only realistic way to exhaust it.
-const COMMIT_SETTLE_STEPS: u32 = 40;
 
 /// The late-bound executor behind every tool [`crate::registration`] registers — the port of
 /// upstream's `() => state` / `() => initPromise` / `currentOwner` closures.
@@ -102,13 +85,19 @@ impl McpDispatch {
         Self { extension }
     }
 
-    /// `index.ts:906`'s init gate, as the four states a call can find the generation in.
+    /// The init gate of a direct tool, as the states a call can find the generation in.
     ///
     /// The owner is read **once, before the wait** (`const executeOwner = currentOwner;`) and
     /// travels with the outcome: fencing on a re-read would fence a call that began under
     /// generation N against generation N+1's owner, which is active, and so would let the stale
     /// call through — the precise write the fence exists to refuse.
-    async fn gate(&self) -> Gate {
+    ///
+    /// A build in flight is waited for until it settles, with no bound of its own, and the call's
+    /// own `cancel` ends the wait (MCP-631). Upstream's direct tool waits the same way —
+    /// `await ensureSessionRuntime(ctx)` before its executor runs (`index.ts:491` @v5.2.0), with no
+    /// bound — but observes no signal while it does; the gateway's wait is the bounded one
+    /// ([`ProxyInitGate`]).
+    async fn gate(&self, cancel: &CancelToken) -> Gate {
         let Some(extension) = self.extension.upgrade() else {
             return Gate {
                 owner: None,
@@ -122,22 +111,26 @@ impl McpDispatch {
                 outcome: GateOutcome::Ready(ctx),
             };
         }
-        let Some(task) = extension.init_task() else {
+        let Some(build) = extension.init_task() else {
             return Gate {
                 owner,
                 outcome: GateOutcome::NotInitialized,
             };
         };
-        let waited = tokio::time::timeout(
-            Duration::from_millis(INIT_WAIT_TIMEOUT_MS),
-            join_build(&extension, &task),
-        )
-        .await;
-        let outcome = match waited {
-            Err(_) => GateOutcome::TimedOut,
-            Ok(Settled::Ready(ctx)) => GateOutcome::Ready(ctx),
-            Ok(Settled::Failed(message)) => GateOutcome::Failed(message),
-            Ok(Settled::Gone) => GateOutcome::NotInitialized,
+        let settled = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Gate {
+                    owner,
+                    outcome: GateOutcome::Aborted,
+                };
+            }
+            settled = settle(&extension, &build) => settled,
+        };
+        let outcome = match settled {
+            Settled::Ready(ctx) => GateOutcome::Ready(ctx),
+            Settled::Failed(message) => GateOutcome::Failed(message),
+            Settled::Gone => GateOutcome::NotInitialized,
         };
         Gate { owner, outcome }
     }
@@ -163,10 +156,10 @@ impl McpDispatch {
             gate.set_owner(extension.owner());
             if let Some(ctx) = extension.proxy_ctx() {
                 let _ = sender.send(InitPhase::Ready(ctx));
-            } else if let Some(task) = extension.init_task() {
+            } else if let Some(build) = extension.init_task() {
                 let _ = sender.send(InitPhase::Pending);
                 tokio::spawn(async move {
-                    let phase = match join_build(&extension, &task).await {
+                    let phase = match settle(&extension, &build).await {
                         Settled::Ready(ctx) => InitPhase::Ready(ctx),
                         Settled::Failed(message) => InitPhase::Failed(message),
                         // Upstream's `!state` after the await: the build resolved, and the commit
@@ -194,8 +187,8 @@ struct Gate {
 enum GateOutcome {
     /// A committed context: the call proceeds.
     Ready(Arc<ProxyCtx>),
-    /// The wait hit [`INIT_WAIT_TIMEOUT_MS`] with the build still running.
-    TimedOut,
+    /// The call's own token was cancelled while it waited for the build.
+    Aborted,
     /// The build rejected. Carries the message the `init_failed` envelope reports.
     Failed(String),
     /// Nothing is committed and nothing is coming.
@@ -211,45 +204,16 @@ enum Settled {
     Gone,
 }
 
-/// Join the memoised build rather than starting a rival one, then read what it committed.
+/// What the build this call joined came to, once its driver has settled it.
 ///
-/// Cloning the `Shared` out of the `Arc` clones the *inner* handle and leaves the outer `Arc`'s
-/// identity intact, which is what lets a call attach to a build without disturbing
-/// `startInitialization`'s third staleness check (`Arc::ptr_eq` on that same outer `Arc`).
-async fn join_build(extension: &Arc<McpExtension>, task: &Arc<InitTask>) -> Settled {
-    match (**task).clone().await {
-        Ok(_) => match committed_ctx(extension).await {
-            Some(ctx) => Settled::Ready(ctx),
-            None => Settled::Gone,
-        },
-        Err(error) => Settled::Failed(error.to_string()),
+/// The commit installs the proxy context before it settles the build, so a [`BuildState::Committed`]
+/// build's context is there to read; a superseded build leaves none.
+async fn settle(extension: &Arc<McpExtension>, build: &Arc<Build>) -> Settled {
+    match build.settled().await {
+        BuildState::Committed => extension.proxy_ctx().map_or(Settled::Gone, Settled::Ready),
+        BuildState::Failed(message) => Settled::Failed(message),
+        BuildState::Superseded | BuildState::Running => Settled::Gone,
     }
-}
-
-/// The committed context, re-read across the commit tail's scheduling window (see
-/// [`COMMIT_SETTLE_STEP`]).
-async fn committed_ctx(extension: &Arc<McpExtension>) -> Option<Arc<ProxyCtx>> {
-    for _ in 0..COMMIT_SETTLE_STEPS {
-        if let Some(ctx) = extension.proxy_ctx() {
-            return Some(ctx);
-        }
-        tokio::time::sleep(COMMIT_SETTLE_STEP).await;
-    }
-    extension.proxy_ctx()
-}
-
-/// `index.ts:911` — the timeout envelope. No `mode` key, and it carries the budget it gave up on.
-fn init_timeout_result() -> ToolResult {
-    let mut map = JsonMap::new();
-    map.insert(
-        "error".to_string(),
-        Value::String(McpErrorCode::InitTimeout.as_str().to_string()),
-    );
-    map.insert("timeoutMs".to_string(), json!(INIT_WAIT_TIMEOUT_MS));
-    text_result(
-        "MCP initialization is still in progress. Try again shortly.",
-        map,
-    )
 }
 
 /// `index.ts:917` — the rejected-build envelope, reporting the message rather than throwing it.
@@ -318,15 +282,18 @@ impl McpToolDispatch for McpDispatch {
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        // [CYRUP-DELTA] `direct-tools.ts:137` @v5.2.0 awaits `initPromise` with no bound
-        // (`state = await initPromise`), where only the gateway is bounded by
-        // `awaitWithTimeout(initPromise, INIT_WAIT_TIMEOUT_MS)`. A direct call shares the gateway's
-        // gate and so its 30 s bound and `init_timeout` envelope: a build that never settles ends
-        // the call with a result the model can act on instead of holding the turn.
-        let gate = self.gate().await;
+        // `throwIfAborted(signal)` (`direct-tools.ts:140` @v5.2.0): a call cancelled before it
+        // began does not wait for anything.
+        crate::abort::throw_if_aborted(&cancel, None)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let gate = self.gate(&cancel).await;
         let ctx = match gate.outcome {
             GateOutcome::Ready(ctx) => ctx,
-            GateOutcome::TimedOut => return Ok(init_timeout_result()),
+            // [CYRUP-DELTA, upward] The call's own cancel ends its wait for the build; upstream's
+            // `await ensureSessionRuntime(ctx)` observes no signal.
+            GateOutcome::Aborted => {
+                return Err(ToolError::new(crate::abort::ABORTED_FALLBACK_REASON));
+            }
             GateOutcome::Failed(message) => {
                 // An owner abort rethrows rather than reporting — the session is going away, and a
                 // successful result describing that would be recorded in a transcript nobody keeps.
@@ -511,22 +478,7 @@ mod tests {
         );
     }
 
-    // ---- The two envelopes `call_direct` builds for itself ---------------------------------------
-
-    /// `init_timeout` carries the budget it gave up on, so the model can decide whether to retry.
-    #[test]
-    fn the_timeout_envelope_reports_the_budget() {
-        let result = init_timeout_result();
-        assert_eq!(error_code(&result).as_deref(), Some("init_timeout"));
-        assert_eq!(
-            result.details.as_ref().and_then(|d| d.get("timeoutMs")),
-            Some(&json!(INIT_WAIT_TIMEOUT_MS))
-        );
-        assert_eq!(
-            text(&result),
-            "MCP initialization is still in progress. Try again shortly."
-        );
-    }
+    // ---- The envelope `call_direct` builds for itself --------------------------------------------
 
     /// `init_failed` reports the rejection message in both the text and `details.message`.
     #[test]
