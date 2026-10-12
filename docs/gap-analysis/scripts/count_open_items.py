@@ -40,8 +40,30 @@ WHAT IT PARSES
     use the standard table too. Area 16 is NOT a port: `cyrup-herdr` is
     cyrup's own client of herdr's socket API, so its `client-bug` /
     `protocol-drift` kinds are client conformance and are folded into Port
-    bug / Version lag (see KIND_TO_CLASS). Areas 13 and 15 stay outside this
-    census by README's standing rule; their own files count them.
+    bug / Version lag (see KIND_TO_CLASS).
+
+    Area 13 (the MCP port, `13-cyrup-mcp.md` and `13a`..`13i`) has no
+    `## Open items` heading: each section file carries its own standard
+    `| ID | Severity | Kind | Effort | Title |` table wherever its pass put it,
+    and some carry none. Every such table in the files listed in AREA_13_FILES
+    is read, wherever it sits. These are the area's defect rows (MCP-587 on).
+    The older port-plan UNITS (MCP-001.., status implemented / partial /
+    missing) are NOT counted: `13-cyrup-mcp-STATUS.md` never keeps one current
+    table of them -- each pass appends a table and leaves earlier ones as
+    filed -- so no per-unit open list can be read mechanically. See INVENTORY.
+
+    Area 15 (`15-cyrup-acp.md`) keeps its items in the table under
+    `## 6. Open items`, columns `sev | id | title | eff | area |
+    verification`, open or closed by the severity strike. The re-rating
+    table just above it (`id | from | to | why`) records severity changes,
+    not items, and is skipped because it has no `sev` column. The table has
+    no Kind column: a row whose text says it was filed from a drift triage is
+    `upstream-drift`, every other row is `not-ported` (a gap against pi-acp).
+
+INVENTORY
+    Every `*.md` in the directory is either counted or listed in
+    EXCLUDED_FILES with its reason. A file in neither -- a new area file --
+    makes the script fail, so nothing falls out of the census unnoticed.
 
 DUPLICATES
     A row whose `Dedup` column reads `duplicate-of: <ID>` is dropped from
@@ -118,6 +140,36 @@ STANDARD_AREAS = [
     ("18", "18-pi-codemode.md"),
 ]
 AREA_09A = ("09a", "09a-cyrup-ext-subagents-v0.57-drift.md")
+# Area 13's files that carry a standard `| ID | Severity | ... |` table. 13f and
+# 13g carry none (see EXCLUDED_FILES).
+AREA_13_FILES = [
+    "13-cyrup-mcp.md",
+    "13a-mcp-activation.md",
+    "13b-mcp-config.md",
+    "13c-mcp-servers.md",
+    "13d-mcp-proxy-modes.md",
+    "13e-mcp-tools.md",
+    "13h-mcp-tui.md",
+    "13i-mcp-protocol-and-verification.md",
+]
+AREA_15 = ("15", "15-cyrup-acp.md")
+
+# Every other `*.md` here, and why it holds nothing to count. Adding a file to
+# docs/gap-analysis/ means adding it to the census or to this list.
+EXCLUDED_FILES = {
+    "README.md": "the ledger's rules and format; holds no items",
+    "00-residual-ledger.md": "a ranked view of the area files' rows; counting it would count each row twice",
+    "PARITY-GAPS.md": "a grouped view of the area files' rows; counting it would count each row twice",
+    "REPRO-LOG.md": "a record of running the binary; holds no items",
+    "MCP-PORT-METHODOLOGY.md": "how the MCP port is done and checked; holds no items",
+    "13-cyrup-mcp-STATUS.md": (
+        "area 13's pass narrative and port-unit census. Its defect rows are counted from "
+        "13*.md's tables; its port units (implemented/partial/missing) have no single current "
+        "table to read, so they are not counted"
+    ),
+    "13f-mcp-credentials.md": "area 13 section analysis with no item table",
+    "13g-mcp-oauth.md": "area 13 section analysis with no item table",
+}
 
 SEVERITIES = ["critical", "high", "medium", "low"]
 
@@ -301,8 +353,14 @@ def parse_standard_area(path):
     if header_cells is None:
         raise ValueError(f"{path}: '## Open items' heading found but no table header in range")
 
+    return rows_to_items(rows, header_cells)
+
+
+def rows_to_items(rows, header_cells, sev_name="severity"):
+    """The rows of one item table, as items. Shared by the standard areas and
+    by areas 13 and 15, so one row is read the same way wherever it sits."""
     id_idx = header_cells.index("id")
-    sev_idx = header_cells.index("severity")
+    sev_idx = header_cells.index(sev_name)
     kind_idx = header_cells.index("kind") if "kind" in header_cells else None
     title_idx = header_cells.index("title") if "title" in header_cells else None
     dedup_idx = header_cells.index("dedup") if "dedup" in header_cells else None
@@ -348,9 +406,75 @@ def parse_standard_area(path):
                 "kind": kind,
                 "raw_severity_cell": raw_sev_cell,
                 "duplicate_of": dup_of,
+                "title": cells[title_idx] if title_idx is not None and len(cells) > title_idx else "",
             }
         )
     return parsed
+
+
+SEPARATOR_RE = re.compile(r"^\|[\s:|-]+\|\s*$")
+
+
+def tables(lines, start, end, wanted):
+    """Every table in lines[start:end] whose lowercased header cells satisfy
+    `wanted`, as (header_cells, [(lineno, cells), ...])."""
+    found = []
+    i = start
+    while i < end - 1:
+        if lines[i].startswith("|") and SEPARATOR_RE.match(lines[i + 1]):
+            header = [c.strip().lower() for c in split_row(lines[i])]
+            j = i + 2
+            rows = []
+            while j < end and lines[j].startswith("|"):
+                rows.append((j + 1, split_row(lines[j])))
+                j += 1
+            if wanted(header):
+                found.append((header, rows))
+            i = j
+        else:
+            i += 1
+    return found
+
+
+def parse_area_13(directory):
+    """Every standard item table in AREA_13_FILES, wherever it sits."""
+    parsed = []
+    for fname in AREA_13_FILES:
+        with open(os.path.join(directory, fname), encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        for header, rows in tables(lines, 0, len(lines),
+                                   lambda h: h[:3] == ["id", "severity", "kind"]):
+            for item in rows_to_items(rows, header):
+                item["file"] = fname
+                parsed.append(item)
+    return parsed
+
+
+def parse_area_15(path):
+    """The item table under `## 6. Open items`; see the module docstring."""
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    start = next(i for i, l in enumerate(lines) if l.strip() == "## 6. Open items")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    parsed = []
+    for header, rows in tables(lines, start, end, lambda h: "sev" in h and "id" in h):
+        for item in rows_to_items(rows, header, sev_name="sev"):
+            item["kind"] = "upstream-drift" if "drift triage" in item["title"] else "not-ported"
+            parsed.append(item)
+    return parsed
+
+
+def inventory(directory):
+    """(counted, excluded, unaccounted, stale) over the directory's `*.md`."""
+    counted = {fname: area for area, fname in STANDARD_AREAS}
+    counted[AREA_09A[1]] = AREA_09A[0]
+    counted.update({fname: "13" for fname in AREA_13_FILES})
+    counted[AREA_15[1]] = AREA_15[0]
+    on_disk = sorted(f for f in os.listdir(directory) if f.endswith(".md"))
+    listed = set(counted) | set(EXCLUDED_FILES)
+    unaccounted = [f for f in on_disk if f not in listed]
+    stale = sorted(f for f in listed if f not in on_disk)
+    return counted, EXCLUDED_FILES, unaccounted, stale
 
 
 def parse_09a(path):
@@ -513,6 +637,16 @@ def main():
         all_items[area_id] = parse_standard_area(path)
     path_09a = os.path.join(args.dir, AREA_09A[1])
     all_items["09a"] = parse_09a(path_09a)
+    all_items["13"] = parse_area_13(args.dir)
+    all_items["15"] = parse_area_15(os.path.join(args.dir, AREA_15[1]))
+
+    counted, excluded, unaccounted, stale = inventory(args.dir)
+    if unaccounted or stale:
+        for f in unaccounted:
+            print(f"UNACCOUNTED: {f} is neither counted nor in EXCLUDED_FILES", file=sys.stderr)
+        for f in stale:
+            print(f"STALE: {f} is listed but not on disk", file=sys.stderr)
+        sys.exit(1)
 
     per_area, class_totals, unclassified, above_medium, duplicates = tally(all_items)
 
@@ -523,10 +657,11 @@ def main():
             "unclassified": unclassified,
             "above_medium": above_medium,
             "duplicates": duplicates,
+            "inventory": {"counted": counted, "excluded": excluded},
         }, indent=2, sort_keys=True))
         return
 
-    order = [a for a, _ in STANDARD_AREAS] + ["09a"]
+    order = [a for a, _ in STANDARD_AREAS] + ["09a", "13", "15"]
     total = {"open": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "trackers": 0, "closed": 0,
              "duplicates": 0}
     print(f"{'area':<5}{'open':>6}{'crit':>6}{'high':>6}{'med':>6}{'low':>6}{'trackers':>10}{'closed':>8}{'dups':>6}")
@@ -536,9 +671,17 @@ def main():
         for k in total:
             total[k] += c[k]
     print(f"{'TOTAL':<5}{total['open']:>6}{total['critical']:>6}{total['high']:>6}{total['medium']:>6}{total['low']:>6}{total['trackers']:>10}{total['closed']:>8}{total['duplicates']:>6}")
-    print("(areas 13 and 15 are counted in their own files by the standing rule; area 16 is a")
-    print(" client of herdr, not a port -- its client-bug/protocol-drift kinds fold into Port bug /")
+    print("(area 13 counts its defect rows only, not its port units -- see the inventory; area 16 is")
+    print(" a client of herdr, not a port -- its client-bug/protocol-drift kinds fold into Port bug /")
     print(" Version lag as documented in KIND_TO_CLASS)")
+
+    print()
+    print("Inventory (every *.md here, counted or excluded):")
+    for f in sorted(set(counted) | set(excluded)):
+        if f in counted:
+            print(f"  {f:<42} counted, area {counted[f]}")
+        else:
+            print(f"  {f:<42} excluded: {excluded[f]}")
 
     if duplicates:
         print()

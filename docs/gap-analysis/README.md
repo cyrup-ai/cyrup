@@ -96,7 +96,11 @@ partial / missing) against a plan, so a forward-looking port unit and a backward
 into anything a planner can act on. **The exclusion runs both ways: nothing in `README.md`,
 `00-residual-ledger.md` or `PARITY-GAPS.md` speaks for `13-cyrup-mcp.md`, `13a`–`13i` or
 `MCP-PORT-METHODOLOGY.md` — and those files' own tables are the authority for their unit inventory
-and its status.** *Correction 2026-09-04: earlier editions said another team owned area 13. That was
+and its status.** *Changed 2026-10-12: area 13's defect rows — the standard `ID | Severity | Kind |
+Effort | Title` tables in `13-cyrup-mcp.md` and `13a`–`13i`, `MCP-587` on — are bugs in code that exists
+and are now counted by `scripts/count_open_items.py`. Its port units (implemented / partial / missing)
+are still not: `13-cyrup-mcp-STATUS.md` keeps no single current table of them, so they cannot be read
+mechanically.* *Correction 2026-09-04: earlier editions said another team owned area 13. That was
 never true — every upstream port, the MCP adapter included, is this repository's own work and is
 schedulable from this directory. The count separation above stands on the structural reason only.*
 
@@ -140,7 +144,8 @@ editor — Zed is the reference client — drive cyrup over JSON-RPC on stdio. *
 counted separately from the twelve for the same structural reason as area 13**: it began as a spec
 for code that did not exist yet, and its port units cannot be added to a backward-looking defect count. The
 exclusion runs both ways, and [`15-cyrup-acp.md`](15-cyrup-acp.md)'s own tables are the authority
-for its unit inventory and status.
+for its unit inventory and status. *Changed 2026-10-12: the open rows of its `## 6. Open items` table
+are real gaps in code that exists, and `scripts/count_open_items.py` now counts that table.*
 
 **Area 15's defining decision is an inversion of its upstream, and it is worth knowing before
 reading any unit.** pi-acp is an out-of-process adapter by necessity — a separate npm package that
