@@ -40,6 +40,7 @@ mod extension_model_calls;
 mod fork_non_persisted;
 mod fork_parent_and_unsaved_guard;
 mod get_commands_source_info;
+mod guest_over_builtin;
 mod host_flag_value;
 mod inject_message_details;
 mod inject_message_display;

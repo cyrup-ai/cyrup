@@ -280,6 +280,21 @@ pub fn all_providers_with_overlay(
     }
 }
 
+/// The ONE built-in provider registered under `id`, over the given store + registry and with the
+/// optional catalog overlay applied — pi `builtins.get(id)`, the base `composeProvider` composes a
+/// registration over when no native extension owns the id (`core/model-runtime.ts:301-310`
+/// @f1b2e77f5). `None` for an id no built-in owns. PROV-162.
+pub fn builtin_provider(
+    id: &str,
+    store: Arc<dyn CredentialStore>,
+    registry: Arc<ApiRegistry>,
+    overlay: Option<&CatalogOverlay>,
+) -> Option<Arc<dyn Provider>> {
+    all_providers_with_overlay(store, registry, overlay)
+        .into_iter()
+        .find(|provider| provider.id().as_str() == id)
+}
+
 fn builtin_providers_with(
     store: Arc<dyn CredentialStore>,
     registry: Arc<ApiRegistry>,

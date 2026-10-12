@@ -60,7 +60,7 @@ pub(super) fn install(api: &mut ExtensionApi) {
             api_key: None,
             auth_header: None,
             headers: Default::default(),
-            models: vec![crate::ProviderModelConfig {
+            models: Some(vec![crate::ProviderModelConfig {
                 id: "demo-model".into(),
                 name: Some("Demo Model".into()),
                 // Full Pi model shape (sdk gap #26): reasoning/input modalities/cost/contextWindow/maxTokens.
@@ -76,7 +76,7 @@ pub(super) fn install(api: &mut ExtensionApi) {
                 context_window: Some(200000),
                 max_tokens: Some(8192),
                 ..Default::default()
-            }],
+            }]),
             oauth: None,
             has_stream_simple: false,
         },

@@ -8,8 +8,10 @@
 //! folds the registered models straight into `this.models`).
 //!
 //! cyrup's session streams through a concrete [`Provider`] per provider id, so this registry realizes
-//! each guest registration as a `ConfigProvider` (via [`cyrup_ext::ProviderRegistration::build_provider`])
-//! and holds it behind an `Arc`. The [`AgentSession`](crate::AgentSession) then UNIONs these providers'
+//! each guest registration as a provider and holds it behind an `Arc`: under an id no base owns, a
+//! `ConfigProvider` ([`cyrup_ext::ProviderRegistration::build_provider`]); under a built-in id, the
+//! registration composed over that base ([`cyrup_ext::ProviderRegistration::compose_over`], pi
+//! `composeProvider`, PROV-162). The [`AgentSession`](crate::AgentSession) then UNIONs these providers'
 //! catalogs into `full_model_registry()` / `available_model_catalog()` and installs the owning provider
 //! into the [`crate::ProviderSwap`] on a matching `set_model`, so the registered model is both
 //! SELECTABLE and STREAMABLE in the assembled run.
@@ -89,7 +91,23 @@ pub struct GuestProviderRegistry {
     /// from a thread with no tokio runtime current spawns its restore here (see
     /// [`GuestProviderRegistry::runtime_handle`]).
     restore_runtime: Mutex<Option<tokio::runtime::Handle>>,
+    /// PROV-162 — what a registration under an id is composed OVER: pi's `base =
+    /// nativeExtensionProviders.get(id) ?? builtins.get(id)` (`core/model-runtime.ts:301-310`
+    /// @f1b2e77f5), with the session's `models.json` layer applied where it has one (pi composes
+    /// built-in → `models.json` → extension in one provider, `provider-composer.ts:555-560`). The
+    /// session attaches one ([`GuestProviderRegistry::attach_base_resolver`]); unattached, the
+    /// compiled-in built-in over the refresh store.
+    base_resolver: Mutex<Option<BaseResolver>>,
+    /// The ids whose provider is a registration composed over a base WITHOUT a key of its own: such
+    /// an id is configured only through the composed auth (pi `checkAuth` over the composed provider,
+    /// `model-runtime.ts:343`), not by being registered. See
+    /// [`GuestProviderRegistry::carries_own_credentials`].
+    keyless_composed: Mutex<BTreeSet<String>>,
 }
+
+/// Resolves the base provider a registration under `id` composes over (see
+/// [`GuestProviderRegistry::attach_base_resolver`]). `None`: no base owns the id.
+pub type BaseResolver = Arc<dyn Fn(&str) -> Option<Arc<dyn Provider>> + Send + Sync>;
 
 /// What [`GuestProviderRegistry::attach_virtual_models`] binds: the registry a registration lands
 /// in, and the catalog its two validations read.
@@ -206,8 +224,60 @@ impl GuestProviderRegistry {
         *poison_safe(&self.virtual_models) = Some(VirtualModelSink { registry, catalog });
     }
 
+    ///
+    /// PROV-162 — a provider ALREADY registered under the slot's id is stored into it at once: the
+    /// builder flushes the extensions' startup registrations into this registry before it builds
+    /// the slot, so a startup `registerProvider` over the installed provider's id (a proxy
+    /// `baseUrl` over the built-in the session started on) would otherwise leave the session
+    /// streaming the uncomposed built-in. pi has one registry; the composed provider is the only
+    /// one under the id.
     pub fn follow_installed(&self, swap: &Arc<ProviderSwap>) {
         *poison_safe(&self.installed) = Some(Arc::downgrade(swap));
+        let registered = self.provider(swap.current().id().as_str());
+        if let Some(provider) = registered {
+            swap.store(provider);
+        }
+    }
+
+    /// PROV-162 — install what a registration under an id composes over (see
+    /// [`BaseResolver`]). Called by [`crate::SessionBuilder`] BEFORE the bind flush, so the
+    /// extensions' startup registrations compose over the session's own built-ins and
+    /// `models.json`.
+    pub fn attach_base_resolver(&self, resolver: BaseResolver) {
+        *poison_safe(&self.base_resolver) = Some(resolver);
+    }
+
+    /// The base a registration under `id` composes over: the attached resolver's answer, else the
+    /// compiled-in built-in over the refresh engine's credential store.
+    fn base_provider(&self, id: &str) -> Option<Arc<dyn Provider>> {
+        let resolver = poison_safe(&self.base_resolver).clone();
+        match resolver {
+            Some(resolver) => resolver(id),
+            None => cyrup_provider::builtin_provider(
+                id,
+                self.refresh.auth().0,
+                Arc::new(cyrup_provider::builtin_registry()),
+                None,
+            ),
+        }
+    }
+
+    /// Whether the guest provider under `id` brings its own credentials, so being registered is
+    /// enough to count as configured: a registration under a fresh id or a live provider (cyrup's
+    /// standing rule, pi `hasConfiguredAuth` with a provider-request key), or a registration over a
+    /// base that carries a key (pi `composeApiKeyAuth`'s `check`, `provider-composer.ts:445-451`).
+    /// A KEY-LESS registration over a base is configured only through the composed auth's
+    /// inherited check (`:453-455`), which the caller asks the base's own predicates. PROV-162.
+    pub fn carries_own_credentials(&self, id: &str) -> bool {
+        self.has_provider(id) && !poison_safe(&self.keyless_composed).contains(id)
+    }
+
+    /// The registered providers, by id (a snapshot of the map).
+    pub fn providers(&self) -> Vec<(String, Arc<dyn Provider>)> {
+        self.lock()
+            .iter()
+            .map(|(id, provider)| (id.clone(), Arc::clone(provider)))
+            .collect()
     }
 
     /// Store `provider` into the bound installed-provider slot when that holds the same id.
@@ -1155,7 +1225,30 @@ impl ProviderRefresher for GuestProviderRegistry {
 impl ModelRegistrySink for GuestProviderRegistry {
     fn upsert_provider(&self, reg: &ProviderRegistration) {
         // Full replacement for this provider id (Pi "replaces all models", model-registry.ts:919).
-        let provider = reg.build_provider();
+        //
+        // PROV-162 — pi stores the registration as the id's `extension` layer and recomposes the
+        // id OVER its base (`model-runtime.ts:921-934` → `composeProvider`, `:301-310`). An id a
+        // base owns is composed over it with the session's own store and auth context (pi's
+        // `ModelRuntime` `credentials`/`authContext`); an id no base owns is realized from the
+        // registration alone, exactly as before.
+        let (provider, keyless) = match self.base_provider(&reg.id) {
+            Some(base) => {
+                let (store, ctx) = self.refresh.auth();
+                match reg.compose_over(base, store, Some(ctx)) {
+                    Ok(provider) => (
+                        provider,
+                        reg.resolved_api_key.as_deref().is_none_or(str::is_empty),
+                    ),
+                    // pi records the composition error and keeps the base registered
+                    // (`model-runtime.ts:312-315`): the registration does not land.
+                    Err(message) => {
+                        tracing::warn!(provider = %reg.id, "{message}");
+                        return;
+                    }
+                }
+            }
+            None => (reg.build_provider(), false),
+        };
         // One hold of the map for the stale check, the supersede, the insert, the installed slot
         // and the bump (SEAM-145, see `stale_publication`).
         let mut providers = self.lock();
@@ -1164,6 +1257,14 @@ impl ModelRegistrySink for GuestProviderRegistry {
         }
         self.supersede_refresh(&reg.id);
         providers.insert(reg.id.clone(), Arc::clone(&provider));
+        {
+            let mut keyless_composed = poison_safe(&self.keyless_composed);
+            if keyless {
+                keyless_composed.insert(reg.id.clone());
+            } else {
+                keyless_composed.remove(&reg.id);
+            }
+        }
         self.replace_installed(&reg.id, &provider);
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
@@ -1186,6 +1287,7 @@ impl ModelRegistrySink for GuestProviderRegistry {
             let is_new = providers
                 .insert(id.to_string(), Arc::clone(&provider))
                 .is_none();
+            poison_safe(&self.keyless_composed).remove(id);
             let late_restore = if is_new {
                 self.begin_late_restore(id, &provider)
             } else {
@@ -1212,6 +1314,7 @@ impl ModelRegistrySink for GuestProviderRegistry {
             }
             self.supersede_refresh(id);
             providers.remove(id);
+            poison_safe(&self.keyless_composed).remove(id);
             // SEAM-144: begun under the same hold, so a registration that follows supersedes
             // this restore, never the reverse.
             let restore = self.begin_removal_restore(&providers);

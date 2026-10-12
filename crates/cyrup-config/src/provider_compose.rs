@@ -35,80 +35,63 @@
 //! (PROV-157). Where the base is one of pi's single-api built-ins, pi's base streams any model
 //! through its one api (`apiFor = single ?? byApi[model.api]`, `models.ts:1070`) where cyrup
 //! dispatches on `model.api`: that is PROV-160, not a composition question.
+//!
+//! The assembly itself — auth layers, name/`baseUrl` fallbacks, `headers`, operations and
+//! `supportsBaseApi` routing — is the ONE composer, `cyrup_provider::compose::compose_over_base`,
+//! which a guest `registerProvider` over a built-in id goes through as well (PROV-162). This module
+//! supplies the `models.json` layer: its catalog step (`apply_models_json`) and its config-value
+//! language for the key and header templates.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cyrup_core::ProviderId;
-use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
-use cyrup_provider::wire::{ApiDispatch, WireProvider};
-use cyrup_provider::{
-    AnyModel, ApiKeyAuth, ApiRegistry, AuthContext, AuthError, AuthResult, ClassifierModel,
-    CreateModelsOptions, Credential, CredentialStore, ImageModel, InMemoryCredentialStore, Model,
-    ModelAuth, Models, ProviderAuth, all_providers_with_overlay, builtin_registry, create_models,
+use cyrup_provider::compose::{
+    AuthLayer, ConfigValues, ProviderLayer, RawHeaders, compose_over_base,
 };
+use cyrup_provider::{
+    AnyModel, ApiRegistry, AuthContext, ClassifierModel, CreateModelsOptions, CredentialStore,
+    ImageModel, InMemoryCredentialStore, Model, Models, all_providers_with_overlay,
+    builtin_registry, create_models,
+};
+
+/// The composed provider's API-key strategy — pi `composeApiKeyAuth`. It lives with the ONE
+/// composer in `cyrup-provider` (PROV-162); re-exported here, where it was first ported.
+pub use cyrup_provider::compose::ConfiguredApiKeyAuth;
 
 use crate::config_value::{
     config_value_env_var_names, resolve_config_value_or_throw_async, resolve_headers_or_throw,
 };
 use crate::model::{ModelFile, ProviderConfig, apply_models_json, model_base_url_override};
 
-/// Pi `configContextEnv` (provider-composer.ts:279-291): resolve, **through the injected auth
-/// context** rather than the ambient process env, every environment variable named by a
-/// config-value template, layered over `explicit`.
-async fn config_context_env(
-    values: &[String],
-    ctx: &dyn AuthContext,
-    explicit: Option<&HashMap<String, String>>,
-) -> Option<HashMap<String, String>> {
-    let mut env: HashMap<String, String> = explicit.cloned().unwrap_or_default();
-    let mut names: Vec<String> = Vec::new();
-    for value in values {
-        for name in config_value_env_var_names(value) {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-    }
-    for name in names {
-        if env.contains_key(&name) {
-            continue;
-        }
-        if let Some(value) = ctx.env(&name).await {
-            env.insert(name, value);
-        }
-    }
-    if env.is_empty() { None } else { Some(env) }
-}
+/// pi's config-value language (`resolve-config-value.ts`): `$VAR` / `${VAR}` templates and
+/// `!command` values — what a `models.json` block's `apiKey` and `headers` are written in. The
+/// shared composer resolves a layer's values through this.
+struct ConfigValueLanguage;
 
-/// Pi `withConfiguredAuth` (provider-composer.ts:250-262): merge the provider's configured headers
-/// over the resolved ones, then add `Authorization: Bearer <key>` when `authHeader` is set.
-///
-/// `authHeader` with no resolved key is Pi's `throw new Error("authHeader requires a resolved API
-/// key")`; here it is an `Err` that the caller turns into a terminal stream error, never a panic.
-fn with_configured_auth(
-    mut auth: ModelAuth,
-    headers: Option<HashMap<String, String>>,
-    auth_header: bool,
-) -> Result<ModelAuth, String> {
-    if auth.headers.is_some() || headers.is_some() {
-        let mut merged = auth.headers.take().unwrap_or_default();
-        if let Some(configured) = headers {
-            for (key, value) in configured {
-                merged.insert(key, Some(value));
-            }
-        }
-        auth.headers = Some(merged);
+#[async_trait::async_trait]
+impl ConfigValues for ConfigValueLanguage {
+    fn env_var_names(&self, raw: &str) -> Vec<String> {
+        config_value_env_var_names(raw)
     }
-    if auth_header {
-        let Some(key) = auth.api_key.clone() else {
-            return Err("authHeader requires a resolved API key".to_string());
-        };
-        auth.headers
-            .get_or_insert_with(Default::default)
-            .insert("Authorization".to_string(), Some(format!("Bearer {key}")));
+
+    async fn resolve(
+        &self,
+        raw: &str,
+        description: &str,
+        env: Option<&HashMap<String, String>>,
+    ) -> Result<String, String> {
+        // CFG-028: `!command` resolution runs on the blocking pool (same 10 s ceiling).
+        resolve_config_value_or_throw_async(raw, description, env).await
     }
-    Ok(auth)
+
+    fn resolve_headers(
+        &self,
+        headers: Option<&RawHeaders>,
+        description: &str,
+        env: Option<&HashMap<String, String>>,
+    ) -> Result<Option<RawHeaders>, String> {
+        resolve_headers_or_throw(headers, description, env)
+    }
 }
 
 /// Pi `rawModelHeaders` (provider-composer.ts:384-396): the PER-MODEL request headers a
@@ -146,260 +129,31 @@ fn raw_model_headers(config: &ProviderConfig) -> HashMap<String, HashMap<String,
     out
 }
 
-fn auth_err(provider: &ProviderId, message: String) -> AuthError {
-    AuthError::ApiKey {
-        provider: provider.clone(),
-        cause: message.into(),
-    }
+/// A `models.json` block's auth inputs as the shared composer's [`AuthLayer`] (pi
+/// `configuredApiKey` / `configuredHeaders` / `authHeader` / `rawModelHeaders`,
+/// provider-composer.ts:388-401, :429, :508-527), resolving through pi's config-value language.
+fn auth_layer(config: &ProviderConfig) -> AuthLayer {
+    let mut layer = AuthLayer::new(Arc::new(ConfigValueLanguage));
+    layer.api_key = config.api_key.clone();
+    layer.headers = config
+        .headers
+        .as_ref()
+        .map(|h| h.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    layer.model_headers = raw_model_headers(config);
+    layer.auth_header = config.auth_header.unwrap_or(false);
+    layer
 }
 
-/// The API-key strategy of a **composed** provider — Pi `composeApiKeyAuth`
-/// (provider-composer.ts:293-357).
-///
-/// Precedence, exactly as Pi's `resolve` (:333-355):
-///
-/// 1. an explicit/stored [`Credential`] wins and is handed to the inherited built-in strategy when
-///    there is one (so e.g. anthropic's own credential handling still applies);
-/// 2. else the `models.json` `apiKey` resolved through the config-value language
-///    (`${VAR}` / `!command` — [`crate::config_value::resolve_config_value_or_throw`]), fed to the inherited strategy
-///    as a credential when there is one;
-/// 3. else the inherited strategy's own ambient resolution (its env vars).
-///
-/// Whatever resolves is then decorated with the provider's configured `headers` + `authHeader`.
-/// A base-less provider that declares no `apiKey` therefore resolves ONLY from the credential
-/// store — matching Pi, and matching this pass's scope: credentials are *read* from the existing
-/// auth-store/env path, never acquired.
-pub struct ConfiguredApiKeyAuth {
-    provider_id: String,
-    /// Pi `name: inherited?.name ?? "API key"` (provider-composer.ts:315).
-    ///
-    /// **[CYRUP-DELTA]** `composeApiKeyAuth` evaluates that coalesce once, at compose time, into a
-    /// plain string field. [`ApiKeyAuth::name`] returns `&str`, so the resolved value is stored
-    /// here rather than recomputed per call — a borrow of a `String` owned by `inherited` cannot
-    /// outlive the `&self` frame. Same observable value, same evaluation point as upstream.
-    name: String,
-    api_key: Option<String>,
-    headers: Option<HashMap<String, String>>,
-    /// Per-model request headers, keyed by model id ([`raw_model_headers`]). Applied LAST, over the
-    /// provider-level `headers` and over `authHeader`'s `Authorization` — Pi's ordering, where
-    /// `composeApiKeyAuth` produces the provider layer and `ModelRuntime.getAuth` merges the model
-    /// layer on top of the finished result (model-runtime.ts:392-396).
-    model_headers: HashMap<String, HashMap<String, String>>,
-    auth_header: bool,
-    inherited: Option<Arc<dyn ApiKeyAuth>>,
-}
-
-#[async_trait::async_trait]
-impl ApiKeyAuth for ConfiguredApiKeyAuth {
-    /// Pi `name: inherited?.name ?? "API key"` (provider-composer.ts:315) — resolved at compose
-    /// time into [`ConfiguredApiKeyAuth::name`]. `/login`'s provider picker labels the api-key
-    /// option with this (`login.rs`'s `login_provider_options`, `method_name:
-    /// api_key.name()`), so hardcoding `"API key"` here erased the inherited strategy's display
-    /// name — `"Gemini API key"`, `"GitHub Copilot token"`, `"Hugging Face token"` — from every
-    /// provider a `models.json` block touches.
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Pi's `login` member is **unconditionally populated** — `inherited?.login ?? (async
-    /// (interaction) => …)` (provider-composer.ts:316-321) — so the object this composes always
-    /// satisfies `interactive-mode.ts:4942`'s `method.login !== undefined`, and
-    /// `ai/src/models.ts:433-435`'s `if (!method?.login) throw` never fires for a composed
-    /// provider.
-    ///
-    /// [`ApiKeyAuth::supports_login`] is cyrup's stand-in for that presence check
-    /// (`cyrup-provider/src/auth/mod.rs:64-78`), and its `false` default is what silently dropped
-    /// the inherited strategy's login one frame after `compose_provider_auth` captured it: every
-    /// `models.json`-declared provider answered `LoginError::Unsupported` at `login.rs`'s
-    /// `.filter(|s| s.supports_login())`.
-    fn supports_login(&self) -> bool {
-        true
-    }
-
-    /// Pi `login: inherited?.login ?? (async (interaction) => ({ type: "api_key", key: await
-    /// interaction.prompt({ type: "secret", message: "Enter API key" }) }))`
-    /// (provider-composer.ts:316-321).
-    ///
-    /// The `??` coalesce is on the *member*, not on the strategy: an `inherited` whose `login` is
-    /// absent (upstream's *"Absent = ambient-only"*, `ai/src/auth/types.ts:166`) falls through to
-    /// the generic flow exactly as an absent `inherited` does. `supports_login()` is cyrup's
-    /// spelling of `login !== undefined`, so it is the correct discriminator here.
-    ///
-    /// Delegating matters because the inherited flow is frequently multi-prompt — Cloudflare
-    /// (account id), Google Vertex (project + location), Amazon Bedrock (profile) — and the
-    /// generic one-secret flow would persist a partial credential and report success (ADR-0010
-    /// §"(3)"). Note the generic message is the literal `"Enter API key"`, NOT `env_key`'s
-    /// `format!("Enter {name}")` (`auth/helpers.ts:12`): upstream inlines the fixed string here.
-    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
-        if let Some(inner) = self.inherited.as_ref()
-            && inner.supports_login()
-        {
-            return inner.login(interaction).await;
-        }
-        let key = interaction
-            .prompt(AuthPrompt::secret("Enter API key"))
-            .await?;
-        Ok(Credential::api_key(key))
-    }
-
-    async fn resolve(
-        &self,
-        model: &Model,
-        ctx: &dyn AuthContext,
-        cred: Option<&Credential>,
-    ) -> Result<Option<AuthResult>, AuthError> {
-        let resolved: Option<AuthResult> = if let Some(cred) = cred {
-            match &self.inherited {
-                Some(inner) => inner.resolve(model, ctx, Some(cred)).await?,
-                None => match cred {
-                    Credential::ApiKey {
-                        key: Some(key),
-                        env,
-                    } if !key.is_empty() => Some(AuthResult {
-                        auth: ModelAuth {
-                            api_key: Some(key.clone()),
-                            ..Default::default()
-                        },
-                        env: env.clone(),
-                        source: Some("stored credential".to_string()),
-                    }),
-                    _ => None,
-                },
-            }
-        } else if let Some(raw) = &self.api_key {
-            let env = config_context_env(std::slice::from_ref(raw), ctx, None).await;
-            // CFG-028: `!command` resolution runs on the blocking pool (same 10 s ceiling).
-            let key = resolve_config_value_or_throw_async(
-                raw,
-                &format!("API key for provider \"{}\"", self.provider_id),
-                env.as_ref(),
-            )
-            .await
-            .map_err(|m| auth_err(&model.provider, m))?;
-            match &self.inherited {
-                Some(inner) => {
-                    inner
-                        .resolve(model, ctx, Some(&Credential::api_key(key)))
-                        .await?
-                }
-                None => Some(AuthResult {
-                    auth: ModelAuth {
-                        api_key: Some(key),
-                        ..Default::default()
-                    },
-                    env: None,
-                    source: Some("configured API key".to_string()),
-                }),
-            }
-        } else {
-            match &self.inherited {
-                Some(inner) => inner.resolve(model, ctx, None).await?,
-                None => None,
-            }
-        };
-
-        let Some(mut result) = resolved else {
-            return Ok(None);
-        };
-
-        // Pi :351-353 — the header templates resolve against the credential's env overlay merged
-        // under the resolution's own env, then through the auth context.
-        let mut explicit: HashMap<String, String> = HashMap::new();
-        if let Some(env) = cred.and_then(Credential::env) {
-            for (k, v) in env {
-                explicit.insert(k.clone(), v.clone());
-            }
-        }
-        if let Some(env) = &result.env {
-            for (k, v) in env {
-                explicit.insert(k.clone(), v.clone());
-            }
-        }
-        let values: Vec<String> = self
-            .headers
-            .as_ref()
-            .map(|h| h.values().cloned().collect())
-            .unwrap_or_default();
-        let header_env = config_context_env(&values, ctx, Some(&explicit)).await;
-        let headers = resolve_headers_or_throw(
-            self.headers.as_ref(),
-            &format!("provider \"{}\"", self.provider_id),
-            header_env.as_ref(),
-        )
-        .map_err(|m| auth_err(&model.provider, m))?;
-        result.auth = with_configured_auth(result.auth, headers, self.auth_header)
-            .map_err(|m| auth_err(&model.provider, m))?;
-
-        // Pi `ModelRuntime.getAuth`'s model branch (model-runtime.ts:383-397): resolve THIS model's
-        // configured headers (`resolveConfiguredModelHeaders`, provider-composer.ts:501-511) against
-        // the same env overlay and merge them over the resolved auth headers, on every call. This is
-        // the only place a `models.json` per-model header ever reaches a request.
-        if let Some(raw) = self.model_headers.get(model.id.as_str()) {
-            let values: Vec<String> = raw.values().cloned().collect();
-            let model_env = config_context_env(&values, ctx, Some(&explicit)).await;
-            let description = format!(
-                "model \"{}/{}\"",
-                model.provider.as_str(),
-                model.id.as_str()
-            );
-            let resolved = resolve_headers_or_throw(Some(raw), &description, model_env.as_ref())
-                .map_err(|m| auth_err(&model.provider, m))?;
-            if let Some(resolved) = resolved {
-                let merged = result.auth.headers.get_or_insert_with(Default::default);
-                for (key, value) in resolved {
-                    merged.insert(key, Some(value));
-                }
-            }
-        }
-        Ok(Some(result))
-    }
-}
-
-/// Pi `composeApiKeyAuth` + `composeOAuthAuth` + the `!apiKey && !oauth` guard
-/// (provider-composer.ts:293-382, :441-443).
-///
-/// OAuth is inherited from the base provider only — cyrup implements no OAuth *acquisition*, so a
-/// `models.json` block that names an `oauth` flow cannot mint one (out of scope for this pass).
-/// One consequence: a provider whose ONLY auth is that inherited OAuth strategy gets no
-/// [`ConfiguredApiKeyAuth`], so neither the provider-level nor the per-model configured headers ride
-/// along on its requests — Pi applies both there too (`composeOAuthAuth`'s `toAuth`,
-/// provider-composer.ts:371-379, plus `getAuth`). That gap belongs to the OAuth cluster.
-/// The `!inherited && !rawKey && oauth` early-out (:303) is Pi's "OAuth-only providers get no
-/// fabricated API-key login method".
+/// Pi `composeApiKeyAuth` + `composeOAuthAuth` + the `!apiKey && !oauth` guard for a `models.json`
+/// block — the shared composer's [`cyrup_provider::compose::compose_provider_auth`] over this
+/// block's [`auth_layer`].
+#[cfg(test)]
 fn compose_provider_auth(
     provider_id: &str,
-    base: Option<&ProviderAuth>,
+    base: Option<&cyrup_provider::ProviderAuth>,
     config: &ProviderConfig,
-) -> Result<ProviderAuth, String> {
-    let inherited = base.and_then(|a| a.api_key.clone());
-    let oauth = base.and_then(|a| a.oauth.clone());
-    let api_key: Option<Arc<dyn ApiKeyAuth>> =
-        if inherited.is_none() && config.api_key.is_none() && oauth.is_some() {
-            None
-        } else {
-            Some(Arc::new(ConfiguredApiKeyAuth {
-                provider_id: provider_id.to_string(),
-                // Pi `name: inherited?.name ?? "API key"` (:315).
-                name: inherited
-                    .as_ref()
-                    .map(|i| i.name().to_string())
-                    .unwrap_or_else(|| "API key".to_string()),
-                api_key: config.api_key.clone(),
-                headers: config
-                    .headers
-                    .as_ref()
-                    .map(|h| h.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-                model_headers: raw_model_headers(config),
-                auth_header: config.auth_header.unwrap_or(false),
-                inherited,
-            }))
-        };
-    if api_key.is_none() && oauth.is_none() {
-        return Err(format!(
-            "Provider {provider_id}: no authentication method configured."
-        ));
-    }
-    Ok(ProviderAuth { api_key, oauth })
+) -> Result<cyrup_provider::ProviderAuth, String> {
+    cyrup_provider::compose::compose_provider_auth(provider_id, base, &auth_layer(config))
 }
 
 impl ModelFile {
@@ -440,7 +194,6 @@ impl ModelFile {
                     AnyModel::Classifier(model) => base_classifiers.push(model),
                 }
             }
-            let base_auth = base.as_ref().and_then(|p| p.provider_auth());
             let composed = match apply_models_json(provider_id, &base_models, config) {
                 Ok(models) => models,
                 Err(message) => {
@@ -456,66 +209,43 @@ impl ModelFile {
                     model.base_url = base_url.to_string();
                 }
             }
-            let auth = match compose_provider_auth(provider_id, base_auth, config) {
-                Ok(auth) => auth,
-                Err(message) => {
-                    errors.push(message);
-                    continue;
-                }
-            };
             // Pi `name: extension?.name ?? config?.name ?? base?.name ?? extension?.oauth?.name ??
-            // providerId` and `baseUrl: extension?.baseUrl ?? config?.baseUrl ?? base?.baseUrl`
-            // (provider-composer.ts:607-608 @f1b2e77f5). No extension layer composes here (a guest
-            // registration is its own provider). The URL is the block's `baseUrl` even under
-            // `oauth` — deliberately NOT `model_base_url_override`, which drops it for the ROWS
-            // (:326, the block's URL is then the auth gateway); the provider's own `baseUrl` takes
-            // it either way. CFG-114.
+            // providerId` (provider-composer.ts:607 @f1b2e77f5); the base's name and `baseUrl`
+            // (`:608`) are the shared composer's fallback. The provider's URL is the block's
+            // `baseUrl` even under `oauth` — deliberately NOT `model_base_url_override`, which drops
+            // it for the ROWS (:326, the block's URL is then the auth gateway). CFG-114.
             //
             // An `oauth` block's base is pi's radius provider, named `config.name ?? providerId`
             // (`model-runtime.ts:263-276`), not the built-in cyrup composes over (`[CYRUP-DELTA]`
             // in `model/schema.rs`), so its name never falls back to the built-in's.
-            let name = config
-                .name
-                .clone()
-                .or_else(|| match config.oauth {
-                    Some(_) => None,
-                    None => base.as_ref().map(|b| b.name().to_string()),
-                })
-                .unwrap_or_else(|| provider_id.clone());
-            let base_url = config
-                .base_url
-                .clone()
-                .or_else(|| base.as_ref().and_then(|b| b.base_url().map(str::to_string)));
-            let mut provider = WireProvider::new(
-                provider_id.as_str(),
+            let name = match (&config.name, &config.oauth) {
+                (Some(name), _) => Some(name.clone()),
+                (None, Some(_)) => Some(provider_id.clone()),
+                (None, None) => None,
+            };
+            let layer = ProviderLayer {
                 name,
-                composed,
-                auth,
+                base_url: config.base_url.clone(),
+                models: composed,
+                image_models: base_images,
+                classifier_models: base_classifiers,
+                auth: auth_layer(config),
+            };
+            // The ONE composer (PROV-162): the base's auth layers, `headers`, operations and
+            // `supportsBaseApi` routing, `ApiDispatch::Global` for the rest (PROV-157). A block it
+            // rejects (`no authentication method configured`) leaves the built-in registered.
+            match compose_over_base(
+                provider_id,
+                base,
+                layer,
                 store.clone(),
                 registry.clone(),
-            )
-            .with_image_models(base_images)
-            .with_classifier_models(base_classifiers)
-            // `streamWith` falls through to the process-wide registry (provider-composer.ts:
-            // 598-599); a model its base lists is the base's (`:593-596`), resolved per request
-            // from `with_operations_from` below. PROV-157.
-            .with_api_dispatch(ApiDispatch::Global);
-            if let Some(base_url) = base_url {
-                provider = provider.with_base_url(base_url);
+                auth_context.clone(),
+            ) {
+                // Pi `models.setProvider(...)`, model-runtime.ts:215.
+                Ok(provider) => models.set_provider(Arc::new(provider)),
+                Err(message) => errors.push(message),
             }
-            if let Some(ctx) = &auth_context {
-                provider = provider.with_auth_context(ctx.clone());
-            }
-            // Pi's composed provider calls `base.generateImages` / `base.classify` when the base
-            // has them (provider-composer.ts:657, :669 @v1.0.4): the block changes the catalog and
-            // the auth, never what the provider can do.
-            if let Some(base) = &base {
-                provider = provider.with_operations_from(base.clone());
-            }
-            // Release the base handle (and `base_auth`, which borrows it) before the upsert that
-            // replaces it — Pi `models.setProvider(...)`, model-runtime.ts:215.
-            drop(base);
-            models.set_provider(Arc::new(provider));
         }
         errors
     }
@@ -563,7 +293,10 @@ mod tests {
     )]
 
     use super::*;
-    use cyrup_provider::auth::oauth::{AuthPromptKind, ScriptedInteraction};
+    use cyrup_provider::auth::oauth::{
+        AuthInteraction, AuthPrompt, AuthPromptKind, ScriptedInteraction,
+    };
+    use cyrup_provider::{ApiKeyAuth, AuthError, AuthResult, Credential, ProviderAuth};
 
     /// A stand-in for a built-in strategy with a real, MULTI-prompt `login` — the shape Cloudflare
     /// (key + account id), Vertex (key + project + location) and Bedrock actually have. Its

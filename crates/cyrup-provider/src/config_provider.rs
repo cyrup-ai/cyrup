@@ -5,8 +5,8 @@
 //! exactly like a built-in. Under a FRESH id that composition has no base, and its `streamWith`
 //! falls through to the process-wide api registry (`provider-composer.ts:583-603`): this provider
 //! declares [`ApiDispatch::Global`], so a miss reports pi's `No API provider registered for api:
-//! <api>` (PROV-157). A registration over a BUILT-IN id is composed over that base upstream; cyrup's
-//! `ConfigProvider` has no base, which is the composition gap `PROV-162`, not a dispatch question.
+//! <api>` (PROV-157). A registration over an id a base owns is NOT a `ConfigProvider`: it is
+//! composed over that base by the shared composer, [`crate::compose::compose_over_base`] (PROV-162).
 //!
 //! cyrup streams through a concrete [`Provider`] per provider id, so a guest registration is realized
 //! as a `ConfigProvider`: a static catalog + an api-key auth + an in-memory credential store seeded

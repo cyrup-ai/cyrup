@@ -1086,33 +1086,45 @@ impl Models {
         interaction: &dyn crate::auth::oauth::AuthInteraction,
         options: &crate::auth::LoginOptions,
     ) -> Result<crate::auth::Credential, ProviderError> {
-        let id: cyrup_core::ProviderId = provider.into();
+        // pi `models.ts:771`: ``if (!provider) throw new ModelsError("provider", `Unknown
+        // provider: ${providerId}`)`` — PROV-161.
         let entry = self
             .providers
             .get(provider)
-            .ok_or_else(|| auth_err(&id, "unknown provider"))?;
-        let auth = entry
-            .provider_auth()
-            .ok_or_else(|| auth_err(&id, "provider has no auth strategy"))?;
+            .ok_or_else(|| ProviderError::UnknownProvider(provider.into()))?;
+        // pi `:772-775`: ``const method = type === "oauth" ? provider.auth.oauth :
+        // provider.auth.apiKey; if (!method?.login) throw new ModelsError("auth",
+        // `${provider.name} does not support ${type} login`)``. An api-key strategy's `login` is
+        // OPTIONAL upstream (`ai/src/auth/types.ts:166`), which `supports_login` stands in for; an
+        // OAuth flow's is required. A provider with no auth at all (cyrup's `faux`; pi requires
+        // `auth` on every provider) has no method either way. PROV-161.
+        let unsupported = || ProviderError::LoginUnsupported {
+            provider_name: entry.name().to_string(),
+            auth_type: match auth_type {
+                AuthType::ApiKey => "api_key",
+                AuthType::Oauth => "oauth",
+            },
+        };
+        let auth = entry.provider_auth().ok_or_else(unsupported)?;
+        // pi awaits `method.login(…)` bare (`:776-777`), so a flow's own failure is the caller's
+        // error as the flow worded it — not re-wrapped as an api-key resolution failure.
         let cred = match auth_type {
             AuthType::Oauth => {
-                let flow = auth
-                    .oauth
-                    .as_ref()
-                    .ok_or_else(|| auth_err(&id, "provider has no OAuth flow"))?;
+                let flow = auth.oauth.as_ref().ok_or_else(unsupported)?;
                 flow.login(interaction, options)
                     .await
-                    .map_err(|e| auth_err(&id, &format!("login failed: {e}")))?
+                    .map_err(ProviderError::Login)?
             }
             AuthType::ApiKey => {
                 let strategy = auth
                     .api_key
                     .as_ref()
-                    .ok_or_else(|| auth_err(&id, "provider has no api-key strategy"))?;
+                    .filter(|strategy| strategy.supports_login())
+                    .ok_or_else(unsupported)?;
                 strategy
                     .login(interaction)
                     .await
-                    .map_err(|e| auth_err(&id, &format!("login failed: {e}")))?
+                    .map_err(ProviderError::Login)?
             }
         };
         let id = entry.id().clone();
@@ -1136,14 +1148,6 @@ impl Models {
         self.credentials.delete(&id).await?;
         Ok(())
     }
-}
-
-/// A `ProviderError::Auth` naming the provider — the shape [`crate::error::AuthError`] requires.
-fn auth_err(provider: &cyrup_core::ProviderId, detail: &str) -> ProviderError {
-    ProviderError::Auth(crate::error::AuthError::ApiKey {
-        provider: provider.clone(),
-        cause: detail.to_string().into(),
-    })
 }
 
 /// Whether a provider's configured auth is an api key or an OAuth credential
@@ -1206,29 +1210,44 @@ impl AuthHelper {
         let Some(resolution) = resolution else {
             return Err(ProviderError::NotConfigured(model.provider.clone()));
         };
-        let auth = &resolution.auth;
-        let mut request_model = model.clone();
-        if let Some(base_url) = &auth.base_url {
-            request_model.base_url = base_url.clone();
-        }
-        let mut request_options = options.clone();
-        request_options.api_key = options.api_key.clone().or_else(|| auth.api_key.clone());
-        let mut headers = merge_headers(auth.headers.as_ref(), options.headers.as_ref());
-        // PROV-042. `if (options?.transformHeaders) headers = await options.transformHeaders(headers
-        // ?? {})` (Pi `models.ts:480` @v0.83.0) — LAST, after auth headers and request headers are
-        // merged, so the transform observes the final set and its return value wins. Then
-        // `const { transformHeaders: _t, ...providerOptions } = options ?? {}` (`:483`) strips it,
-        // so no provider or wire impl ever sees it as an option field.
-        if let Some(transform) = &options.transform_headers {
-            headers = Some(transform(headers.unwrap_or_default()).await);
-        }
-        request_options.headers = headers;
-        request_options.transform_headers = None;
-        // PROV-109. `env = { ...(resolution.env ?? {}), ...(options?.env ?? {}) }` (Pi
-        // `models.ts:862`): the resolution's env first, the request's env wins per key.
-        request_options.env = merge_env(resolution.env.as_ref(), options.env.as_ref());
-        Ok((request_model, request_options))
+        Ok(apply_resolution(model, options, &resolution).await)
     }
+}
+
+/// The request half of pi `applyAuth` (`models.ts:863-874` @f1b2e77f5), given the resolution:
+/// the request model takes the resolution's `baseUrl`, the request options its key, headers and
+/// env, explicit request options winning per field, and `transformHeaders` runs last and is
+/// stripped. Shared by [`Models::stream`] (through [`AuthHelper::apply_auth`]) and by a composed
+/// [`crate::wire::WireProvider`] handing a model to its base (`supportsBaseApi`,
+/// `provider-composer.ts:593-596`), which must hand the base the composed provider's auth exactly
+/// as `Models.stream` hands it to the composed provider. PROV-162.
+pub(crate) async fn apply_resolution(
+    model: &Model,
+    options: &StreamOptions,
+    resolution: &crate::auth::AuthResult,
+) -> (Model, StreamOptions) {
+    let auth = &resolution.auth;
+    let mut request_model = model.clone();
+    if let Some(base_url) = &auth.base_url {
+        request_model.base_url = base_url.clone();
+    }
+    let mut request_options = options.clone();
+    request_options.api_key = options.api_key.clone().or_else(|| auth.api_key.clone());
+    let mut headers = merge_headers(auth.headers.as_ref(), options.headers.as_ref());
+    // PROV-042. `if (options?.transformHeaders) headers = await options.transformHeaders(headers
+    // ?? {})` (Pi `models.ts:480` @v0.83.0) — LAST, after auth headers and request headers are
+    // merged, so the transform observes the final set and its return value wins. Then
+    // `const { transformHeaders: _t, ...providerOptions } = options ?? {}` (`:483`) strips it,
+    // so no provider or wire impl ever sees it as an option field.
+    if let Some(transform) = &options.transform_headers {
+        headers = Some(transform(headers.unwrap_or_default()).await);
+    }
+    request_options.headers = headers;
+    request_options.transform_headers = None;
+    // PROV-109. `env = { ...(resolution.env ?? {}), ...(options?.env ?? {}) }` (Pi
+    // `models.ts:862`): the resolution's env first, the request's env wins per key.
+    request_options.env = merge_env(resolution.env.as_ref(), options.env.as_ref());
+    (request_model, request_options)
 }
 
 /// Merge auth headers with request headers; request headers win per key (Pi `applyAuth` header
@@ -2872,5 +2891,133 @@ mod tests {
             Credential::Oauth { access, .. } => assert_eq!(access, "none"),
             other => panic!("expected an oauth credential, got {other:?}"),
         }
+    }
+
+    /// PROV-161 — a login fixture: a provider whose display NAME differs from its id (pi's
+    /// `${provider.name}` is the name, not the id), over `auth`.
+    fn login_fixture(auth: crate::auth::ProviderAuth) -> Models {
+        let mut models = create_models(CreateModelsOptions::default());
+        models.set_provider(Arc::new(crate::wire::WireProvider::new(
+            "keyed",
+            "Keyed Co",
+            vec![model("keyed", "m", false, None)],
+            auth,
+            Arc::new(crate::auth::InMemoryCredentialStore::new()),
+            Arc::new(crate::api::builtin_registry()),
+        )));
+        models
+    }
+
+    /// An api-key strategy with NO `login` member — upstream's *"Absent = ambient-only"*
+    /// (`ai/src/auth/types.ts:166`), `supports_login() == false` here.
+    struct AmbientOnly;
+
+    #[async_trait::async_trait]
+    impl crate::auth::ApiKeyAuth for AmbientOnly {
+        fn name(&self) -> &str {
+            "Ambient"
+        }
+        async fn resolve(
+            &self,
+            _model: &Model,
+            _ctx: &dyn crate::auth::AuthContext,
+            _cred: Option<&Credential>,
+        ) -> Result<Option<crate::auth::AuthResult>, crate::error::AuthError> {
+            Ok(None)
+        }
+    }
+
+    /// An OAuth flow whose `login` fails with a flow-level message.
+    struct FailingFlow;
+
+    #[async_trait::async_trait]
+    impl crate::auth::OAuthAuth for FailingFlow {
+        fn name(&self) -> &str {
+            "Failing Flow"
+        }
+        async fn login(
+            &self,
+            _interaction: &dyn crate::auth::oauth::AuthInteraction,
+            _options: &crate::auth::LoginOptions,
+        ) -> Result<Credential, crate::auth::oauth::OAuthError> {
+            Err(crate::auth::oauth::OAuthError::Failed(
+                "device authorization was denied".to_string(),
+            ))
+        }
+        async fn refresh(&self, cred: &Credential) -> Result<Credential, crate::error::AuthError> {
+            Ok(cred.clone())
+        }
+        async fn to_auth(
+            &self,
+            _cred: &Credential,
+        ) -> Result<crate::auth::ModelAuth, crate::error::AuthError> {
+            Ok(crate::auth::ModelAuth::default())
+        }
+    }
+
+    /// PROV-161 — pi `Models.login` (`models.ts:771` @f1b2e77f5):
+    /// ``if (!provider) throw new ModelsError("provider", `Unknown provider: ${providerId}`)``.
+    /// RED at `360dc2bb`: `api key auth failed for nope` with code `auth`.
+    #[tokio::test]
+    async fn login_reports_an_unknown_provider_with_pis_text_and_code() {
+        let models = create_models(CreateModelsOptions::default());
+        let interaction = crate::auth::oauth::ScriptedInteraction::new(Vec::new());
+        for auth_type in [AuthType::ApiKey, AuthType::Oauth] {
+            let err = models
+                .login("nope", auth_type, &interaction)
+                .await
+                .expect_err("an unknown provider cannot log in");
+            assert_eq!(err.to_string(), "Unknown provider: nope");
+            assert_eq!(err.code(), "provider");
+        }
+    }
+
+    /// PROV-161 — pi `models.ts:772-775`: ``if (!method?.login) throw new ModelsError("auth",
+    /// `${provider.name} does not support ${type} login`)``, `type` being pi's `AuthType` string.
+    /// Three shapes of a missing method: no OAuth flow at all, no api-key strategy at all, and an
+    /// api-key strategy whose `login` member is absent. RED at `360dc2bb`: `api key auth failed
+    /// for keyed`.
+    #[tokio::test]
+    async fn login_reports_a_missing_login_method_with_pis_text_and_code() {
+        let interaction = crate::auth::oauth::ScriptedInteraction::new(Vec::new());
+
+        let ambient = login_fixture(crate::auth::ProviderAuth::with_api_key(Arc::new(
+            AmbientOnly,
+        )));
+        let err = ambient
+            .login("keyed", AuthType::Oauth, &interaction)
+            .await
+            .expect_err("no oauth method");
+        assert_eq!(err.to_string(), "Keyed Co does not support oauth login");
+        assert_eq!(err.code(), "auth");
+        let err = ambient
+            .login("keyed", AuthType::ApiKey, &interaction)
+            .await
+            .expect_err("an ambient-only api-key strategy has no login member");
+        assert_eq!(err.to_string(), "Keyed Co does not support api_key login");
+        assert_eq!(err.code(), "auth");
+
+        let oauth_only =
+            login_fixture(crate::auth::ProviderAuth::with_oauth(Arc::new(FailingFlow)));
+        let err = oauth_only
+            .login("keyed", AuthType::ApiKey, &interaction)
+            .await
+            .expect_err("no api-key method");
+        assert_eq!(err.to_string(), "Keyed Co does not support api_key login");
+        assert_eq!(err.code(), "auth");
+    }
+
+    /// PROV-161 residual — pi awaits `method.login(...)` bare (`models.ts:776-777`), so a flow's
+    /// own failure reaches the caller with the flow's message. RED at `360dc2bb`, which wrapped it
+    /// as `api key auth failed for keyed` (source `login failed: …`), even for an OAuth flow.
+    #[tokio::test]
+    async fn a_failed_login_reports_the_flows_own_message() {
+        let interaction = crate::auth::oauth::ScriptedInteraction::new(Vec::new());
+        let models = login_fixture(crate::auth::ProviderAuth::with_oauth(Arc::new(FailingFlow)));
+        let err = models
+            .login("keyed", AuthType::Oauth, &interaction)
+            .await
+            .expect_err("the flow fails");
+        assert_eq!(err.to_string(), "device authorization was denied");
     }
 }

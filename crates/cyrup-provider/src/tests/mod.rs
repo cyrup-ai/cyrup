@@ -21,6 +21,7 @@ mod classifier_dispatch;
 mod classifier_store;
 mod classifier_support;
 mod classifier_types;
+mod compose_over_base;
 mod context_estimate_chars_per_token;
 mod input_limits;
 mod llama_cpp_classify;

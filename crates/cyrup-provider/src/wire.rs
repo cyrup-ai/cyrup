@@ -19,6 +19,7 @@ use crate::classifier::{
     AnyModel, ClassifierApiRegistry, ClassifierContext, ClassifierModel, ClassifierOptions,
     ClassifierResult, ImageModel, ProviderClassifier,
 };
+use crate::collection::clamp_thinking_level;
 use crate::context::Context;
 use crate::error::ProviderError;
 use crate::images::{
@@ -27,6 +28,7 @@ use crate::images::{
 use crate::model::Model;
 use crate::provider::Provider;
 use crate::stream::{StreamEvent, StreamOptions};
+use crate::utils::simple_options::{SimpleStreamOptions, build_base_options};
 use cyrup_core::{ApiId, EventStream, ProviderId};
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -113,8 +115,9 @@ pub enum ApiDispatch {
     ///
     /// A provider composed over a base ([`WireProvider::with_operations_from`]) first asks the base:
     /// pi hands `base.stream` every model whose api the base's own chat catalog lists
-    /// (`supportsBaseApi`, `provider-composer.ts:582`, `:593-596`), so a miss there is the base's
-    /// [`ApiDispatch::Own`] text. [`WireProvider::stream`] resolves that per request.
+    /// (`supportsBaseApi`, `provider-composer.ts:582`, `:593-596`), so such a model streams through
+    /// the base — and a miss there is the base's own text. [`WireProvider::stream`] resolves that
+    /// per request (PROV-162).
     Global,
 }
 
@@ -452,19 +455,11 @@ impl Provider for WireProvider {
         let store = self.store.clone();
         let auth_ctx = self.auth_ctx.clone();
         let registry = self.registry.clone();
+        let api_dispatch = self.api_dispatch;
         // pi's composer hands `base.stream` every model whose api the base's own chat catalog lists
         // (`supportsBaseApi`, `provider-composer.ts:582`, `:593-596` @f1b2e77f5), reading the base's
-        // live catalog per request; only the rest fall through to the registry. A composition is
-        // over its own id (`composeModelProvider(providerId, base, …)`), so the base's miss text
-        // names this provider.
-        let api_dispatch = match (&self.operations_base, self.api_dispatch) {
-            (Some(base), ApiDispatch::Global)
-                if base.models().iter().any(|row| row.api == model.api) =>
-            {
-                ApiDispatch::Own
-            }
-            (_, api_dispatch) => api_dispatch,
-        };
+        // live catalog per request; only the rest fall through to the registry. PROV-162.
+        let through_base = self.base_for(model);
         let model = model.clone();
         let context = context.clone();
         let options = options.clone();
@@ -478,46 +473,36 @@ impl Provider for WireProvider {
                 error.into_error_event(model.provider.clone(), &model_id, Some(model.api.clone()))
             };
 
-            // 1. Resolve auth (failures → terminal Error, never thrown — R-01-018). The
-            // provider-scoped env overlay (Pi `options.env`) participates in env-key resolution /
-            // base-url (Pi `applyAuth`, `models.ts:482` @v0.83.0).
-            //
-            // [CYRUP-DELTA, mechanism] This task is pi's `Models.stream` (`applyAuth`,
-            // `models.ts:843-875`) and `createProvider`'s `dispatch` (`:1072-1083`) in one, because
-            // the agent streams through `Provider::stream` directly (`cyrup-agent` `stream_fn.rs`):
-            // so a direct call resolves auth BEFORE the dispatch lookup, where pi's bare
-            // `provider.stream` dispatches unauthenticated. Through `Models::stream` the order is
-            // pi's: `Models` applies auth first either way.
-            let overrides = AuthOverrides {
-                api_key: options.api_key.as_deref(),
-                env: options.env.as_ref(),
-                min_oauth_validity_ms: None,
-            };
-            let mut auth_result = match resolve_provider_auth(
+            // 1. Resolve auth (failures → terminal Error, never thrown — R-01-018); see
+            // `resolve_request_auth` for the order this fuses with dispatch.
+            let mut auth_result = match resolve_request_auth(
                 &id,
                 &auth,
                 &model,
                 store.as_ref(),
                 auth_ctx.as_ref(),
-                overrides,
+                &options,
             )
             .await
             {
-                Ok(Some(result)) => result,
-                // pi `applyAuth` (`models.ts:859-861`): `Provider is not configured:
-                // ${model.provider}`.
-                Ok(None) => {
-                    sink.send(setup_error(ProviderError::NotConfigured(
-                        model.provider.clone(),
-                    )))
-                    .await;
-                    return;
-                }
-                Err(e) => {
-                    sink.send(setup_error(ProviderError::from(e))).await;
+                Ok(result) => result,
+                Err(error) => {
+                    sink.send(setup_error(error)).await;
                     return;
                 }
             };
+
+            // A model the base answers streams THROUGH the base (`base.stream(model, context,
+            // options)`, provider-composer.ts:593-596), carrying this provider's resolved auth the
+            // way `Models.stream`'s `applyAuth` hands it to a provider (`models.ts:863-874`). The
+            // base's own dispatch then reports its own miss (`createProvider`'s text, PROV-157).
+            if let Some(base) = through_base {
+                let (request_model, request_options) =
+                    crate::collection::apply_resolution(&model, &options, &auth_result).await;
+                let mut events = base.stream(&request_model, &context, &request_options);
+                forward(&mut events, &sink).await;
+                return;
+            }
 
             // Merge the per-request env overlay into the resolved env so the request path
             // (cache-retention / base-url resolution) sees it, with `options.env` winning per key
@@ -545,6 +530,121 @@ impl Provider for WireProvider {
         });
 
         Box::pin(ReceiverStream::new(rx))
+    }
+
+    /// The trait's lowering for every model this provider dispatches itself; a model its base
+    /// answers goes to the BASE's `stream_simple` — pi `streamWith(…, simple: true)` calls
+    /// `base.streamSimple(model, context, options)` (`provider-composer.ts:594-595` @f1b2e77f5), so
+    /// a base that overrides it (radius does) keeps its override. PROV-162.
+    fn stream_simple(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: &SimpleStreamOptions,
+    ) -> EventStream<StreamEvent> {
+        let Some(base) = self.base_for(model) else {
+            // `Provider::stream_simple`'s default, verbatim: lower, clamp, `self.stream`.
+            let mut lowered =
+                build_base_options(model, context, options, options.base.api_key.as_deref());
+            if let Some(level) = options.reasoning {
+                lowered.reasoning = clamp_thinking_level(model, level.into());
+            }
+            return self.stream(model, context, &lowered);
+        };
+        let (sink, rx) = channel(STREAM_BUFFER);
+        let id = self.id.clone();
+        let auth = self.auth.clone();
+        let store = self.store.clone();
+        let auth_ctx = self.auth_ctx.clone();
+        let model = model.clone();
+        let context = context.clone();
+        let options = options.clone();
+        tokio::spawn(async move {
+            let auth_result = match resolve_request_auth(
+                &id,
+                &auth,
+                &model,
+                store.as_ref(),
+                auth_ctx.as_ref(),
+                &options.base,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let model_id = model.id.as_str().to_string();
+                    sink.send(error.into_error_event(
+                        model.provider.clone(),
+                        &model_id,
+                        Some(model.api.clone()),
+                    ))
+                    .await;
+                    return;
+                }
+            };
+            let (request_model, request_base) =
+                crate::collection::apply_resolution(&model, &options.base, &auth_result).await;
+            let mut request_options = options;
+            request_options.base = request_base;
+            let mut events = base.stream_simple(&request_model, &context, &request_options);
+            forward(&mut events, &sink).await;
+        });
+        Box::pin(ReceiverStream::new(rx))
+    }
+}
+
+impl WireProvider {
+    /// The base that answers `model`, if any: pi `base && supportsBaseApi(model)`, where
+    /// `supportsBaseApi = (model) => base?.getModels().some((entry) => entry.api === model.api)`
+    /// (`provider-composer.ts:582`, `:593` @f1b2e77f5) — the base's LIVE chat catalog, read per
+    /// request. PROV-162.
+    fn base_for(&self, model: &Model) -> Option<Arc<dyn Provider>> {
+        self.operations_base
+            .as_ref()
+            .filter(|base| base.models().iter().any(|row| row.api == model.api))
+            .cloned()
+    }
+}
+
+/// Resolve a request's auth — the stream task's step 1 (pi `applyAuth`'s resolution,
+/// `models.ts:850-861`). `Ok(None)` from the strategy is pi's `Provider is not configured:
+/// ${model.provider}` (`:859-861`).
+async fn resolve_request_auth(
+    id: &ProviderId,
+    auth: &ProviderAuth,
+    model: &Model,
+    store: &dyn CredentialStore,
+    auth_ctx: &dyn AuthContext,
+    options: &StreamOptions,
+) -> Result<crate::auth::AuthResult, ProviderError> {
+    // The provider-scoped env overlay (Pi `options.env`) participates in env-key resolution /
+    // base-url (Pi `applyAuth`, `models.ts:482` @v0.83.0).
+    //
+    // [CYRUP-DELTA, mechanism] The stream task is pi's `Models.stream` (`applyAuth`,
+    // `models.ts:843-875`) and `createProvider`'s `dispatch` (`:1072-1083`) in one, because the
+    // agent streams through `Provider::stream` directly (`cyrup-agent` `stream_fn.rs`): so a
+    // direct call resolves auth BEFORE the dispatch lookup, where pi's bare `provider.stream`
+    // dispatches unauthenticated. Through `Models::stream` the order is pi's: `Models` applies auth
+    // first either way.
+    let overrides = AuthOverrides {
+        api_key: options.api_key.as_deref(),
+        env: options.env.as_ref(),
+        min_oauth_validity_ms: None,
+    };
+    match resolve_provider_auth(id, auth, model, store, auth_ctx, overrides).await {
+        Ok(Some(result)) => Ok(result),
+        Ok(None) => Err(ProviderError::NotConfigured(model.provider.clone())),
+        Err(e) => Err(ProviderError::from(e)),
+    }
+}
+
+/// Forward every event of `events` into `sink` until either ends.
+async fn forward(events: &mut EventStream<StreamEvent>, sink: &crate::api::EventSink) {
+    use futures::StreamExt;
+    while let Some(event) = events.next().await {
+        if !sink.send(event).await {
+            break;
+        }
     }
 }
 

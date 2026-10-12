@@ -63,7 +63,7 @@ async fn live_guest_provider_oauth_stream_autocomplete_activetools() {
         reg.has_stream_simple(),
         "provider supplies a custom streamSimple"
     );
-    assert_eq!(reg.config.models.len(), 1);
+    assert_eq!(reg.config.models.as_ref().map(Vec::len), Some(1));
 
     // 1) provider-login: runs the guest `login(callbacks)` flow across the boundary. The guest calls
     //    `onAuth` + `onPrompt`; the host backend answers the prompt with the canned code.
