@@ -16,12 +16,14 @@
 
 pub(super) use super::support;
 
+mod headless_early_notices;
 mod json_mode;
 mod print_mode;
 mod rpc_bash;
 mod rpc_clear_queue;
 mod rpc_command_parsing;
 mod rpc_commands;
+mod rpc_disposition;
 mod rpc_errors;
 mod rpc_extension_errors;
 mod rpc_models;

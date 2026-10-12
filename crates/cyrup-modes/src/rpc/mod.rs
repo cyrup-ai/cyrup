@@ -44,7 +44,10 @@ pub(crate) mod types;
 
 use jsonl::{read_lines, write_out};
 use types::queue_mode_str;
-pub use types::{ClearedQueue, QueueModeArg, RpcOut, RpcResponse, SessionCommand};
+pub use types::{
+    ClearedQueue, DispositionData, PromptDisposition, QueueModeArg, QueuedInputDisposition, RpcOut,
+    RpcResponse, SessionCommand,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Extension dialogs + run-loop support
@@ -1038,6 +1041,18 @@ fn latch_if_running(session: &AgentSession, in_flight: &mut bool) {
     }
 }
 
+/// SEAM-162 — the `{ disposition }` `data` of the `prompt`, `steer` and `follow_up` responses (pi
+/// `success(id, "prompt", { disposition })`, `success(id, "steer", { disposition })`,
+/// `success(id, "follow_up", { disposition })`, rpc-mode.ts:405, `:418`, `:423` @f1b2e77f5). The
+/// wire strings are [`PromptDisposition`]'s. `steer`/`follow_up` can only answer `queued` or
+/// `handled` (`queue_user_input` never starts a run, as pi's `_queueUserInput` never does), so one
+/// mapping serves all three without ever inventing a value the session did not report.
+fn disposition_data(accepted: PromptAccepted) -> Value {
+    json!(DispositionData {
+        disposition: PromptDisposition::from(accepted),
+    })
+}
+
 /// The run-control arms of [`handle`] (`prompt`/`steer`/`follow_up`) — split out so SEAM-158's
 /// [`dispatch_run_control`] can run them without a runtime. `Err` hands back any other command,
 /// with its id, untouched.
@@ -1063,7 +1078,9 @@ async fn handle_run_control(
                     if !matches!(accepted, PromptAccepted::Handled) {
                         *in_flight = true;
                     }
-                    RpcResponse::ok("prompt", id, None)
+                    // SEAM-162 — pi `output(success(id, "prompt", { disposition }))` from
+                    // `preflightResult` (rpc-mode.ts:394-414, the `output` at :405).
+                    RpcResponse::ok("prompt", id, Some(disposition_data(accepted)))
                 }
                 Err(e) => RpcResponse::err("prompt", id, e.to_string()),
             }
@@ -1071,9 +1088,9 @@ async fn handle_run_control(
         SessionCommand::Steer { message, images } => {
             let id = raw_id.clone();
             match session.steer(user_input(message, images)).await {
-                Ok(_) => {
+                Ok(accepted) => {
                     latch_if_running(session, in_flight);
-                    RpcResponse::ok("steer", id, None)
+                    RpcResponse::ok("steer", id, Some(disposition_data(accepted)))
                 }
                 Err(e) => RpcResponse::err("steer", id, e.to_string()),
             }
@@ -1081,9 +1098,9 @@ async fn handle_run_control(
         SessionCommand::FollowUp { message, images } => {
             let id = raw_id.clone();
             match session.follow_up(user_input(message, images)).await {
-                Ok(_) => {
+                Ok(accepted) => {
                     latch_if_running(session, in_flight);
-                    RpcResponse::ok("follow_up", id, None)
+                    RpcResponse::ok("follow_up", id, Some(disposition_data(accepted)))
                 }
                 Err(e) => RpcResponse::err("follow_up", id, e.to_string()),
             }

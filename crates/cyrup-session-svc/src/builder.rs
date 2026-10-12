@@ -1452,6 +1452,9 @@ impl SessionBuilder {
             bash_proc.clone(),
             cwd.clone(),
         ));
+        // SEAM-160 — before any extension can say anything: a `-p`/`--mode json` session never
+        // attaches an effect drain, so it holds no early notice.
+        host_services.declare_effect_drain_for(cfg.app_mode);
         // Only when there IS one: a guest's `getModel()` reads `Option`-shaped state
         // (`host_services.rs`), matching pi's `ctx.model` being `undefined` on a modelless session.
         if let (Some(mr), Some(m)) = (model_ref.as_ref(), resolved_model.as_ref()) {

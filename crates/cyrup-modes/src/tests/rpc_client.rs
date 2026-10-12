@@ -294,7 +294,10 @@ async fn prompt_and_wait_arms_the_collector_before_the_prompt_is_written() {
         "an absent image list must omit the key, not send null: {command}"
     );
 
-    host.respond_ok(&command["id"], "prompt", Value::Null).await;
+    // pi's `prompt` reply carries `{ disposition }` (`rpc-types.ts:118`), and its client reads it
+    // (`rpc-client.ts:204`); a `data: null` reply is not one pi's host writes (SEAM-162).
+    host.respond_ok(&command["id"], "prompt", json!({"disposition": "started"}))
+        .await;
     host.write_line(&json!({"type": "agent_start"})).await;
     host.write_line(&json!({"type": "agent_settled"})).await;
 

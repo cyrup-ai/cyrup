@@ -5,7 +5,7 @@
 //! upstream citations are exactly as they were when they lived in `rpc.rs`.
 
 use cyrup_session_svc::{
-    AgentSessionEvent, Content, ModelThinkingLevel, QueueMode, StreamingBehavior,
+    AgentSessionEvent, Content, ModelThinkingLevel, PromptAccepted, QueueMode, StreamingBehavior,
 };
 use serde_json::Value;
 
@@ -186,6 +186,61 @@ pub enum SessionCommand {
     /// Any unrecognized `type` (R-00-009). Detected in [`dispatch`](super::dispatch); never reaches [`handle`](super::handle).
     #[serde(other)]
     Unknown,
+}
+
+/// What happened to a `prompt` (SEAM-162) — pi `PromptDisposition = QueuedInputDisposition |
+/// "started"` (`core/agent-session.ts:311` @f1b2e77f5, `:301` @v1.0.4), the `data` of the `prompt`
+/// response: `{ disposition }` (`rpc-types.ts:118`, written from `preflightResult` at
+/// `rpc-mode.ts:405`). The wire strings are pi's, exactly: `"started"` (`preflightResult` after
+/// `before_agent_start`, `agent-session.ts:2109` @f1b2e77f5), `"queued"` (streaming, queued per
+/// `streamingBehavior`, `:2024`) and `"handled"` (an extension command or an `input` handler
+/// serviced it, `:1981`, `:2000`).
+///
+/// One type for both directions, like [`ClearedQueue`]: the host serializes it, and
+/// [`RpcClient::prompt`](crate::RpcClient::prompt) deserializes the same enum back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptDisposition {
+    /// Wire string `"started"` — a run was started for this prompt.
+    Started,
+    /// Wire string `"queued"` — the agent was streaming; the prompt was queued.
+    Queued,
+    /// Wire string `"handled"` — no run started and nothing was queued.
+    Handled,
+}
+
+impl From<PromptAccepted> for PromptDisposition {
+    fn from(accepted: PromptAccepted) -> Self {
+        match accepted {
+            PromptAccepted::Started => Self::Started,
+            PromptAccepted::Queued(_) => Self::Queued,
+            PromptAccepted::Handled => Self::Handled,
+        }
+    }
+}
+
+/// What happened to a `steer` or `follow_up` (SEAM-162) — pi `QueuedInputDisposition = "handled" |
+/// "queued"` (`core/agent-session.ts:310` @f1b2e77f5, `:300` @v1.0.4), the `data` of both responses
+/// (`rpc-types.ts:119-126`). `_queueUserInput` answers `"handled"` when an `input` handler serviced
+/// the message and `"queued"` otherwise (`agent-session.ts:2189`, `:2199` @f1b2e77f5); it never
+/// starts a run, so `"started"` is not one of its answers. The host writes these through
+/// [`PromptDisposition`] (the session's answer type is shared); this narrower type is what
+/// [`RpcClient::steer`](crate::RpcClient::steer) reads back, so a `"started"` here fails the parse
+/// rather than passing as something pi never sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueuedInputDisposition {
+    /// Wire string `"handled"` — an `input` handler serviced the message; nothing was queued.
+    Handled,
+    /// Wire string `"queued"` — the message was queued.
+    Queued,
+}
+
+/// The `data` of the `prompt`, `steer` and `follow_up` responses: `{ disposition }`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DispositionData<D> {
+    /// The disposition.
+    pub disposition: D,
 }
 
 /// What `clear_queue` drained — pi's `{ steering: string[]; followUp: string[] }`
