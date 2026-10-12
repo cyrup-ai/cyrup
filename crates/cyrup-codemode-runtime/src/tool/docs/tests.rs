@@ -332,3 +332,17 @@ fn a_prose_list_of_the_built_in_tools_names_every_registered_one() {
         "only {lists} lists of the built-in tools were found; the scan is broken"
     );
 }
+
+/// CODE-023 — the page the binary writes for the model documents `ClassifierContext.images` as
+/// upstream's does (`docs/codemode.md` @ce8972a0e): the field in the interface, and which
+/// classifiers accept it. RED at the base: the interface had no `images`.
+#[test]
+fn the_page_documents_classifier_images() {
+    assert!(EMBEDDED_CODEMODE_DOCS.contains(
+        "  /** Images judged together with `state`. Only models whose `input` includes \"image\" accept them. */\n  images?: { type: \"image\"; data: string; mimeType: string }[];\n"
+    ));
+    assert!(
+        EMBEDDED_CODEMODE_DOCS
+            .contains("Other classifiers return an error result when `images` is not empty.")
+    );
+}
