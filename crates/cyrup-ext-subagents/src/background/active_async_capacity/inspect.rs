@@ -730,7 +730,10 @@ enum ChildPidFallback {
 /// mismatch (a status or owner written by an older build probes as before), and an observer with
 /// no scope of its own mismatches every recorded one.
 fn pid_namespace_differs(recorded: Option<&str>, options: &CapacityOptions) -> bool {
-    recorded.is_some_and(|recorded| options.pid_namespace_scope().as_deref() != Some(recorded))
+    crate::background::reconcile::pid_namespace_scope_differs(
+        recorded,
+        options.pid_namespace_scope().as_deref(),
+    )
 }
 
 /// pi `ownerReleaseVerdict` (`:292-297`) — reads the owner's own `status.json` once and dispatches

@@ -999,3 +999,130 @@ fn stale_tombstones(sandbox: &Sandbox) -> Vec<PathBuf> {
         })
         .collect()
 }
+
+// ============================================================ PERM-045: the shared owner verdict
+
+fn alive(_: u32) -> crate::background::reconcile::Liveness {
+    crate::background::reconcile::Liveness::Alive
+}
+fn dead(_: u32) -> crate::background::reconcile::Liveness {
+    crate::background::reconcile::Liveness::Dead
+}
+
+/// PERM-045(a): on one host, a writer in another PID namespace is beyond this reader's `kill(2)` and
+/// `/proc`, so its pid reads dead or as someone else's. The verdict is "cannot prove gone", the
+/// lease's answer for another hostname; a stamp without a namespace is probed as before.
+#[test]
+fn a_writer_in_another_pid_namespace_is_not_demonstrably_gone() {
+    let ours = "pid:[4026531836]";
+    let stamp = |scope| OwnerStamp {
+        pid: 1,
+        start_identity: None,
+        hostname: "here",
+        pid_namespace_scope: scope,
+    };
+    assert!(
+        !owner_demonstrably_gone(
+            &stamp(Some("pid:[4026532265]")),
+            "here",
+            Some(ours),
+            dead,
+            |_| None
+        ),
+        "a dead-looking pid of another namespace is not evidence"
+    );
+    assert!(
+        !owner_demonstrably_gone(&stamp(Some("pid:[4026532265]")), "here", None, dead, |_| {
+            None
+        }),
+        "a reader that cannot name its own namespace cannot match a recorded one"
+    );
+    assert!(owner_demonstrably_gone(
+        &stamp(Some(ours)),
+        "here",
+        Some(ours),
+        dead,
+        |_| None
+    ));
+    assert!(
+        owner_demonstrably_gone(&stamp(None), "here", Some(ours), dead, |_| None),
+        "an unrecorded namespace probes as before"
+    );
+    assert!(
+        !owner_demonstrably_gone(&stamp(Some(ours)), "elsewhere", Some(ours), dead, |_| None),
+        "rung 1 first: another host"
+    );
+}
+
+/// The lease's own ladder is the shared verdict plus its writer rungs: an unchanged answer for
+/// another host, a dead owner, and a live one.
+#[test]
+fn the_lease_ladder_is_built_on_the_shared_owner_verdict() {
+    let owner = parse_owner(&owner_json(json!({}))).expect("valid owner");
+    assert!(!demonstrably_stale(&owner, "elsewhere", dead, |_| None));
+    assert!(demonstrably_stale(&owner, "here", dead, |_| None));
+    assert!(!demonstrably_stale(&owner, "here", alive, |_| None));
+}
+
+/// PERM-045(b): where `/proc` is not there, the portable probe gives a start time, so a pid that
+/// another process has taken over reads gone instead of alive. Run here on Linux, through the same
+/// function macOS and Windows use as their production probe.
+#[test]
+fn the_portable_probe_tells_a_recycled_pid_from_its_first_holder() {
+    use crate::background::reconcile::check_pid_liveness;
+
+    let pid = std::process::id();
+    let now = portable_start_identity(pid).expect("the OS reports this process's start time");
+    assert_eq!(now.scheme(), "start");
+    assert_eq!(
+        portable_start_identity(pid),
+        Some(now.clone()),
+        "stable for the life of the process"
+    );
+    let started: u64 = now
+        .as_str()
+        .strip_prefix("start:")
+        .and_then(|secs| secs.parse().ok())
+        .expect("seconds since the epoch");
+    // What a record of an earlier holder of this pid would carry: a start an hour before.
+    let earlier = ProcessStartIdentity::from_token(format!("start:{}", started - 3600));
+    assert!(
+        process_demonstrably_gone(
+            pid,
+            Some(&earlier),
+            check_pid_liveness,
+            portable_start_identity
+        ),
+        "the pid is alive under another start time: a different process"
+    );
+    assert!(!process_demonstrably_gone(
+        pid,
+        Some(&now),
+        check_pid_liveness,
+        portable_start_identity
+    ));
+    assert_eq!(portable_start_identity(0), None);
+}
+
+/// PERM-045(b): a token is compared only with one of its own scheme. A `runtime:` token (the
+/// fallback for a process no probe could read) or one the other probe wrote proves nothing.
+#[test]
+fn start_identities_of_different_schemes_are_not_compared() {
+    let recorded = ProcessStartIdentity::from_token("runtime:1700000000000");
+    assert!(!process_demonstrably_gone(
+        7,
+        Some(&recorded),
+        alive,
+        |_| Some(ProcessStartIdentity::from_token("start:1700000000"))
+    ));
+    let recorded = ProcessStartIdentity::from_token("linux:100");
+    assert!(!process_demonstrably_gone(
+        7,
+        Some(&recorded),
+        alive,
+        |_| Some(ProcessStartIdentity::from_token("start:1700000000"))
+    ));
+    assert!(process_demonstrably_gone(7, Some(&recorded), alive, |_| {
+        Some(ProcessStartIdentity::from_token("linux:200"))
+    }));
+}

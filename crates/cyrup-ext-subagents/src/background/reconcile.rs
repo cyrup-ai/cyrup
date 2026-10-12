@@ -183,6 +183,16 @@ pub fn current_pid_namespace_scope() -> Option<String> {
         .clone()
 }
 
+/// pi's `recorded !== undefined && recorded !== observed` over two PID namespace scopes
+/// (`active-async-capacity.ts:256`, `await-async-run.ts:21-22` @ad11b7ab): a RECORDED scope the
+/// observer does not share. An unrecorded scope is never a mismatch (a record an older build wrote
+/// probes as before), and an observer with no scope of its own mismatches every recorded one. The
+/// one expression of the rule; every caller that compares scopes goes through it.
+#[must_use]
+pub fn pid_namespace_scope_differs(recorded: Option<&str>, observed: Option<&str>) -> bool {
+    recorded.is_some_and(|recorded| observed != Some(recorded))
+}
+
 /// pi `checkPidLiveness(pid, kill, probeZombie)` (`stale-run-reconciler.ts:360-379` @ad11b7ab):
 /// [`check_pid_liveness`], plus — when `probe_zombie` is set and the probe found the pid — a read
 /// of `/proc/<pid>/stat` whose state field (the character after the LAST `") "`, since the comm
@@ -264,8 +274,12 @@ pub fn check_pid_identity_with(
         return Liveness::Alive;
     };
     // pi `:171` — `currentIdentity !== undefined && currentIdentity !== startIdentity`.
+    // \[CYRUP-DELTA] (PERM-045(b)) and only between tokens of one scheme: a `runtime:` token, or
+    // one an older build's probe wrote, says nothing a `linux:` or `start:` reading can refute.
     match start_identity_of(pid) {
-        Some(current) if current != *recorded => Liveness::Dead,
+        Some(current) if current.scheme() == recorded.scheme() && current != *recorded => {
+            Liveness::Dead
+        }
         _ => Liveness::Alive,
     }
 }
@@ -1296,7 +1310,14 @@ mod tests {
         assert_eq!(ambient(None), Liveness::Alive);
         // A fabricated identity for a pid that really is this process IS the recycled shape, and
         // is the one arm that must answer `Dead` — on a platform that can read one at all.
-        let fabricated = identity("linux:0");
+        // In the scheme this platform's probe writes (`linux:` here, `start:` off Linux): only
+        // tokens of one scheme are compared.
+        let fabricated = identity(&format!(
+            "{}:0",
+            current
+                .as_ref()
+                .map_or("linux", ProcessStartIdentity::scheme)
+        ));
         let expected = if current.is_some() {
             Liveness::Dead
         } else {
