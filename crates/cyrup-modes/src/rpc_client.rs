@@ -93,7 +93,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::rpc::types::{ClearedQueue, RpcResponse};
+use crate::rpc::types::{
+    ClearedQueue, DispositionData, PromptDisposition, QueuedInputDisposition, RpcResponse,
+};
+use cyrup_session_svc::StreamingBehavior;
 
 // ---------------------------------------------------------------------------------------------
 // Constants — pi's literals
@@ -686,30 +689,52 @@ impl RpcClient {
     // Command methods — pi `rpc-client.ts:192-445`, in pi's order
     // -----------------------------------------------------------------------------------------
 
-    /// pi `prompt` (`:197`). Returns as soon as the host accepts; use [`Self::on_event`] for the
-    /// stream and [`Self::wait_for_idle`] for completion.
-    pub async fn prompt(&self, message: &str, images: Option<Value>) -> Result<(), RpcClientError> {
-        self.send(command("prompt", [("message", json!(message))], images))
-            .await
-            .map(|_| ())
+    /// pi `prompt` (`rpc-client.ts:198-205` @f1b2e77f5). Returns the prompt's disposition as soon
+    /// as the host accepts; use [`Self::on_event`] for the stream and [`Self::wait_for_idle`] for
+    /// completion. pi: "If the disposition is \"handled\", no run started for this prompt, so don't
+    /// wait for agent_settled." SEAM-162: pi reads `getData<{ disposition }>(response).disposition`,
+    /// so an error response rejects with its own `error` string, and it sends `streamingBehavior`
+    /// (absent when `None`, as `JSON.stringify` drops pi's `undefined`).
+    pub async fn prompt(
+        &self,
+        message: &str,
+        images: Option<Value>,
+        streaming_behavior: Option<StreamingBehavior>,
+    ) -> Result<PromptDisposition, RpcClientError> {
+        let mut fields: Vec<(&str, Value)> = vec![("message", json!(message))];
+        if let Some(behavior) = streaming_behavior {
+            fields.push(("streamingBehavior", json!(behavior)));
+        }
+        let data = self.data(command("prompt", fields, images)).await?;
+        let reply: DispositionData<PromptDisposition> = serde_json::from_value(data)?;
+        Ok(reply.disposition)
     }
 
-    /// pi `steer` (`:204`).
-    pub async fn steer(&self, message: &str, images: Option<Value>) -> Result<(), RpcClientError> {
-        self.send(command("steer", [("message", json!(message))], images))
-            .await
-            .map(|_| ())
+    /// pi `steer` (`rpc-client.ts:210-213` @f1b2e77f5) — `"queued"`, or `"handled"` when an
+    /// `input` handler serviced the message (SEAM-162).
+    pub async fn steer(
+        &self,
+        message: &str,
+        images: Option<Value>,
+    ) -> Result<QueuedInputDisposition, RpcClientError> {
+        let data = self
+            .data(command("steer", [("message", json!(message))], images))
+            .await?;
+        let reply: DispositionData<QueuedInputDisposition> = serde_json::from_value(data)?;
+        Ok(reply.disposition)
     }
 
-    /// pi `followUp` (`:211`).
+    /// pi `followUp` (`rpc-client.ts:218-221` @f1b2e77f5) — as [`Self::steer`] (SEAM-162).
     pub async fn follow_up(
         &self,
         message: &str,
         images: Option<Value>,
-    ) -> Result<(), RpcClientError> {
-        self.send(command("follow_up", [("message", json!(message))], images))
-            .await
-            .map(|_| ())
+    ) -> Result<QueuedInputDisposition, RpcClientError> {
+        let data = self
+            .data(command("follow_up", [("message", json!(message))], images))
+            .await?;
+        let reply: DispositionData<QueuedInputDisposition> = serde_json::from_value(data)?;
+        Ok(reply.disposition)
     }
 
     /// pi `abort` (`:218`).
@@ -995,7 +1020,7 @@ impl RpcClient {
         timeout: Duration,
     ) -> Result<Vec<Value>, RpcClientError> {
         let (subscription, events) = self.subscribe_collect();
-        self.prompt(message, images).await?;
+        self.prompt(message, images, None).await?;
         let outcome = tokio::time::timeout(timeout, events).await;
         drop(subscription);
         match outcome {

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_agent::AgentMessage;
+use cyrup_config::AppMode;
 use cyrup_core::{CancelToken, EntryId, ModelRef};
 use cyrup_ext::caps::http::HttpCaps;
 use cyrup_ext::caps::proc::ProcCaps;
@@ -243,12 +244,25 @@ pub enum UiEffect {
 /// setWidget/setTitle/setEditorText — rpc-mode.ts:149-241) onward to the client. Set by the mode entry
 /// point via [`LiveHostServices::set_ui_effect_sink`]; absent (`None`) in headless (print/json), where
 /// the effect methods below silently drop (== Pi `noOpUIContext`'s `notify`/`setStatus`/… no-ops,
-/// runner.ts:234-244). [CYRUP-DELTA] A notice said before the drain is attached is held and
-/// delivered when it is ([`EffectDrain`]).
+/// runner.ts:234-244). [CYRUP-DELTA] In a mode that attaches one, a notice said before the drain is
+/// attached is held and delivered when it is ([`EffectDrain`]).
 pub type UiEffectSink = UnboundedSender<UiEffect>;
 
 /// How many notices are kept for a mode that has not attached its effect drain yet.
 const MAX_EARLY_NOTICES: usize = 32;
+
+/// Whether a session run in `mode` ever attaches an effect drain (SEAM-160): the interactive TUI
+/// (`cyrup-tui` `install_ui_sinks`), `--mode rpc` (`cyrup-modes` `run_rpc` and its rebind) and ACP
+/// (`cyrup-acp` `SessionSinks::install`) do; `-p` (`run_print`) and `--mode json` (`run_json`) never
+/// do. It is the same split as the `has_ui` extensions are told (`builder.rs` `ext_mode`): pi binds
+/// a real `uiContext` in interactive and RPC and `noOpUIContext` in print and json, so a notice said
+/// there is dropped at once upstream (`runner.ts` `noOpUIContext.notify`, `() => {}`).
+fn mode_attaches_effect_drain(mode: AppMode) -> bool {
+    match mode {
+        AppMode::Interactive | AppMode::Rpc | AppMode::Acp => true,
+        AppMode::Print | AppMode::Json => false,
+    }
+}
 
 /// The mode's effect drain, and the notices said before it was attached.
 ///
@@ -258,12 +272,18 @@ const MAX_EARLY_NOTICES: usize = 32;
 /// the mode has built its terminal and attached the drain; the notice was dropped, and a server that
 /// failed at once (a command that does not exist) was announced nowhere, with its tools silently
 /// missing from every script. A notice said while no drain is attached is kept, a few of them, and
-/// delivered when one is. Every other effect (status, widgets, the title) is state the extension sets
-/// again, and is still dropped as in headless modes, where no drain is ever attached.
+/// delivered when one is. Every other effect (status, widgets, the title) is dropped.
+///
+/// SEAM-160 — only while a drain can still come. A session whose mode never attaches one (`-p`,
+/// `--mode json`; [`LiveHostServices::declare_effect_drain_for`]) holds nothing: a notice there is
+/// dropped as it is said, as pi's `noOpUIContext` drops it, instead of the first thirty-two being
+/// kept for the life of the session with nobody ever to read them.
 #[derive(Default)]
 struct EffectDrain {
     sink: Option<UiEffectSink>,
     early_notices: Vec<UiEffect>,
+    /// The mode has declared it will never attach a drain; nothing is held.
+    never_attached: bool,
 }
 
 /// The sync snapshot the session keeps current for the (sync) host-services reads.
@@ -1553,6 +1573,26 @@ impl LiveHostServices {
         *Self::lock(&self.overlay_sink) = Some(sink);
     }
 
+    /// Declare, from the session's mode, whether an effect drain will ever be attached (SEAM-160).
+    /// Called by the builder right after construction, before any extension can say anything; for
+    /// `-p` and `--mode json` ([`mode_attaches_effect_drain`]) the early-notice queue is closed and
+    /// emptied, so the session holds no notice for its life. A drain attached anyway (an embedder
+    /// that declared a headless mode) still receives every effect said after it is attached.
+    pub fn declare_effect_drain_for(&self, mode: AppMode) {
+        if mode_attaches_effect_drain(mode) {
+            return;
+        }
+        let mut drain = Self::lock(&self.ui_effect_sink);
+        drain.never_attached = true;
+        drain.early_notices = Vec::new();
+    }
+
+    /// How many notices are being held for a drain not yet attached (SEAM-160's observation).
+    #[cfg(test)]
+    fn held_early_notices(&self) -> usize {
+        Self::lock(&self.ui_effect_sink).early_notices.len()
+    }
+
     /// Send one fire-and-forget effect to the attached drain, if any (no-op — matching Pi's
     /// `noOpUIContext` — when unattached). Never blocks: an `UnboundedSender::send` never awaits.
     fn emit_ui_effect(&self, effect: UiEffect) {
@@ -1560,6 +1600,7 @@ impl LiveHostServices {
         if let Some(sink) = drain.sink.as_ref() {
             let _ = sink.send(effect);
         } else if matches!(effect, UiEffect::Notify { .. })
+            && !drain.never_attached
             && drain.early_notices.len() < MAX_EARLY_NOTICES
         {
             drain.early_notices.push(effect);
@@ -4971,8 +5012,9 @@ mod tests {
         );
     }
 
-    /// The notices held for a mode that never attaches (print, json) are bounded: the oldest are
-    /// kept, and a session that says more drops the rest instead of growing for as long as it runs.
+    /// The notices held for a mode that has not attached its drain yet are bounded: the oldest are
+    /// kept, and a session that says more drops the rest instead of growing for as long as it runs
+    /// (whether that silent drop is right is `SEAM-163`).
     #[test]
     fn the_notices_held_for_an_unattached_mode_are_bounded() {
         let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
@@ -4988,6 +5030,62 @@ mod tests {
         }
         assert_eq!(held.len(), MAX_EARLY_NOTICES);
         assert_eq!(held.first().map(String::as_str), Some("notice 0"));
+    }
+
+    /// SEAM-160 — a session whose mode never attaches an effect drain (`-p`, `--mode json`) holds
+    /// no notice: each is dropped as it is said, as pi's `noOpUIContext.notify` drops it. Before,
+    /// the first thirty-two were kept for the life of the session.
+    #[test]
+    fn a_mode_that_never_attaches_a_drain_holds_no_notice() {
+        for mode in [AppMode::Print, AppMode::Json] {
+            let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+            let svc = svc_with(provider);
+            svc.declare_effect_drain_for(mode);
+            for n in 0..(MAX_EARLY_NOTICES + 10) {
+                svc.notify(&format!("notice {n}"), NotifyKind::Info);
+            }
+            assert_eq!(svc.held_early_notices(), 0, "{mode:?} holds nothing");
+            // An embedder that declared a headless mode and attaches a drain anyway gets what is
+            // said from then on, and nothing from before.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+            svc.set_ui_effect_sink(tx);
+            assert!(
+                rx.try_recv().is_err(),
+                "{mode:?}: nothing was held to deliver"
+            );
+            svc.notify("live", NotifyKind::Info);
+            assert_eq!(
+                rx.try_recv().ok(),
+                Some(UiEffect::Notify {
+                    message: "live".to_string(),
+                    kind: NotifyKind::Info
+                }),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// SEAM-160 CONTROL — the modes that attach a drain (interactive, rpc, acp) still hold their
+    /// early notices across the declaration and deliver them on attach (SEAM-157's behaviour).
+    #[test]
+    fn a_mode_that_attaches_a_drain_still_holds_its_early_notices() {
+        for mode in [AppMode::Interactive, AppMode::Rpc, AppMode::Acp] {
+            let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+            let svc = svc_with(provider);
+            svc.declare_effect_drain_for(mode);
+            svc.notify("early", NotifyKind::Warning);
+            assert_eq!(svc.held_early_notices(), 1, "{mode:?}");
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+            svc.set_ui_effect_sink(tx);
+            assert_eq!(
+                rx.try_recv().ok(),
+                Some(UiEffect::Notify {
+                    message: "early".to_string(),
+                    kind: NotifyKind::Warning
+                }),
+                "{mode:?} delivers the early notice on attach"
+            );
+        }
     }
 
     /// MIRROR: with NO effect sink (headless print/json) the four silently drop and — critically —
