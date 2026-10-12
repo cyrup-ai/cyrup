@@ -102,6 +102,11 @@ pub struct LifecycleEffects {
     /// a warning pushed there would be wiped before the user saw it. Surfaced after the swap, which
     /// is where pi shows it.
     pub warning: Option<String>,
+    /// SEAM-150 — pi's `/reload` `showError(`models.json error: ${getError()}`)`
+    /// (`interactive-mode.ts:6501-6504` @f1b2e77f5), the bare message (`Error: ` is added where it
+    /// is surfaced, as pi's `showError` adds it). Read off the rebuilt session, so it rides the
+    /// outcome for the same reason [`Self::warning`] does.
+    pub error: Option<String>,
 }
 
 /// What a spawned session-lifecycle op hands back (TUI-092 §5b.2).

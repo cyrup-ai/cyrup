@@ -219,6 +219,10 @@ impl<B: Backend> App<B> {
         if let Some(warning) = effects.warning {
             self.state.transcript.show_warning(warning);
         }
+        // SEAM-150 — after the trust warning, pi's order (`interactive-mode.ts:6500-6504`).
+        if let Some(error) = effects.error {
+            self.state.transcript.push_error(format!("Error: {error}"));
+        }
         if let Some(agent_dir) = effects.reload_keybindings_in {
             // TUI-051 — Pi's ordering: session reload first, THEN `this.keybindings.reload()`
             // (`interactive-mode.ts:5386`). A malformed document must not wipe the live keymap

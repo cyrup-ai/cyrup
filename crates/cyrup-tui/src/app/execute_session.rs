@@ -1,6 +1,33 @@
 use super::*;
 
+/// SEAM-150 — the line pi's startup (`interactive-mode.ts:1211-1214` @f1b2e77f5) and `/reload`
+/// (`:6501-6504`) hand `showError`: `` `models.json error: ${this.session.modelRuntime.getError()}` ``,
+/// or `None` when `getError()` is empty. `getError()` is [`AgentSession::model_runtime_error`]: the
+/// `models.json` problems plus `Availability refresh: …` for a failing live-provider auth check.
+///
+/// Those checks run lazily inside the availability predicate, so the catalog is read first —
+/// pi's `getError()` follows the availability pass its runtime creation ran
+/// (`core/model-runtime.ts:334-377`), and without a read here a check that has not run since the
+/// session was built would be missing from the line.
+pub(crate) fn models_json_error(session: &AgentSession) -> Option<String> {
+    let _ = session.available_model_catalog();
+    session
+        .model_runtime_error()
+        .map(|error| format!("models.json error: {error}"))
+}
+
 impl<B: Backend> App<B> {
+    /// SEAM-150 — pi's startup `showError(`models.json error: ${…}`)` (`interactive-mode.ts:
+    /// 1211-1214` @f1b2e77f5), for the boot transcript (`cyrup::interactive::render_boot_transcript`
+    /// calls it after the startup diagnostics and before the model-fallback warning, pi's order).
+    /// `showError` frames the message `Error: …` (`:4623-4626`). Pushes nothing when the session has
+    /// no `getError()`.
+    pub fn show_models_json_error(&mut self, session: &AgentSession) {
+        if let Some(line) = models_json_error(session) {
+            self.state.transcript.push_error(format!("Error: {line}"));
+        }
+    }
+
     /// The session-lifecycle half of [`Self::execute_command`] (§7.1): `NewSession`/`Reload`/
     /// `Import`/`Compact`/`Clone` plus the session-file and session-IO arms (`DeleteSession`,
     /// `RenameSession`, `Export`, `SessionInfo`). Arm bodies moved verbatim.
@@ -395,6 +422,12 @@ impl<B: Backend> App<B> {
                             Ok(()) => Ok(LifecycleEffects {
                                 reload_keybindings_in: Some(agent_dir),
                                 warning: trust_warning,
+                                // SEAM-150 — pi's `const modelsJsonError =
+                                // this.session.modelRuntime.getError(); if (modelsJsonError)
+                                // this.showError(`models.json error: ${modelsJsonError}`)` after
+                                // the reload (`interactive-mode.ts:6501-6504` @f1b2e77f5), read
+                                // off the REBUILT session.
+                                error: models_json_error(&*rt.session().await),
                                 ..LifecycleEffects::default()
                             }),
                             Err(e) => Err(format!("reload error: {e}")),

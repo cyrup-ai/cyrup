@@ -117,6 +117,7 @@ mod live_floor;
 mod login_flow;
 mod markdown;
 mod markdown_links;
+mod model_runtime_error;
 mod model_scope;
 mod model_selector_assembled;
 mod native_shift_enter;

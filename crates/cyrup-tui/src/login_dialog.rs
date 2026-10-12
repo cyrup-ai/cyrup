@@ -14,7 +14,8 @@
 //! | [`LoginDialog::show_info`] | `login-dialog.ts:185-201` |
 //! | [`LoginDialog::show_waiting`] | `login-dialog.ts:207-211` |
 //! | [`LoginDialog::show_progress`] | `login-dialog.ts:217-220` |
-//! | [`LoginDialog::show_select`] | `interactive-mode.ts:5294-5325` (`showAuthSelect`) |
+//! | [`LoginDialog::show_select`] | `interactive-mode.ts:5294-5325` (`showAuthSelect`); its `description` row is `extension-selector.ts:48-51` @f1b2e77f5 |
+//! | [`RADIUS_LOGIN_INTRO`] | `interactive-mode.ts:371`, passed at `:6269` @f1b2e77f5 (TUI-186; wording deliberately not ported) |
 //! | [`TuiAuthInteraction`] | `interactive-mode.ts:5327-5375` (`showAuthPrompt` + `notifyAuthDialog` + `loginProvider`) |
 //! | [`notify_auth_dialog`] | `interactive-mode.ts:5350-5360` (`notifyAuthDialog`) |
 //! | the auth-URL rows + `app.message.copy` | `components/auth-url.ts` (`AuthUrlComponent`) and `login-dialog.ts:16-17`, `:226-233` @v1.1.0 (pi `ced72c2f0`, v1.0.1) |
@@ -82,6 +83,21 @@ use crate::selector::{
     Selector, SelectorOutcome, border_rule, search_input_spans, title_lines, title_wrapped_height,
 };
 use crate::theme::UiTheme;
+
+/// TUI-186 — the intro line drawn under the Radius sign-in method prompt: pi passes
+/// `{ description: providerId === RADIUS_PROVIDER_ID ? RADIUS_LOGIN_INTRO : undefined }` to the
+/// selector its auth `select` prompt opens (`interactive-mode.ts:6269` @f1b2e77f5).
+///
+/// TODO(owner): the wording is the product owner's call. pi's string (`:371`) names pi and makes a
+/// claim about who built the service, so it is NOT ported; this is a neutral, factual placeholder
+/// that only says what the step does, so the mechanism is visible until the owner supplies copy.
+pub const RADIUS_LOGIN_INTRO: &str = "Choose how to sign in to Radius.";
+
+/// The description a provider's auth `select` prompt is shown with — pi's
+/// `providerId === RADIUS_PROVIDER_ID ? RADIUS_LOGIN_INTRO : undefined` (`interactive-mode.ts:6269`).
+pub fn auth_select_description(provider_id: &str) -> Option<&'static str> {
+    (provider_id == cyrup_provider::RADIUS_PROVIDER_ID).then_some(RADIUS_LOGIN_INTRO)
+}
 
 /// The click affordance pi appends under an auth URL (`login-dialog.ts:100`, `:123`). pi branches on
 /// `process.platform === "darwin"`; cyrup resolves the same branch from `cfg!(target_os)`.
@@ -162,6 +178,10 @@ struct LoginSelect {
 pub struct LoginDialog {
     /// `` `Login to ${providerName}` `` unless overridden (`login-dialog.ts:41`).
     title: String,
+    /// `providerId` — the constructor argument pi's dialog keeps (`login-dialog.ts:35`) and the id
+    /// `showAuthPrompt(dialog, prompt, providerId)` picks the select prompt's description by
+    /// (`interactive-mode.ts:6269`, TUI-186). Empty until [`Self::with_provider_id`].
+    provider_id: String,
     lines: Vec<(LoginLineKind, String)>,
     input: Option<LoginInput>,
     select: Option<LoginSelect>,
@@ -204,6 +224,7 @@ impl LoginDialog {
     pub fn new(title: impl Into<String>, keymap: &SelectKeymap) -> Self {
         LoginDialog {
             title: title.into(),
+            provider_id: String::new(),
             lines: Vec::new(),
             input: None,
             select: None,
@@ -245,6 +266,19 @@ impl LoginDialog {
         self.copy_keys = keys;
         self.copy_label = label.filter(|l| !l.is_empty());
         self
+    }
+
+    /// The provider this dialog logs into (pi's `providerId` constructor argument,
+    /// `login-dialog.ts:35`).
+    #[must_use]
+    pub fn with_provider_id(mut self, provider_id: impl Into<String>) -> Self {
+        self.provider_id = provider_id.into();
+        self
+    }
+
+    /// The provider this dialog logs into; empty when none was given.
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
     }
 
     /// Force the OSC-8 capability instead of reading the process-wide cache (test seam).
@@ -449,9 +483,24 @@ impl LoginDialog {
 
     /// `showAuthSelect` (`interactive-mode.ts:5294-5325`) rendered in-dialog: the prompt message
     /// heads a list of the option **labels**; confirming answers with the matching **id**.
-    pub fn show_select(&mut self, message: &str, options: Vec<(String, String)>) {
+    ///
+    /// `description` is `ExtensionSelectorOptions.description` (TUI-186): pi draws it under the
+    /// title after a `Spacer(1)`, in `theme.fg("text", …)` (`extension-selector.ts:48-51`
+    /// @f1b2e77f5). Here it is a spacer and a `Text` row between the message and the options; the
+    /// spacer pi puts after it is not drawn, as the in-dialog list already omits the one between
+    /// the title and the options.
+    pub fn show_select(
+        &mut self,
+        message: &str,
+        options: Vec<(String, String)>,
+        description: Option<&str>,
+    ) {
         self.spacer();
         self.push(LoginLineKind::Text, message);
+        if let Some(description) = description.filter(|d| !d.is_empty()) {
+            self.spacer();
+            self.push(LoginLineKind::Text, description);
+        }
         self.input = None;
         self.select = Some(LoginSelect { options, index: 0 });
     }
@@ -1000,11 +1049,13 @@ pub fn notify_auth_dialog(dialog: &mut LoginDialog, event: AuthEvent) {
     }
 }
 
-/// `showAuthPrompt`'s kind dispatch (`interactive-mode.ts:5328-5332`): `select` opens the option
-/// list, `manual_code` opens the bare manual-entry field (keeping its placeholder — the module's
+/// `showAuthPrompt(dialog, prompt, providerId)`'s kind dispatch (`interactive-mode.ts:6278-6285`
+/// @f1b2e77f5): `select` opens the option list — with [`auth_select_description`] of `provider_id`
+/// under its message, pi's `showAuthSelect(dialog, prompt, providerId)` (`:6269`, TUI-186) —,
+/// `manual_code` opens the bare manual-entry field (keeping its placeholder — the module's
 /// `[CYRUP-DELTA]`), everything else (`text`, `secret`, and an absent `type`) opens the ordinary
 /// message+placeholder prompt.
-pub fn show_auth_prompt(dialog: &mut LoginDialog, prompt: &AuthPrompt) {
+pub fn show_auth_prompt(dialog: &mut LoginDialog, prompt: &AuthPrompt, provider_id: &str) {
     match prompt.kind {
         Some(AuthPromptKind::Select) => {
             let options = prompt
@@ -1012,7 +1063,11 @@ pub fn show_auth_prompt(dialog: &mut LoginDialog, prompt: &AuthPrompt) {
                 .iter()
                 .map(|o| (o.id.clone(), o.label.clone()))
                 .collect();
-            dialog.show_select(&prompt.message, options);
+            dialog.show_select(
+                &prompt.message,
+                options,
+                auth_select_description(provider_id),
+            );
         }
         Some(AuthPromptKind::ManualCode) => {
             dialog.show_manual_code(&prompt.message, prompt.placeholder.clone())
@@ -1184,7 +1239,7 @@ mod tests {
                 },
             ],
         );
-        show_auth_prompt(&mut d, &prompt);
+        show_auth_prompt(&mut d, &prompt, "stub");
         assert_eq!(d.select_option_ids(), vec!["acct-1", "acct-2"]);
         let km = SelectKeymap::default();
         assert_eq!(d.handle(&key(KeyCode::Down), &km), SelectorOutcome::Redraw);
@@ -1436,6 +1491,7 @@ mod tests {
             &mut d,
             &AuthPrompt::manual_code("Paste the code Anthropic shows after you sign in:")
                 .with_placeholder("code#state"),
+            "anthropic",
         );
         assert_eq!(d.input_placeholder(), Some("code#state"));
         let rows = painted_rows(&mut d).join("\n");
@@ -1506,5 +1562,102 @@ mod tests {
             .expect_err("aborted up front");
         assert!(matches!(err, OAuthError::Cancelled));
         assert!(rx.try_recv().is_err(), "no prompt should have been sent");
+    }
+
+    /// The two-option method prompt the Radius flow issues (`radius.rs` `login`, pi `radius.ts:365-376`).
+    fn radius_method_prompt() -> AuthPrompt {
+        AuthPrompt::select(
+            "Sign in to Radius:",
+            vec![
+                AuthSelectOption {
+                    id: "browser".to_string(),
+                    label: "Sign in with browser (recommended)".to_string(),
+                    description: None,
+                },
+                AuthSelectOption {
+                    id: "device-code".to_string(),
+                    label: "Sign in with device code".to_string(),
+                    description: None,
+                },
+            ],
+        )
+    }
+
+    /// TUI-186 Done 1 (unit half) — a Radius `select` prompt draws [`RADIUS_LOGIN_INTRO`] under its
+    /// message, after a spacer and before the options, in `theme.fg("text", …)` — pi's
+    /// `{ description: providerId === RADIUS_PROVIDER_ID ? RADIUS_LOGIN_INTRO : undefined }`
+    /// (`interactive-mode.ts:6269` @f1b2e77f5) drawn by `extension-selector.ts:48-51`.
+    ///
+    /// Red under the mutation "`auth_select_description` answers `None`" (no intro row) and
+    /// "`show_select` ignores `description`" (same); at HEAD `show_auth_prompt` took no provider id.
+    #[test]
+    fn a_radius_select_prompt_shows_the_intro_under_its_message() {
+        let mut d = dialog().with_hyperlinks(false);
+        show_auth_prompt(
+            &mut d,
+            &radius_method_prompt(),
+            cyrup_provider::RADIUS_PROVIDER_ID,
+        );
+        assert_eq!(
+            d.lines(),
+            &[
+                (LoginLineKind::Spacer, String::new()),
+                (LoginLineKind::Text, "Sign in to Radius:".to_string()),
+                (LoginLineKind::Spacer, String::new()),
+                (LoginLineKind::Text, RADIUS_LOGIN_INTRO.to_string()),
+            ]
+        );
+        let rows = painted_rows(&mut d);
+        let intro = rows
+            .iter()
+            .position(|r| r.contains(RADIUS_LOGIN_INTRO))
+            .expect("the intro is drawn");
+        let message = rows
+            .iter()
+            .position(|r| r.contains("Sign in to Radius:"))
+            .unwrap();
+        let first_option = rows
+            .iter()
+            .position(|r| r.contains("Sign in with browser"))
+            .unwrap();
+        assert!(message < intro && intro < first_option, "{rows:#?}");
+        // The prompt still answers with the option id.
+        assert_eq!(d.select_option_ids(), vec!["browser", "device-code"]);
+        assert!(!RADIUS_LOGIN_INTRO.is_empty());
+    }
+
+    /// TUI-186 Done 2 — another provider's `select` prompt has NO description: pi passes
+    /// `undefined` for every id but `radius`.
+    ///
+    /// Non-regression guard: green at HEAD (nothing drew a description). Red under the mutation
+    /// "`auth_select_description` answers the intro for every provider".
+    #[test]
+    fn a_non_radius_select_prompt_has_no_description() {
+        for provider in ["stub", "openai", "anthropic", ""] {
+            let mut d = dialog().with_hyperlinks(false);
+            show_auth_prompt(&mut d, &radius_method_prompt(), provider);
+            assert_eq!(
+                d.lines(),
+                &[
+                    (LoginLineKind::Spacer, String::new()),
+                    (LoginLineKind::Text, "Sign in to Radius:".to_string()),
+                ],
+                "{provider:?}"
+            );
+            assert!(
+                !painted_rows(&mut d)
+                    .iter()
+                    .any(|r| r.contains(RADIUS_LOGIN_INTRO)),
+                "{provider:?}"
+            );
+        }
+        // And a Radius TEXT prompt is untouched — the description belongs to the select prompt.
+        let mut d = dialog().with_hyperlinks(false);
+        show_auth_prompt(
+            &mut d,
+            &AuthPrompt::text("Paste the code"),
+            cyrup_provider::RADIUS_PROVIDER_ID,
+        );
+        assert!(!d.body_text().contains(RADIUS_LOGIN_INTRO));
     }
 }

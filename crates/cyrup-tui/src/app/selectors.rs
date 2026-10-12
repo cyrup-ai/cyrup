@@ -423,17 +423,20 @@ impl<B: Backend> App<B> {
             return; // stale: from a picker that has since closed or been reopened
         }
         self.state.model_refresh_cancel = None;
-        // Pi's `getError()` (`model-runtime.ts:426-435`), minus `availabilityError` which cyrup has
-        // no counterpart for: the `models.json` load error plus every per-provider composition error,
-        // joined exactly as upstream joins them.
-        let runtime_error = session.services().startup_diagnostics.models.join("\n\n");
-        let (status, error) =
-            crate::model_selector::refresh_outcome_rows(&msg.result, Some(runtime_error.as_str()));
         // Read the rebuilt catalog BEFORE taking `&mut` on the picker: `model_entries` borrows the
         // session, not `self`, and keeping the two borrows disjoint is what lets this stay one pass.
         // `available_model_catalog` rebuilds the registry from XAI_3's live overlay slot on every
         // call — so a model released since this binary was built arrives here with no extra plumbing.
+        //
+        // SEAM-150 — it is also the catalog read that runs every live provider's auth check, which
+        // is what records (or clears) a failing one, so it comes BEFORE the error read below.
         let models = model_entries(session);
+        // Pi's `this.modelRuntime.getError()` (`model-selector.ts:202`, `core/model-runtime.ts:
+        // 504-512` @f1b2e77f5): the `models.json` problems plus `Availability refresh: …` for a
+        // failing live-provider auth check, `\n\n`-joined — `AgentSession::model_runtime_error`.
+        let runtime_error = session.model_runtime_error();
+        let (status, error) =
+            crate::model_selector::refresh_outcome_rows(&msg.result, runtime_error.as_deref());
         let Some(picker) = self.model_selector_mut() else {
             return; // closed (Esc/confirm) since this refresh started; epoch matched, nothing to paint
         };
@@ -662,6 +665,25 @@ impl<B: Backend> App<B> {
                     // (`interactive-mode.ts:2564` @v0.84.4) and `handleImportCommand` shows
                     // `Import cancelled` (`:6071`). The stashed path is dropped with it.
                     SelectorKind::ImportConfirm => self.cancel_pending_import(),
+                    // TUI-185 — the `/login` provider picker's `onCancel` (`interactive-mode.ts:
+                    // 5992-5999` @f1b2e77f5): `done(); if (authType) this.showLoginAuthTypeSelector();
+                    // else this.ui.requestRender();`. `authType` is set when the picker was opened
+                    // from the method menu (`:5940`) or re-shown by a login's `onBack` that carried
+                    // it (`:5989`); `/login <unknown>` opens it with `undefined` (`:5871`) and Esc
+                    // lands in the editor. The menu is pi's bare `showLoginAuthTypeSelector()` — the
+                    // one `OpenSelector(Login)` already runs — and needs the session (the menu's rows
+                    // read the registry and the credential store), so it rides a command, the shape
+                    // the `BranchSummary` arm above uses.
+                    SelectorKind::Login => {
+                        if let Some((Some(_auth_type), _)) = self.state.login_picker_args.take() {
+                            return AppAction::Command(AppCommand::OpenSelector(
+                                SelectorKind::Login,
+                            ));
+                        }
+                    }
+                    // Every other kind lands in the editor (or, for a `/settings` child, back on
+                    // its parent list, which `close_selector` already did) — what pi's `done()`
+                    // does for each of them. Audited per kind for TUI-185 (ledger row).
                     _ => {}
                 }
                 AppAction::Redraw

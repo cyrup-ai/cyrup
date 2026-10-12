@@ -975,3 +975,316 @@ async fn the_existing_rows_route_as_before() {
     assert_eq!(text.matches("Radius").count(), 1, "{text}");
     assert!(text.contains("Stub"), "{text}");
 }
+
+// ================================================================ TUI-185: Esc in the provider picker
+
+/// Press Esc in whatever occupies the slot and run the command it emits (if any), as the run loop
+/// does — returning the action so a test can also pin WHICH path was taken.
+async fn esc_and_run(app: &mut App<TestBackend>, session: &Arc<AgentSession>) -> AppAction {
+    let action = app.handle_input(&key(KeyCode::Esc));
+    if let AppAction::Command(command) = &action {
+        app.execute_command(command.clone(), session, None).await;
+    }
+    action
+}
+
+/// Drive a login dialog that is blocked on its prompt to its cancel settle.
+async fn cancel_running_login(
+    app: &mut App<TestBackend>,
+    session: &Arc<AgentSession>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<LoginUiMsg>,
+) {
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::LoginDialog));
+    app.handle_input(&key(KeyCode::Esc));
+    loop {
+        let msg = next_msg(rx).await;
+        let done = matches!(msg, LoginUiMsg::Finished(_));
+        app.apply_login_msg(session, msg).await;
+        if done {
+            break;
+        }
+    }
+}
+
+/// **TUI-185 Done 1.** Bare `/login` → "Sign in with an account" (and, separately, "Sign in with an
+/// API key") → the provider picker → Esc lands back on the METHOD MENU, Radius row and all — pi's
+/// `onCancel`: `done(); if (authType) this.showLoginAuthTypeSelector(); …`
+/// (`interactive-mode.ts:5992-5999` @f1b2e77f5).
+///
+/// RED with the new arm disabled (HEAD's `_ => {}`): `Oauth: Esc asks for pi's bare
+/// \`showLoginAuthTypeSelector()\`` with `left: Redraw, right: Command(OpenSelector(Login))`.
+#[tokio::test]
+async fn esc_in_the_picker_opened_from_the_method_menu_returns_to_the_method_menu() {
+    let fx = fixture().await;
+    let mut app = app_with(with_radius());
+    for method in [AuthType::Oauth, AuthType::ApiKey] {
+        app.state_mut().editor.set_text("draft");
+        bare_login(&mut app, &fx.session).await;
+        app.execute_command(
+            AppCommand::ConfirmSelection {
+                kind: SelectorKind::LoginAuthType,
+                value: method.as_str().to_string(),
+            },
+            &fx.session,
+            None,
+        )
+        .await;
+        assert_eq!(app.active_selector_kind(), Some(SelectorKind::Login));
+
+        let action = esc_and_run(&mut app, &fx.session).await;
+
+        assert_eq!(
+            action,
+            AppAction::Command(AppCommand::OpenSelector(SelectorKind::Login)),
+            "{method:?}: Esc asks for pi's bare `showLoginAuthTypeSelector()`"
+        );
+        assert_eq!(
+            app.active_selector_kind(),
+            Some(SelectorKind::LoginAuthType),
+            "{method:?}: back on the method menu"
+        );
+        assert_eq!(
+            menu_rows(&mut app),
+            vec![
+                "→ Sign in with an account".to_string(),
+                "Sign in with an API key".to_string(),
+                "Sign in with Radius • not configured".to_string(),
+            ],
+            "{method:?}: the TOP-LEVEL menu (pi passes no `providerOptions`)"
+        );
+        // Esc on the menu itself is pi's `done(); requestRender()` → the editor, draft intact.
+        assert_eq!(esc_and_run(&mut app, &fx.session).await, AppAction::Redraw);
+        assert_eq!(app.active_selector_kind(), None);
+        assert_eq!(app.state().editor.text(), "draft");
+    }
+}
+
+/// **TUI-185 Done 2.** `/login <unknown>` opens the picker with `authType` undefined
+/// (`interactive-mode.ts:5871`), so Esc lands in the EDITOR, draft intact.
+///
+/// Non-regression guard: green at HEAD (the editor was where every picker Esc landed). Red under
+/// the mutation "reopen the menu whatever `login_picker_args` holds" (`Some((_, _))`), with
+/// `left: Command(OpenSelector(Login)), right: Redraw`.
+#[tokio::test]
+async fn esc_in_the_picker_opened_by_an_unknown_provider_name_returns_to_the_editor() {
+    let fx = fixture().await;
+    let mut app = app_with(with_radius());
+    app.state_mut().editor.set_text("draft");
+    app.execute_command(
+        AppCommand::LoginCommand(Some("nope".to_string())),
+        &fx.session,
+        None,
+    )
+    .await;
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::Login));
+
+    assert_eq!(esc_and_run(&mut app, &fx.session).await, AppAction::Redraw);
+    assert_eq!(app.active_selector_kind(), None, "in the editor");
+    assert_eq!(app.state().editor.text(), "draft");
+}
+
+/// **TUI-185, the third path.** A picker RE-SHOWN by a cancelled login's `onBack`
+/// (`() => this.showLoginProviderSelector(authType, initialSearchInput)`, `interactive-mode.ts:5989`)
+/// keeps the `authType` it was first opened with, so its Esc follows the same rule: from the
+/// method menu → back to the method menu; from `/login <unknown>` → the editor.
+///
+/// RED with the new arm disabled on the first half (`left: None, right: Some(LoginAuthType)`); the
+/// second half is a guard, red under the same "always reopen the menu" mutation as the test above.
+#[tokio::test]
+async fn esc_in_a_picker_reopened_by_a_cancelled_login_follows_its_origin() {
+    let fx = fixture().await;
+    let mut app = app_with(with_radius());
+    let mut rx = app.install_login_channel();
+
+    // Bare menu → account → picker → stub → login → Esc → picker (onBack) → Esc → menu.
+    bare_login(&mut app, &fx.session).await;
+    app.execute_command(
+        AppCommand::ConfirmSelection {
+            kind: SelectorKind::LoginAuthType,
+            value: AuthType::Oauth.as_str().to_string(),
+        },
+        &fx.session,
+        None,
+    )
+    .await;
+    app.execute_command(
+        AppCommand::ConfirmSelection {
+            kind: SelectorKind::Login,
+            value: "0".to_string(),
+        },
+        &fx.session,
+        None,
+    )
+    .await;
+    cancel_running_login(&mut app, &fx.session, &mut rx).await;
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::Login));
+    esc_and_run(&mut app, &fx.session).await;
+    assert_eq!(
+        app.active_selector_kind(),
+        Some(SelectorKind::LoginAuthType),
+        "the re-shown picker still knows it came from the method menu"
+    );
+    app.close_selector(true);
+
+    // `/login nope` → picker → stub → login → Esc → picker (onBack) → Esc → editor.
+    app.execute_command(
+        AppCommand::LoginCommand(Some("nope".to_string())),
+        &fx.session,
+        None,
+    )
+    .await;
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::Login));
+    app.execute_command(
+        AppCommand::ConfirmSelection {
+            kind: SelectorKind::Login,
+            value: "0".to_string(),
+        },
+        &fx.session,
+        None,
+    )
+    .await;
+    cancel_running_login(&mut app, &fx.session, &mut rx).await;
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::Login));
+    assert_eq!(esc_and_run(&mut app, &fx.session).await, AppAction::Redraw);
+    assert_eq!(app.active_selector_kind(), None, "in the editor");
+}
+
+/// TUI-185 control — cancelling a NON-provider-picker selector behaves as before: the method menu
+/// itself (pi's `onCancel` is `done(); requestRender()`), `/logout`'s picker and the thinking picker
+/// all land in the editor with no command, and `/tree`'s "Summarize branch?" still returns to the
+/// tree (its own arm).
+///
+/// Non-regression guard: green at HEAD. Red under the mutation "match `Login | LoginAuthType`" in
+/// the new arm (the method menu's Esc would then read the stale picker args and reopen itself:
+/// `left: Command(OpenSelector(Login)), right: Redraw`).
+#[tokio::test]
+async fn cancelling_a_non_login_selector_behaves_as_before() {
+    let fx = fixture().await;
+    let mut app = app_with(with_radius());
+
+    // Leave stale picker args behind (opened from the menu, then confirmed away) so a too-wide
+    // arm would have something to act on.
+    bare_login(&mut app, &fx.session).await;
+    app.execute_command(
+        AppCommand::ConfirmSelection {
+            kind: SelectorKind::LoginAuthType,
+            value: AuthType::Oauth.as_str().to_string(),
+        },
+        &fx.session,
+        None,
+    )
+    .await;
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::Login));
+    // Replace the picker without going through its cancel (another selector took the slot).
+    app.close_selector(false);
+
+    bare_login(&mut app, &fx.session).await;
+    assert_eq!(esc_and_run(&mut app, &fx.session).await, AppAction::Redraw);
+    assert_eq!(app.active_selector_kind(), None);
+
+    app.open_selector(SelectorKind::Thinking);
+    assert_eq!(esc_and_run(&mut app, &fx.session).await, AppAction::Redraw);
+    assert_eq!(app.active_selector_kind(), None);
+
+    app.open_data_selector(
+        SelectorKind::Logout,
+        vec![("0".to_string(), "stub".to_string(), None)],
+        0,
+    );
+    assert_eq!(esc_and_run(&mut app, &fx.session).await, AppAction::Redraw);
+    assert_eq!(app.active_selector_kind(), None);
+
+    app.open_data_selector(
+        SelectorKind::BranchSummary,
+        vec![("none".to_string(), "No summary".to_string(), None)],
+        0,
+    );
+    assert_eq!(
+        app.handle_input(&key(KeyCode::Esc)),
+        AppAction::Command(AppCommand::OpenSelector(SelectorKind::Tree)),
+        "the BranchSummary arm is untouched"
+    );
+}
+
+// ================================================================ TUI-186: the Radius intro
+
+/// An OAuth strategy whose login opens with a `select` prompt — the shape of the Radius flow's
+/// method choice (`cyrup-provider` `auth/oauth/radius.rs`, pi `radius.ts:365-376`).
+struct SelectingOauth;
+
+#[async_trait::async_trait]
+impl OAuthAuth for SelectingOauth {
+    fn name(&self) -> &str {
+        "Selecting OAuth"
+    }
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+        _options: &LoginOptions,
+    ) -> Result<Credential, OAuthError> {
+        let method = interaction
+            .prompt(AuthPrompt::select(
+                "Sign in to Radius:",
+                vec![cyrup_provider::auth::oauth::AuthSelectOption {
+                    id: "browser".to_string(),
+                    label: "Sign in with browser (recommended)".to_string(),
+                    description: None,
+                }],
+            ))
+            .await?;
+        Err(OAuthError::Failed(format!("stub stops after {method}")))
+    }
+    async fn refresh(&self, cred: &Credential) -> Result<Credential, ProviderAuthError> {
+        Ok(cred.clone())
+    }
+    async fn to_auth(&self, _cred: &Credential) -> Result<ModelAuth, ProviderAuthError> {
+        Ok(ModelAuth::default())
+    }
+}
+
+/// `/login <id>` on a provider whose login opens with a select prompt; returns the dialog body once
+/// the prompt is up.
+async fn select_prompt_body(id: &'static str) -> String {
+    let fx = fixture().await;
+    let mut app = app_with(registry(vec![(
+        id,
+        ProviderAuth::with_oauth(Arc::new(SelectingOauth)),
+    )]));
+    let mut rx = app.install_login_channel();
+    app.execute_command(
+        AppCommand::LoginCommand(Some(id.to_string())),
+        &fx.session,
+        None,
+    )
+    .await;
+    assert_eq!(app.active_selector_kind(), Some(SelectorKind::LoginDialog));
+    let msg = next_msg(&mut rx).await;
+    assert!(matches!(msg, LoginUiMsg::Prompt { .. }), "{msg:?}");
+    app.apply_login_msg(&fx.session, msg).await;
+    app.login_dialog_body().expect("the dialog is open")
+}
+
+/// **TUI-186 Done 1 + 2, through the App.** The Radius sign-in select prompt shows the intro under
+/// its message; the same prompt from another provider's login does not. Proves the provider id is
+/// threaded from `begin_provider_login` through the dialog into `show_auth_prompt`.
+///
+/// Red under the mutation "`open_login_dialog` gives the dialog an empty provider id" (the Radius
+/// half: no intro); the non-Radius half is a guard, red under "`auth_select_description` answers
+/// the intro for every provider". At HEAD no intro existed anywhere.
+#[tokio::test]
+async fn the_radius_sign_in_prompt_shows_the_intro_and_another_providers_does_not() {
+    let radius = select_prompt_body("radius").await;
+    assert!(
+        radius.contains(crate::login_dialog::RADIUS_LOGIN_INTRO),
+        "{radius}"
+    );
+    let at = |needle: &str| radius.find(needle).unwrap();
+    assert!(at("Sign in to Radius:") < at(crate::login_dialog::RADIUS_LOGIN_INTRO));
+
+    let other = select_prompt_body("stub").await;
+    assert!(other.contains("Sign in to Radius:"), "{other}");
+    assert!(
+        !other.contains(crate::login_dialog::RADIUS_LOGIN_INTRO),
+        "{other}"
+    );
+}

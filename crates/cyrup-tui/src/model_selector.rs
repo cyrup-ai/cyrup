@@ -558,10 +558,12 @@ impl ModelSelector {
 /// (`model-selector.ts:193-206`). Returns `(refresh_status, error_message)` for
 /// [`ModelSelector::set_refresh_status`] / [`ModelSelector::set_error_message`]; `None` clears.
 ///
-/// `runtime_error` is pi's `this.modelRuntime.getError()` (`model-runtime.ts:426-435`): the
-/// `models.json` load error plus every per-provider composition error, joined with `"\n\n"`. cyrup
-/// carries exactly those two on `AgentSessionServices::startup_diagnostics.models`; upstream's third
-/// source, `availabilityError`, has no counterpart because cyrup runs no availability pass.
+/// `runtime_error` is pi's `this.modelRuntime.getError()` (`model-selector.ts:202`,
+/// `core/model-runtime.ts:504-512` @f1b2e77f5): the `models.json` load error, every per-provider
+/// composition error and `Availability refresh: <message>` for a failing live-provider auth check,
+/// joined with `"\n\n"` — cyrup's `AgentSession::model_runtime_error` (SEAM-139), which the caller
+/// (`App::apply_model_refresh`) reads after the catalog read that runs those checks (SEAM-150).
+/// Shown in red one row per line, and it suppresses `Model catalogs refreshed.` (`:203-206`).
 ///
 /// **`[CYRUP-DELTA]`** — the first arm is `timed_out || aborted`, where pi's is
 /// `result.aborted && timedOut`. pi's spare `aborted` falls through to its success arm and reports
