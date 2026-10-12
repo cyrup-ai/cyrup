@@ -28,7 +28,9 @@ copying figures. Nothing here was observed at runtime.
 | 9 | ~~`SUBA-114`~~ | ~~high~~ **CLOSED 2026-09-26 (`850eb70`, #156)** | 09b | Reverse lag (`stale-port`) | M | Child tools are cut to the parent session's start-up tools, so reviewer/scout launches are refused under a narrow `--tools` (removed upstream at v0.70.0) |
 | 10 | ~~`SUBA-110`~~ | ~~high~~ **CLOSED 2026-09-24 (`c936d8c`)** | 09b | Version lag (`upstream-drift`) | S | `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_CONFIG_*` reach the background runner and allowlist-less external CLIs (v0.71.0) |
 
-**Not in this table by the standing rule**, which keeps areas 13 and 15 out of this file: area 13
+**Not in this table by the standing rule**, which keeps areas 13 and 15 out of this file (*2026-10-12:
+the census script now counts area 13's defect rows and area 15's open items, neither of which has an
+open row above medium; area 13's port units below are still counted only in their own file*): area 13
 has critical `MCP-500` and, among its highs, three filed on 2026-09-24 that a user would feel first:
 `MCP-553` (`inheritEnv:false` ignored), `MCP-576` (a rotating `!command` bearer token is never
 re-resolved) and `MCP-585` (an Agent Plugin header's `!command` is run through the shell).
