@@ -130,6 +130,7 @@ mod pending_messages;
 mod program_status_blocked;
 mod project_trust_banner;
 mod quiet_startup_setting;
+mod radius_login;
 mod recorded_duration;
 mod reload_implicit_trust;
 mod render;

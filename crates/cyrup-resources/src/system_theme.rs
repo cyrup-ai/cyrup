@@ -1252,6 +1252,64 @@ pub fn is_background_token(token: &str) -> bool {
     PANELS.contains(&token)
 }
 
+/// The colour space [`mix_colors`] interpolates in — pi's `ColorMixSpace = "oklch" | "srgb"`
+/// (`packages/tui/src/colors.ts:26` @f1b2e77f5). `Oklch` is pi's default argument.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorMixSpace {
+    /// Perceptual: lightness and chroma linear, hue along the shorter arc (`colors.ts:251-257`).
+    #[default]
+    Oklch,
+    /// Straight per-channel interpolation of the GAMMA-ENCODED sRGB bytes (`colors.ts:245-249`) —
+    /// no linearisation, which is what pi means by `"srgb"`.
+    Srgb,
+}
+
+/// Pi `mixColors(first, second, amount, space)` (`packages/tui/src/colors.ts:241-257` @f1b2e77f5):
+/// ONE entry point that takes the space, so a caller ports pi's call site argument for argument.
+///
+/// **TUI-144 colour-space decision.** pi's Radius shimmer mixes in `"srgb"`
+/// (`radius-login-selector.ts:31`); this is the arm that makes it portable without silently
+/// substituting OKLCH (which bends the `#f1be57 → #f09082` and `#f09082 → #4d9abf` transitions
+/// through different intermediate hues). The theme's own dimming stays on [`ColorMixSpace::Oklch`],
+/// pi's default.
+///
+/// `[CYRUP-DELTA]` two total-function choices, both invisible to every in-tree caller (which only
+/// ever pass `amount` in `[0, 1]`): pi THROWS on a non-finite or out-of-range `amount`
+/// (`:242-243`); this clamps into `[0, 1]` and reads `NaN` as `0` instead, because a colour helper
+/// that can fail would force every render path to carry an error it can never meaningfully report.
+/// And pi's sRGB result keeps fractional channels until `foregroundAnsi` rounds them
+/// (`Math.round`, `:300`); cyrup's [`Rgb`] is `u8`, so the rounding happens here, with the same
+/// half-up rule `Math.round` applies to non-negative values.
+#[must_use]
+pub fn mix_colors(first: Rgb, second: Rgb, amount: f64, space: ColorMixSpace) -> Rgb {
+    let amount = if amount.is_nan() {
+        0.0
+    } else {
+        amount.clamp(0.0, 1.0)
+    };
+    match space {
+        ColorMixSpace::Oklch => mix_oklch(first, second, amount),
+        ColorMixSpace::Srgb => mix_srgb(first, second, amount),
+    }
+}
+
+/// Pi `mixColors(first, second, amount, "srgb")` (`colors.ts:245-249`): `a + (b - a) * amount` on
+/// each gamma-encoded channel, rounded to the nearest byte.
+fn mix_srgb(first: Rgb, second: Rgb, amount: f64) -> Rgb {
+    let channel = |a: u8, b: u8| {
+        let a = f64::from(a);
+        let mixed = a + (f64::from(b) - a) * amount;
+        // In range by construction (a convex combination of two bytes); the clamp only makes the
+        // cast's saturation explicit.
+        mixed.round().clamp(0.0, 255.0) as u8
+    };
+    Rgb::new(
+        channel(first.r, second.r),
+        channel(first.g, second.g),
+        channel(first.b, second.b),
+    )
+}
+
 /// Pi `mixColors(first, second, amount)` in OKLCH (`colors.ts:241-257`), the default space: lightness
 /// and chroma interpolate linearly, hue along the shorter arc, and a colourless end takes the other
 /// end's hue.
@@ -1305,7 +1363,7 @@ pub fn concrete_colors(
         .collect();
     for token in &generated.dim {
         if let Some(color) = colors.get_mut(token) {
-            *color = mix_oklch(*color, default_bg, DIM_MIX);
+            *color = mix_colors(*color, default_bg, DIM_MIX, ColorMixSpace::Oklch);
         }
     }
     colors

@@ -139,6 +139,39 @@ impl<B: Backend> App<B> {
         }
     }
 
+    /// The period the selector in the input slot needs the animation tick at, if it animates
+    /// (TUI-144 — the `/login` menu's Radius shimmer, [`crate::radius_login_selector`]).
+    ///
+    /// Read from whatever occupies the slot NOW, so every path that removes the selector — confirm,
+    /// cancel, a session rebind or `reset_extension_ui` clearing the slot, another dialog replacing
+    /// it — stops the animation without any of them knowing it exists: there is no
+    /// `stopAnimation()` to forget.
+    pub fn selector_animation_frame(&self) -> Option<std::time::Duration> {
+        self.state
+            .selector
+            .as_ref()
+            .and_then(|active| active.inner.animation_frame())
+    }
+
+    /// The period the run loop's ONE animation tick runs at: the working indicator's own period
+    /// (`spinner_period`, TUI-030), or faster while the open selector animates (TUI-144: pi's
+    /// `ANIMATION_FRAME_MS = 50`, `radius-login-selector.ts:15`). cyrup has no per-component
+    /// timer, so a second animation does not get a second clock; it shortens this one.
+    ///
+    /// Shortening it does not speed anything else up: the indicator glyph and the bash/elapsed
+    /// figures are derived from elapsed wall time, not from tick counts. The one tick-counted
+    /// phase is the `/share` loader's (`loader_tick`, advanced once per tick), so while a loader is
+    /// mounted the period is left alone — the shimmer would then sample at the loader's 80 ms
+    /// rather than make the loader spin faster.
+    pub fn animation_period(&self) -> std::time::Duration {
+        let indicator = self.state.indicator.spinner_period();
+        if self.state.loader.is_some() {
+            return indicator;
+        }
+        self.selector_animation_frame()
+            .map_or(indicator, |frame| frame.min(indicator))
+    }
+
     /// Reconcile the two `blocked` OSC 7501 sources against the UI state (TUI-171).
     ///
     /// **[CYRUP-DELTA] — mechanism, not behaviour.** Pi hand-places five `setBlocked` calls, paired

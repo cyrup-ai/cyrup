@@ -390,3 +390,86 @@ fn every_generated_system_theme_document_passes_the_strict_theme_check() {
         .unwrap_or_else(|e| panic!("{name}: generated system theme rejected: {e}"));
     }
 }
+
+// ============================================================================
+// TUI-144 — `mixColors(…, "srgb")`
+// ============================================================================
+//
+// Expected values were produced by RUNNING pi's own `mixColors` (`packages/tui/src/colors.ts`
+// @f1b2e77f5) under Bun, then rounded the way `foregroundAnsi` rounds them (`Math.round`,
+// `colors.ts:300`): `mixColors(#4d9abf, #83ccd2, 0.5, "srgb")` is `[104, 179, 200.5]`,
+// `mixColors(#f1be57, #f09082, 0.5, "srgb")` is `[240.5, 167, 108.5]`,
+// `mixColors(#f09082, #4d9abf, 0.25, "srgb")` is `[199.25, 146.5, 145.25]`, and the same
+// `#f1be57`/`#f09082` midpoint in pi's default OKLCH is `[248, 164, 103]`.
+
+const RADIUS_BLUE: Rgb = Rgb::new(0x4d, 0x9a, 0xbf);
+const RADIUS_CYAN: Rgb = Rgb::new(0x83, 0xcc, 0xd2);
+const RADIUS_GOLD: Rgb = Rgb::new(0xf1, 0xbe, 0x57);
+const RADIUS_CORAL: Rgb = Rgb::new(0xf0, 0x90, 0x82);
+
+/// RED-PROVEN: fails at HEAD (no `mix_colors`/`ColorMixSpace` — does not compile), and under the
+/// mutation "`ColorMixSpace::Srgb` routes to `mix_oklch`" (the midpoints come back `[248,164,103]`).
+#[test]
+fn srgb_mix_matches_pis_gamma_encoded_interpolation() {
+    assert_eq!(
+        mix_colors(RADIUS_BLUE, RADIUS_CYAN, 0.5, ColorMixSpace::Srgb),
+        Rgb::new(104, 179, 201),
+        "200.5 rounds half-up, as `Math.round` does"
+    );
+    assert_eq!(
+        mix_colors(RADIUS_GOLD, RADIUS_CORAL, 0.5, ColorMixSpace::Srgb),
+        Rgb::new(241, 167, 109)
+    );
+    assert_eq!(
+        mix_colors(RADIUS_CORAL, RADIUS_BLUE, 0.25, ColorMixSpace::Srgb),
+        Rgb::new(199, 147, 145)
+    );
+}
+
+/// RED-PROVEN under the mutation "`mix_srgb` interpolates `b → a`" (`a + (b - a) * (1 - amount)`):
+/// both endpoints swap.
+#[test]
+fn srgb_mix_endpoints_are_the_inputs() {
+    for (a, b) in [
+        (RADIUS_BLUE, RADIUS_CYAN),
+        (RADIUS_GOLD, RADIUS_CORAL),
+        (RADIUS_CORAL, RADIUS_BLUE),
+    ] {
+        assert_eq!(mix_colors(a, b, 0.0, ColorMixSpace::Srgb), a);
+        assert_eq!(mix_colors(a, b, 1.0, ColorMixSpace::Srgb), b);
+    }
+}
+
+/// The space argument is load-bearing: the same pair mixed in pi's default OKLCH lands elsewhere,
+/// and `ColorMixSpace::default()` is that default. Non-regression guard for the OKLCH arm (the
+/// theme's dimming rides it) — passes against `mix_oklch` as it was at HEAD.
+#[test]
+fn the_oklch_arm_is_pis_default_and_differs_from_srgb() {
+    assert_eq!(ColorMixSpace::default(), ColorMixSpace::Oklch);
+    assert_eq!(
+        mix_colors(RADIUS_GOLD, RADIUS_CORAL, 0.5, ColorMixSpace::Oklch),
+        Rgb::new(248, 164, 103)
+    );
+    assert_ne!(
+        mix_colors(RADIUS_GOLD, RADIUS_CORAL, 0.5, ColorMixSpace::Oklch),
+        mix_colors(RADIUS_GOLD, RADIUS_CORAL, 0.5, ColorMixSpace::Srgb)
+    );
+}
+
+/// `[CYRUP-DELTA]` pi throws on an `amount` outside `[0, 1]` or non-finite; cyrup clamps and reads
+/// `NaN` as `0`. RED-PROVEN under the mutation "drop the clamp" (`1.5` extrapolates past the end).
+#[test]
+fn an_out_of_range_amount_is_clamped_instead_of_thrown() {
+    assert_eq!(
+        mix_colors(RADIUS_BLUE, RADIUS_CYAN, 1.5, ColorMixSpace::Srgb),
+        RADIUS_CYAN
+    );
+    assert_eq!(
+        mix_colors(RADIUS_BLUE, RADIUS_CYAN, -0.5, ColorMixSpace::Srgb),
+        RADIUS_BLUE
+    );
+    assert_eq!(
+        mix_colors(RADIUS_BLUE, RADIUS_CYAN, f64::NAN, ColorMixSpace::Srgb),
+        RADIUS_BLUE
+    );
+}

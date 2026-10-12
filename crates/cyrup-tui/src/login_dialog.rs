@@ -846,6 +846,10 @@ pub enum LoginUiMsg {
     },
     /// The whole login settled — the `try`/`catch` around `loginProvider`.
     Finished(Box<LoginFinished>),
+    /// TUI-144 — a dialog with no flow behind it (the ambient notice) was cancelled by the user:
+    /// return to the `/login` menu it was opened from (pi's `onBack`,
+    /// `interactive-mode.ts:6172-6176` @f1b2e77f5). Posted by `App::cancel_login`, never by a flow.
+    Back,
 }
 
 /// A settled login (`showLoginDialog`/`showApiKeyLoginDialog`'s `try`/`catch`,

@@ -182,7 +182,7 @@ impl App<InlineBackend<TuiStdout>> {
         // exactly as the `SetWorkingIndicator` effect arm re-reads it. Without this a guest that
         // asked for `intervalMs: 1000` would leave the NEXT session's built-in Braille spinner
         // sampled once a second.
-        ctx.spinner = tokio::time::interval(self.state.indicator.spinner_period());
+        ctx.spinner = tokio::time::interval(self.animation_period());
         ctx.spinner
             .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Pi re-titles the window from the newly bound session (`bindSession` →
@@ -638,7 +638,7 @@ impl App<InlineBackend<TuiStdout>> {
             // for the same reason — it is run-loop state `apply_ui_effect` cannot reach.
             // Without this a `frames`-heavy indicator with a 40 ms `intervalMs` would
             // still only be sampled every 80 ms.
-            ctx.spinner = tokio::time::interval(self.state.indicator.spinner_period());
+            ctx.spinner = tokio::time::interval(self.animation_period());
             ctx.spinner
                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         }
