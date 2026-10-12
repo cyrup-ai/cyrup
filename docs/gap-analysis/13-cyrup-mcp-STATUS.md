@@ -623,6 +623,63 @@ Folded in, the census at 2026-10-11 is:
 Next free id unchanged: `MCP-634`. Area 13 is counted in this file by the standing rule, so
 `scripts/count_open_items.py` does not see this change.
 
+### Closures and additions — 2026-10-12 (every MCP wait bounded by what it waits for)
+
+Five rows in `13e` closed and six filed, on `claude/eloquent-lovelace-vivq3h` off `main` @ `360dc2bbf`
+(`5aebe4314`, `c13522f5e`, `4c0162387`, `05c4c2174`). The closure records — each row's delta closed or overturned and why, its
+waits with their bounds now, and the pins that hold them — are on the rows; the table rows above are
+left as filed.
+
+| id | sev | § | kind | status | eff | title |
+|---|---|---|---|---|---|---|
+| `MCP-628` | ~~low~~ | 13e | `cyrup-original` | **implemented** *(CLOSED 2026-10-12)* | S | a script's MCP wait comes out of its own `timeout_ms`; its result names the servers it went without |
+| `MCP-629` | ~~low~~ | 13e | `parity-bug` | **implemented** *(CLOSED 2026-10-12)* | M | the first-prompt wait is scoped to the servers that declare tools (gap closed) |
+| `MCP-630` | ~~low~~ | 13e | `port-divergence` | **implemented** *(CLOSED 2026-10-12)* | M | a reply nested past 127 levels fails its request at once (premise overturned, refusal kept) |
+| `MCP-631` | ~~low~~ | 13e | `port-divergence` | **implemented** *(CLOSED 2026-10-12)* | S | a direct call waits for the build itself and ends at its own cancel (delta overturned) |
+| `MCP-633` | ~~low~~ | 13e | `test-defect` | **implemented** *(CLOSED 2026-10-12)* | S | the 60 s default and the deduped connect pinned so a changed timeout fails them |
+| `MCP-634` | low | 13e | `port-divergence` | **missing** | M | a server's `sampling/createMessage` ignores the turn's abort |
+| `MCP-635` | low | 13e | `parity-bug` | **partial** | M | a direct call mid-build waits for the whole build, not its own server (narrowed out of `MCP-631`) |
+| `MCP-636` | low | 13e | `port-divergence` | **partial** | S | the first prompt's convergence pass is cut at the dispatcher's 5 s budget |
+| `MCP-637` | low | 13e | `port-divergence` | **partial** | M | a reply nested past 127 levels is refused where a JavaScript client reads it (narrowed out of `MCP-630`) |
+| `MCP-638` | low | 13e | `cyrup-original` | **missing** | S | two OAuth memos are cleared only by the caller that installed them |
+| `MCP-639` | low | 13e | `cyrup-original` | **missing** | S | each OAuth token lookup on an HTTP connect parks one task until the session ends |
+
+`MCP-603` and `MCP-632` are untouched and stay open.
+
+**Mutation proofs:** 51, each a deliberate defect in the code a pin guards, applied, the pin's tests
+run, the file restored byte for byte; all 51 turn their pins red. `M07` and `M19` are the second runs
+recorded on `MCP-631`; `M48`/`M49` move the default to 30 s and 90 s under the live `cyrup-it` pin.
+
+**The wait census** behind these closures: every wait, sleep, timeout and `select!` in the MCP
+connect and call paths, read at `360dc2bbf` and again at `4c0162387` (118 production sites; rmcp's own
+and the test fixtures counted apart). Whether each observes the cancel token that reaches it:
+
+| | yes | in part | no | gone / not a wait |
+|---|---|---|---|---|
+| `360dc2bbf` | 29 | 35 | 54 | — |
+| `4c0162387` | 47 | 20 | 34 | 17 |
+
+`05c4c2174` then races the connect's OAuth token lookup against the attempt, which the two aborted-attempt
+joins below waited on. The 34 that do not observe a cancel, by what bounds them instead (locations at
+`4c0162387`):
+
+| bound | n | sites |
+|---|---|---|
+| a human's answer, as upstream's dialogs are | 5 | the project-server trust prompt (`runtime.rs:247`, `project_server_trust.rs:678`); a server's elicitation, form or URL (`runtime.rs:3761`, `:3834`); the `/mcp` panel, which also closes after 60 s without a key (`extension.rs:2368`) |
+| a close: a stdio child's 3 s before the kill, an HTTP session's 5 s `DELETE` | 15 | `server_manager.rs:718`, `:1215`, `:2440`, `:2681`, `:2853`, `:2884`, `:2903`, `:2978`, `:3028`; `runtime.rs:1369`, `:4894`, `:4902`, `:6381`; `lifecycle.rs:935`; `proxy/call.rs:377` |
+| the aborted attempt's next stage, then the close of what it built | 2 | `close_inner`'s and `close_all`'s joins of an aborted connect (`server_manager.rs:2855`, `:2970`); until `05c4c2174` that included the OAuth token lookup |
+| the joins and closes under it | 2 | `graceful_shutdown`'s joins (`lifecycle.rs:1593`); the session-start teardown, declared with a 35 s ceiling (`extension.rs:1651`) |
+| time, not a cancel | 3 | the first prompt's 10 s, which upstream's `waitForDirectServers` does not cancel either (`extension.rs:1735`); a call's deadline, which stops while a human answers an elicitation (`call_deadline.rs:190`); a detached gateway waiter, which ends when the build settles (`dispatch.rs:161`) |
+| nothing in cyrup | 3 | a keyring read on a blocking thread (`oauth.rs:3688`); an `auth.provider` token source (`runtime.rs:2494`); the transport's request POST, which has no timeout of its own and which no caller waits on past its own cancel or request timeout (`runtime.rs:3034`) |
+| short and local | 4 | the 250 ms stderr settle (`runtime.rs:4842`); a send into rmcp's service channel (`live.rs:1192`); an artifact written to disk (`live.rs:1929`); the session lock a script's store read takes (`cyrup-session-svc` `session/codemode.rs:143`) |
+
+Arithmetic on the 2026-10-11 census (570: `implemented` 370, `partial` 71, `missing` 95,
+`not-applicable` 34): +6 rows = **576**; `implemented` 370 + 5 = **375**; `partial` 71 − 4
+(`MCP-628`…`MCP-631`) + 3 (`MCP-635`…`MCP-637`) = **70**; `missing` 95 − 1 (`MCP-633`) + 3
+(`MCP-634`, `MCP-638`, `MCP-639`) = **97**; `not-applicable` **34**. 375 + 70 + 97 + 34 = 576.
+Severity of the new rows: 6 low. Next free id: `MCP-640`. Area 13 is counted in this file by the standing rule, so
+`scripts/count_open_items.py` does not see this change.
+
 ### Additions — 2026-10-07 (area 18's pi `v1.0.1..v1.0.4` triage)
 
 One row filed: `MCP-616` (13e, low, M, **missing**): `--tools` / `--exclude-tools` accept `*` patterns, `--tools`
