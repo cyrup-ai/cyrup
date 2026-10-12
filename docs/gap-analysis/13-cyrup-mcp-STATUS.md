@@ -646,9 +646,19 @@ left as filed.
 
 `MCP-603` and `MCP-632` are untouched and stay open.
 
-**Mutation proofs:** 51, each a deliberate defect in the code a pin guards, applied, the pin's tests
-run, the file restored byte for byte; all 51 turn their pins red. `M07` and `M19` are the second runs
-recorded on `MCP-631`; `M48`/`M49` move the default to 30 s and 90 s under the live `cyrup-it` pin.
+**Mutation proofs:** 58, each a deliberate defect in the code a pin guards, applied, the pin's tests
+run, the file restored byte for byte; all 58 turn their pins red. `M07` and `M19` are the second runs
+recorded on `MCP-631`; `M48`/`M49` move the default to 30 s and 90 s under the live `cyrup-it` pin;
+`M52`–`M58` guard the fixes below.
+
+**Adversarial review.** Four reviewers read the branch's diff (cancellation, the depth guard and
+transports, the script deadline, and the truth of every comment, doc and ledger claim), and a
+skeptic per reviewer tried to refute each finding: 16 found, 14 confirmed, all fixed in `6526d34b2` —
+six in code (recorded on `MCP-628` and `MCP-630`) and eight in comments, the user doc and this
+ledger (among them the next free id, which the STATUS header and seven sibling files still gave
+as `MCP-634`). The two refuted: an approval dialog dropped on cancel releases the interaction
+lock, as it did before this branch; and a parallel batch's prepare phase is not the script's own
+MCP wait.
 
 **The wait census** behind these closures: every wait, sleep, timeout and `select!` in the MCP
 connect and call paths, read at `360dc2bbf` and again at `4c0162387` (118 production sites; rmcp's own
