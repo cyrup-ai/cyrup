@@ -2947,8 +2947,8 @@ impl SseEventSizeLimiter {
 /// # Why this OWNS the POST instead of decorating it
 ///
 /// [`SessionIdProbe`] and [`crate::request_headers_command::RequestHeadersCommandClient`] both sit
-/// ABOVE `impl StreamableHttpClient for reqwest::Client` and delegate the send to it
-/// (`runtime.rs:1017-1022`, `request_headers_command.rs:944-946`). What comes back to them is a
+/// ABOVE `impl StreamableHttpClient for reqwest::Client` and delegate the send to it (their
+/// `post_message`). What comes back to them is a
 /// [`StreamableHttpPostResponse`] — a `ServerJsonRpcMessage`, a stream, and an `Option<String>`
 /// session id, and NOTHING about the HTTP status. rmcp reads the status into a local at
 /// `rmcp-3.1.4/src/transport/common/reqwest/streamable_http_client.rs:243` and that local dies with
@@ -2958,9 +2958,10 @@ impl SseEventSizeLimiter {
 /// # Which POSTs it owns
 ///
 /// Every POST that carries a **request**. The 401 fix is the handshake's alone:
-/// [`unauthorized_challenge`] has exactly one caller (`runtime.rs:2672`) and it takes a
-/// [`ClientInitializeError`], so the startup POST is the only request whose 401 can start the OAuth
-/// ladder, and every other request keeps rmcp's 401 arm, gated on the challenge header.
+/// [`unauthorized_challenge`] has exactly one caller, the attempt loop of
+/// [`ConnectionBuilder::connect_http_client`], and it takes a [`ClientInitializeError`], so the
+/// startup POST is the only request whose 401 can start the OAuth ladder, and every other request
+/// keeps rmcp's 401 arm, gated on the challenge header.
 ///
 /// The others are owned for MCP-630: rmcp parses a JSON reply body itself and answers `Accepted` for
 /// one it cannot parse (`common/reqwest/streamable_http_client.rs:308-318`), so a reply nested past
@@ -2968,30 +2969,48 @@ impl SseEventSizeLimiter {
 /// first ([`crate::depth_guard::read_json_body`]) and a refused reply fails its request at once.
 /// Their SSE replies keep rmcp's per-event cap through a port of its limiter
 /// ([`event_capped_sse_stream`]); the handshake keeps [`capped_sse_stream`]'s total cap, which is
-/// safe only because a handshake stream is drained to its first `Response` and dropped. Notifications
+/// safe only because a handshake stream is drained to its first `Response` and dropped. A handshake
+/// reply nested too deep ends its stream instead ([`crate::depth_guard::guard_handshake_sse`]), and
+/// rmcp's worker logs that error and does not return it, so the probe keeps the reason
+/// ([`Self::take_handshake_refusal`]) for the connect to report. Notifications
 /// and responses this side sends are still delegated to rmcp verbatim: nothing waits on what comes
 /// back for them.
 ///
 /// # Why `AuthRequired` and not a new shape
 ///
 /// [`StreamableHttpError::AuthRequired`] is the currency the consumers already read, so nothing
-/// downstream changes: [`unauthorized_challenge`] downcasts it at `runtime.rs:2021-2025` and returns
-/// `Some(&required.www_authenticate_header)` — `Some("")` for a bare 401, which is exactly what
-/// [`crate::oauth::on_unauthorized`] (`oauth.rs:3949-3964`) already expects. `AuthRequiredError::new`
+/// downstream changes: [`unauthorized_challenge`] downcasts it in [`unauthorized_in_chain`] and
+/// returns `Some(&required.www_authenticate_header)` — `Some("")` for a bare 401, which is exactly
+/// what [`crate::oauth::on_unauthorized`] already expects. `AuthRequiredError::new`
 /// is public (`rmcp-3.1.4/src/transport/streamable_http_client.rs:135-142`) and the variant carries
-/// it as `#[source]` (`:203`), so the `source()` walk at `runtime.rs:2019-2030` finds it. rmcp's own
+/// it as `#[source]` (`:203`), so the `source()` walk in [`unauthorized_in_chain`] finds it. rmcp's own
 /// `ClientInitializeError::auth_challenge` (`…/service/client.rs:109-132`) reads the same type, and
 /// so will `AuthClient` when section 05 lands it.
 #[derive(Debug, Clone)]
 pub struct UnauthorizedProbe {
     inner: reqwest::Client,
+    /// Why the last handshake stream was ended: a reply nested past what cyrup reads. Shared by the
+    /// clones the connect's client stack holds.
+    handshake_refusal: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl UnauthorizedProbe {
     /// Wrap the tuned client [`build_http_client`] produces.
     #[must_use]
     pub fn new(inner: reqwest::Client) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            handshake_refusal: Arc::default(),
+        }
+    }
+
+    /// Why a handshake stream was ended, once: rmcp's worker logs the stream's error and the client
+    /// sees only `connection closed: initialize response`.
+    pub fn take_handshake_refusal(&self) -> Option<String> {
+        self.handshake_refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// A faithful port of `rmcp-3.1.4/src/transport/common/reqwest/streamable_http_client.rs:190-324`
@@ -3134,15 +3153,25 @@ impl UnauthorizedProbe {
             .as_deref()
             .is_some_and(|ct| ct.starts_with(EVENT_STREAM_MIME_TYPE))
         {
+            // The handshake's stream is read by `expect_initialized`, which skips the error reply
+            // `guard_sse` would put in a deep reply's place; there the refusal ends the stream.
             let events = if handshake {
-                capped_sse_stream(response, max_sse_event_size)
+                let refused = Arc::clone(&self.handshake_refusal);
+                crate::depth_guard::guard_handshake_sse(
+                    capped_sse_stream(response, max_sse_event_size),
+                    move |reason| {
+                        *refused
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+                    },
+                )
             } else {
-                event_capped_sse_stream(response.bytes_stream(), max_sse_event_size)
+                crate::depth_guard::guard_sse(event_capped_sse_stream(
+                    response.bytes_stream(),
+                    max_sse_event_size,
+                ))
             };
-            return Ok(StreamableHttpPostResponse::Sse(
-                crate::depth_guard::guard_sse(events),
-                session_id,
-            ));
+            return Ok(StreamableHttpPostResponse::Sse(events, session_id));
         }
         if is_json {
             // Same tolerance as rmcp `:308-318`: a body that is not a `ServerJsonRpcMessage` is
@@ -5482,8 +5511,15 @@ impl ConnectionBuilder {
 
             // Arms 4 and 5.
             let Some(challenge) = unauthorized_challenge(&error) else {
-                // Arm 6 is Cut 1; arm 7 — `throw result.error`.
-                return Err(initialize_error(name, &error, None));
+                // Arm 6 is Cut 1; arm 7 — `throw result.error`, said with the reason a handshake
+                // reply nested too deep was refused for, which rmcp's worker does not return.
+                return Err(match http_client.take_handshake_refusal() {
+                    Some(refusal) => McpError::Server {
+                        server: name.to_string(),
+                        message: refusal,
+                    },
+                    None => initialize_error(name, &error, None),
+                });
             };
             // `supportsOAuth(definition) || provider !== undefined` — the second half is MCP-593's
             // and `provider_client.is_some()` is exactly it: it exists only when the definition
@@ -7758,6 +7794,9 @@ done
         /// Answer `tools/call` with a reply nested [`DEEP_REPLY_DEPTH`] levels deep, in a JSON body
         /// or an SSE event (MCP-630).
         deep_tool_call: Option<DeepReply>,
+        /// Answer `initialize` with an SSE stream whose one event is a reply nested
+        /// [`DEEP_REPLY_DEPTH`] levels deep, and keep the stream open after it.
+        deep_initialize_sse: bool,
     }
 
     /// How [`FixtureOptions::deep_tool_call`] sends its reply.
@@ -7792,6 +7831,7 @@ done
                 cancel_before: None,
                 require_bearer: None,
                 deep_tool_call: None,
+                deep_initialize_sse: false,
             }
         }
     }
@@ -7832,6 +7872,7 @@ done
                 cancel_before,
                 require_bearer,
                 deep_tool_call,
+                deep_initialize_sse,
             } = options;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -7885,6 +7926,17 @@ done
                         // Read, recorded, never answered — and the socket is held open by keeping
                         // it in scope. This is the wedged server: the TCP connect succeeded, so
                         // nothing below the MCP layer fails, and only `requestTimeoutMs` can end it.
+                        held.push(socket);
+                        continue;
+                    } else if is_initialize && deep_initialize_sse {
+                        // The reply, then a stream that stays open: nothing after the reply ends it.
+                        let payload = deep_reply(&json_id(&recorded.body));
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nmcp-session-id: fixture-session\r\nConnection: close\r\n\r\nevent: message\ndata: {payload}\n\n"
+                        );
+                        use tokio::io::AsyncWriteExt as _;
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.flush().await;
                         held.push(socket);
                         continue;
                     } else if !authorized
@@ -9736,6 +9788,33 @@ done
             );
             connection.resource.close().await.expect("close");
         }
+    }
+
+    /// MCP-630 at the handshake: an `initialize` reply nested past what cyrup reads, sent as an SSE
+    /// event, fails the connect at once and says why. rmcp reads the handshake's stream with
+    /// `expect_initialized`, which skips any message that is not a `Response`, so the error reply
+    /// that refuses a deep reply on every other request was skipped here, and a server that kept
+    /// the stream open held the connect for its whole budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handshake_reply_nested_past_what_cyrup_reads_fails_the_connect_at_once() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            deep_initialize_sse: true,
+            ..FixtureOptions::default()
+        })
+        .await;
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            builder().connect_http_client(&request("deep", http_entry(&fixture.url))),
+        )
+        .await
+        .expect("the connect waited past a handshake reply it had already been sent");
+        let message = outcome.expect_err("the connect fails").to_string();
+        assert!(
+            message.contains(&crate::depth_guard::refusal_message(DEEP_REPLY_DEPTH)),
+            "{message}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

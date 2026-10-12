@@ -192,6 +192,47 @@ pub fn guard_sse<E: Send + 'static>(
     stream.map(|event| event.map(guard_sse_event)).boxed()
 }
 
+/// The `initialize` (or `server/discover`) POST's SSE stream with every event's `data` measured
+/// before rmcp parses it: a **reply** nested past what cyrup reads ends the stream, with
+/// [`refusal_message`] as its error; a deep request or notification is dropped, as [`guard_sse`]
+/// drops it.
+///
+/// Not [`guard_sse`], because rmcp reads this stream with `expect_initialized`
+/// (`transport/streamable_http_client.rs:257-288` @3.1.4), which returns on the first `Response`
+/// and skips every other message, the error reply [`guard_sse`] puts in a deep reply's place
+/// included: the handshake would drain past it and wait out its budget, or fail with `empty sse
+/// stream`. An error on the stream ends it at once (`let event = event?;`, `:267`).
+///
+/// rmcp's worker logs that error and closes the connection, so the reason is also handed to
+/// `refused`, for the connect to report.
+pub fn guard_handshake_sse(
+    stream: BoxStream<'static, Result<Sse, sse_stream::Error>>,
+    refused: impl Fn(String) + Send + 'static,
+) -> BoxStream<'static, Result<Sse, sse_stream::Error>> {
+    stream
+        .map(move |event| {
+            let mut event = event?;
+            let Some(data) = event.data.as_deref() else {
+                return Ok(event);
+            };
+            match refuse(data.as_bytes()) {
+                Some(Refusal::Answer(_)) => {
+                    let reason = refusal_message(nesting_depth(data.as_bytes()));
+                    refused(reason.clone());
+                    Err(sse_stream::Error::Body(Box::new(std::io::Error::other(
+                        reason,
+                    ))))
+                }
+                Some(Refusal::Drop) => {
+                    event.data = None;
+                    Ok(event)
+                }
+                None => Ok(event),
+            }
+        })
+        .boxed()
+}
+
 /// A JSON body as rmcp's HTTP client would read it, measured first: the message, the refusal's
 /// answer in its place, or `None` for a body that is neither — which rmcp treats as an accepted
 /// POST.
@@ -209,6 +250,18 @@ pub fn read_json_body(body: &[u8]) -> Option<rmcp::model::ServerJsonRpcMessage> 
 /// A line within [`MAX_READ_DEPTH`] passes through byte for byte. A deeper one is replaced by its
 /// [`Refusal::Answer`] or left out. A line is handed on only once it is complete, which costs
 /// nothing: the codec parses only complete lines.
+/// What a [`DepthGuard`] keeps of a buffer between lines. A line longer than this (a tool returning a
+/// screenshot) grows the buffers for itself, and they are given back once it has been handed on, so
+/// one large reply does not hold its size for the life of the connection.
+const RETAINED_CAPACITY: usize = 64 * 1024;
+
+/// Give back what a buffer grew past [`RETAINED_CAPACITY`] for one large line.
+fn release(buffer: &mut Vec<u8>) {
+    if buffer.capacity() > RETAINED_CAPACITY {
+        buffer.shrink_to(RETAINED_CAPACITY);
+    }
+}
+
 pub struct DepthGuard<R> {
     inner: R,
     /// The line being read, up to its newline.
@@ -255,6 +308,13 @@ impl<R> DepthGuard<R> {
                 self.ready.extend_from_slice(answer.as_bytes());
                 self.ready.push(b'\n');
             }
+        } else if self.ready.is_empty() {
+            // The usual case: the reader has taken everything before this line, so the line itself
+            // becomes what is ready, without a second copy of it.
+            std::mem::swap(&mut self.ready, &mut self.line);
+            if newline {
+                self.ready.push(b'\n');
+            }
         } else {
             self.ready.extend_from_slice(&self.line);
             if newline {
@@ -262,6 +322,7 @@ impl<R> DepthGuard<R> {
             }
         }
         self.line.clear();
+        release(&mut self.line);
     }
 }
 
@@ -280,6 +341,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for DepthGuard<R> {
                 this.handed += n;
                 if this.handed == this.ready.len() {
                     this.ready.clear();
+                    release(&mut this.ready);
                     this.handed = 0;
                 }
                 return Poll::Ready(Ok(()));
@@ -313,6 +375,34 @@ impl<R: AsyncRead + Unpin> AsyncRead for DepthGuard<R> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A large shallow line passes through unchanged, and once it has been read the guard holds no
+    /// more than [`RETAINED_CAPACITY`] in either buffer: a stdio server that once returned a 4 MiB
+    /// screenshot does not keep 8 MiB of the guard's for the life of the connection.
+    #[tokio::test]
+    async fn a_large_line_passes_through_and_is_not_held_after_it_is_read() {
+        use tokio::io::AsyncReadExt as _;
+        let big = format!("{{\"v\":\"{}\"}}\n", "x".repeat(4 * 1024 * 1024));
+        let input = format!("{big}{{\"after\":1}}\n");
+        let mut guard = DepthGuard::new(input.as_bytes());
+        let mut out = Vec::new();
+        guard.read_to_end(&mut out).await.unwrap();
+        assert_eq!(
+            out,
+            input.as_bytes(),
+            "a shallow line is passed through byte for byte"
+        );
+        assert!(
+            guard.line.capacity() <= RETAINED_CAPACITY,
+            "the line buffer kept {} bytes",
+            guard.line.capacity()
+        );
+        assert!(
+            guard.ready.capacity() <= RETAINED_CAPACITY,
+            "the ready buffer kept {} bytes",
+            guard.ready.capacity()
+        );
+    }
     use rmcp::model::{JsonRpcMessage, ServerJsonRpcMessage};
     use tokio::io::AsyncBufReadExt as _;
 

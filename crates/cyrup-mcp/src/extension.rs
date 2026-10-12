@@ -363,8 +363,8 @@ const FIRST_PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(10
 /// [CYRUP-DELTA, upward] The wait for the servers a script names runs before the script, in this
 /// `tool_call` hook, and the script's own deadline is armed when it starts, so the two used to be
 /// separate budgets and a script that asked for three seconds could take six. pi charges nothing
-/// either, but its script has no deadline unless it asks for one (`timeoutMs ?? Infinity`,
-/// `extensions/codemode/execute.ts:484` @v1.0.4). Here `timeout_ms` is the whole budget: the wait is
+/// either, but its script has no deadline unless it asks for one
+/// (`timeoutMs ?? Number.POSITIVE_INFINITY`, `extensions/codemode/execute.ts:427` @v1.0.4). Here `timeout_ms` is the whole budget: the wait is
 /// bounded by it, and what the wait took is taken off the deadline the script starts with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScriptBudget {
@@ -405,14 +405,18 @@ fn charge_script(
     let ScriptBudget::Limit(limit) = budget else {
         return Ok(None);
     };
-    let left = limit.saturating_sub(waited);
-    // Whole milliseconds, rounded down: what is left may be a fraction of one short, never long.
-    let left_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+    // Whole milliseconds of the wait, rounded down: a wait that found every server ready took
+    // microseconds, and charging it a millisecond would rewrite every script, and refuse one that
+    // asked for a single millisecond, for a wait that did not happen. `timeout_ms` is whole
+    // milliseconds, so `limit` is too.
+    let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+    if waited_ms == 0 {
+        return Ok(None);
+    }
+    let limit_ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX);
+    let left_ms = limit_ms.saturating_sub(waited_ms);
     if left_ms == 0 {
         return Err(limit);
-    }
-    if left == limit {
-        return Ok(None);
     }
     Ok(cyrup_codemode::source::with_timeout_ms(code, left_ms))
 }
@@ -454,8 +458,10 @@ fn contains_word(code: &str, word: &str) -> bool {
 /// (`scriptNeedsServer`, `extensions/mcp/index.ts` @v1.0.4).
 ///
 /// [CYRUP-DELTA] A tool here is named by the configured `toolPrefix` (`fx_echo`), not only as
-/// `mcp__<server>__<tool>`, so the formatted prefix counts as naming the server too; with prefixes
-/// off a tool name says nothing about its server, and the script is assumed to need it.
+/// `mcp__<server>__<tool>`, so the formatted prefix counts as naming the server too, in the form a
+/// script writes it: a script calls a tool by its codemode identifier, in which every character an
+/// identifier cannot hold is `_` (`tools.my_docs_find` for server `my-docs`). With prefixes off a
+/// tool name says nothing about its server, and the script is assumed to need it.
 fn script_needs_server(code: &str, server: &str, prefix: crate::config::ToolPrefix) -> bool {
     const DISCOVERY: [&str; 4] = [
         "searchTools",
@@ -470,7 +476,11 @@ fn script_needs_server(code: &str, server: &str, prefix: crate::config::ToolPref
         return true;
     }
     let prefix = crate::registration::server_prefix(server, prefix);
-    prefix.is_empty() || code.contains(&prefix)
+    if prefix.is_empty() {
+        return true;
+    }
+    let identifier = cyrup_codemode::identifier::to_codemode_identifier(&prefix);
+    code.contains(&prefix) || code.contains(identifier.as_str())
 }
 
 impl McpExtension {
@@ -1347,9 +1357,11 @@ impl McpExtension {
         // `docker` server takes seconds, and the model's first reply takes less — and the tools are
         // registered from the disk caches before any server is contacted. With the slot empty they
         // answered `MCP not initialized` for the whole build, a dead end the model reads as "MCP is
-        // broken". Upstream's executors wait: `await awaitWithTimeout(initPromise,
-        // INIT_WAIT_TIMEOUT_MS)` when `!state && initPromise` (`index.ts:2172`, `direct-tools.ts:137`
-        // @v5.2.0), and [`crate::dispatch::McpDispatch`]'s gate is that wait. It reads `proxy_ctx`
+        // broken". Upstream's executors wait when `!state && initPromise`: the gateway at most
+        // `INIT_WAIT_TIMEOUT_MS` (`awaitWithTimeout(initPromise, INIT_WAIT_TIMEOUT_MS)`, `index.ts:2174`
+        // @v5.2.0), a direct tool for the build itself (`await initPromise`, `direct-tools.ts:143-146`).
+        // [`crate::dispatch::McpDispatch`] keeps both: the gateway's 30 s, and a direct call's wait for
+        // the build or its own cancel (MCP-631). It reads `proxy_ctx`
         // and `init_task` live and holds only a `Weak`, so installing it before either is filled is
         // safe, and the generation's slots were cleared by `on_session_start` before this point.
         Self::install_dispatch(&strong);
@@ -1873,10 +1885,17 @@ impl McpExtension {
     /// the model's only recourse is to retry. [`Self::on_input`] cannot close this: the dispatcher
     /// cuts it at its 5 s budget, and a first connect (`npx` downloading a package) takes longer.
     ///
-    /// A script waits only for the servers it names ([`script_needs_server`]) and `tool_search`
-    /// for every server, and of those only for the ones the build is still discovering, each on its
-    /// own ([`crate::startup::StartupPass`], MCP-629): a server whose tools the cache holds is
-    /// registered already, and one that is not resident connects on its first call.
+    /// A script waits only for the servers it names ([`script_needs_server`]), and `tool_search` for
+    /// the servers that declare tools. Of those, a server that declares tools is waited for only
+    /// while the build is still discovering it, each on its own ([`crate::startup::StartupPass`],
+    /// MCP-629): a server whose tools the cache holds is registered already. A named server reached
+    /// only through the `mcp` gateway waits for the build to end, because the gateway reads the
+    /// committed catalogue; a wait for it that gives up names what holds the build.
+    ///
+    /// [CYRUP-DELTA, upward] pi's `tool_search` waits for every server still starting
+    /// (`waiting = pendingServers`, `extensions/mcp/index.ts:1085-1086` @v1.0.4). `tool_search` finds
+    /// only declared tools, and a server reached through the gateway declares none, so here it does
+    /// not wait for one: what it can find is the same, sooner.
     ///
     /// A script's wait is charged to its `timeout_ms` ([`ScriptBudget`], MCP-628): the script starts
     /// with what is left, and one whose whole limit went on the wait is not started. A call whose
@@ -1966,17 +1985,27 @@ impl McpExtension {
             crate::startup::Waited::Settled => Vec::new(),
             crate::startup::Waited::GaveUp(pending) => {
                 if wait >= self.tool_call_wait {
-                    self.remember_stalled(&build, &pending);
+                    // Not waited for again in this build: the servers still connecting, and a server
+                    // reached through the gateway, whose wait is the build's whoever holds it.
+                    let mut waited_out = pending.clone();
+                    waited_out.extend(through_build.iter().cloned());
+                    self.remember_stalled(&build, &waited_out);
                 }
                 self.notify_still_connecting();
                 pending
             }
         };
+        let (stalled_direct, stalled_through_build): (
+            std::collections::BTreeSet<String>,
+            std::collections::BTreeSet<String>,
+        ) = stalled
+            .into_iter()
+            .partition(|server| declaring.contains_key(server.as_str()));
         missing.extend(
             build
                 .startup
                 .progress()
-                .pending(stalled.iter().map(String::as_str)),
+                .waiting_on(&stalled_direct, &stalled_through_build),
         );
         missing.sort();
         missing.dedup();
@@ -4278,7 +4307,7 @@ done
             .map(str::to_string)
     }
 
-    /// `index.ts:2172` @v5.2.0: `if (!state && initPromise) await awaitWithTimeout(initPromise, …)`.
+    /// `index.ts:2174` @v5.2.0: `if (!state && initPromise) await awaitWithTimeout(initPromise, …)`.
     /// The model's first `mcp({...})` lands while a cold server is still starting, and the tool it
     /// calls was registered from the disk caches before any server was contacted. It used to find
     /// the generation's executor slot empty (the commit tail was the only installer) and answer
@@ -4529,8 +4558,12 @@ done
             "await tools.mcp__my_docs__find({})",
             ToolPrefix::Server
         ));
+        // A script writes a tool's codemode identifier, where `-` is `_`: `my-docs_find` is
+        // `tools.my_docs_find`, in every prefix mode.
+        assert!(needs("await tools.my_docs_find({})", ToolPrefix::Server));
+        assert!(needs("await tools.my_docs_find({})", ToolPrefix::Short));
+        assert!(needs("await tools.mcp__my_docs_find({})", ToolPrefix::Mcp));
         assert!(needs("await tools.my-docs_find({})", ToolPrefix::Server));
-        assert!(needs("await tools.mcp__my-docs_find({})", ToolPrefix::Mcp));
         assert!(!needs("await tools.other_find({})", ToolPrefix::Server));
         assert!(!needs("return 1", ToolPrefix::Server));
         // Discovery needs every server, but only as a word: `searchToolsNow` is a different name.
@@ -5173,6 +5206,126 @@ done
             )
             .await;
         assert!(search.elapsed() < std::time::Duration::from_millis(150));
+    }
+
+    /// What call `c1`'s `tool_result` hook appends to its result: the still-connecting note, or
+    /// nothing when it leaves the result alone.
+    async fn appended_to_result(ext: &McpExtension) -> Vec<String> {
+        let result = HostEvent::ToolResult {
+            call_id: "c1".into(),
+            name: "codemode".to_string(),
+            input: serde_json::json!({}),
+            content: vec![cyrup_core::Content::text("ran")],
+            details: None,
+            structured_content: None,
+            is_error: false,
+            usage: None,
+            terminate: cyrup_core::TerminateHint::Unspecified,
+        };
+        match ext.on_event(&result, &event_ctx()).await {
+            HookOutcome::Mutate(cyrup_ext::EventPatch::ToolResult {
+                content: Some(content),
+                ..
+            }) => content
+                .iter()
+                .skip(1)
+                .filter_map(|block| match block {
+                    cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A server reached through the `mcp` gateway waits for the build, so a script that names one
+    /// is held by whichever server holds the build. When that wait gives up, the script is told
+    /// which server that is, and the next script that names the gateway server does not wait for
+    /// the same build again. Before, a gateway server that had already settled gave up naming
+    /// nobody: nothing was noted and nothing remembered, and every script paid the whole wait
+    /// again for as long as the build was held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_script_through_the_gateway_is_told_what_holds_the_build_and_waits_for_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let servers = serde_json::json!({
+            "gw": fixture_server(&dir.path().join("gw-started")),
+            "slow": slow_fixture_server(&dir.path().join("slow-started"), 8),
+        });
+        let config: McpConfig =
+            serde_json::from_value(serde_json::json!({ "mcpServers": servers })).unwrap();
+        let ext = McpExtension::with_config(
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            Some(config),
+        )
+        .with_home(dir.path().to_path_buf())
+        .with_tool_call_wait(std::time::Duration::from_millis(400))
+        .into_arc();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
+        let build = ext.init_task().expect("the build is in flight");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !build.startup.progress().pending(["gw"]).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the gateway server settles while the slow one holds the build");
+        let call = tool_call_event(
+            "codemode",
+            serde_json::json!({
+                "code": "return await tools.mcp({ tool: \"gw_echo\", args: {} })"
+            }),
+        );
+        let told = [still_connecting_note(&["slow".to_string()])];
+
+        let first = std::time::Instant::now();
+        let _ = ext.on_event(&call, &event_ctx()).await;
+        let first = first.elapsed();
+        assert!(
+            first >= std::time::Duration::from_millis(350),
+            "the script waited for the build: {first:?}"
+        );
+        assert_eq!(appended_to_result(&ext).await, told);
+
+        let second = std::time::Instant::now();
+        let _ = ext.on_event(&call, &event_ctx()).await;
+        assert!(
+            second.elapsed() < std::time::Duration::from_millis(150),
+            "the second script waited {:?} for a build the first had waited out",
+            second.elapsed()
+        );
+        assert_eq!(appended_to_result(&ext).await, told, "and is told the same");
+        assert!(
+            ext.init_task().is_some(),
+            "the slow server still holds the build"
+        );
+    }
+
+    /// A wait that found every server ready took microseconds and costs the script nothing: its
+    /// source is left as it is, and a script that asked for one millisecond is run. A wait that
+    /// took time is charged in whole milliseconds.
+    #[test]
+    fn only_a_wait_that_took_time_is_charged_to_the_script() {
+        let limit = |ms| ScriptBudget::Limit(std::time::Duration::from_millis(ms));
+        let one = "// @options: {\"timeout_ms\": 1}\nreturn 1";
+        assert_eq!(
+            charge_script(one, limit(1), std::time::Duration::from_micros(40)),
+            Ok(None)
+        );
+        let six = "// @options: {\"timeout_ms\": 6000}\nreturn 1";
+        assert_eq!(
+            charge_script(six, limit(6000), std::time::Duration::from_micros(900)),
+            Ok(None)
+        );
+        let charged = charge_script(six, limit(6000), std::time::Duration::from_micros(1500))
+            .unwrap()
+            .unwrap();
+        assert!(charged.contains("5999"), "{charged}");
+        assert_eq!(
+            charge_script(six, limit(6000), std::time::Duration::from_millis(6000)),
+            Err(std::time::Duration::from_millis(6000))
+        );
     }
 
     /// [CYRUP-DELTA] A script's own `timeout_ms` bounds the wait that comes before it: it asked for

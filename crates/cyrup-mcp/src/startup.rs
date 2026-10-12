@@ -58,6 +58,31 @@ impl StartupProgress {
             .map(str::to_string)
             .collect()
     }
+
+    /// What a wait for `servers`, and for the build on behalf of `through_build`, is still waiting
+    /// for: the servers of `servers` this pass may still be discovering and, while `through_build`
+    /// names any server and the build has not ended, every server the build is still discovering —
+    /// or, before it has planned, the servers of `through_build` themselves.
+    ///
+    /// A server reached through the `mcp` gateway waits for the build, so what holds it up is
+    /// whatever holds the build, whether or not that server is one of them.
+    #[must_use]
+    pub fn waiting_on(
+        &self,
+        servers: &BTreeSet<String>,
+        through_build: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let mut waiting = self.pending(servers.iter().map(String::as_str));
+        if !through_build.is_empty() && !self.finished {
+            match &self.discovering {
+                Some(discovering) => waiting.extend(discovering.iter().cloned()),
+                None => waiting.extend(through_build.iter().cloned()),
+            }
+        }
+        waiting.sort();
+        waiting.dedup();
+        waiting
+    }
 }
 
 /// What [`StartupPass::wait_for`] found.
@@ -157,8 +182,8 @@ impl StartupPass {
     }
 
     /// Wait until none of `servers` is still being discovered and, when `through_build` names any
-    /// server, until the build has ended, for at most `bound`. A wait that gives up names the
-    /// servers of either set the pass is still discovering.
+    /// server, until the build has ended, for at most `bound`. A wait that gives up names what it
+    /// was still waiting for ([`StartupProgress::waiting_on`]).
     ///
     /// Cancellation is the caller's: the future holds no resource, so dropping it ends the wait.
     pub async fn wait_for(
@@ -177,14 +202,7 @@ impl StartupPass {
             // The sender lives in `self`, which this future borrows, so `Err` (closed) cannot occur;
             // read it as settled rather than invent a server that is still connecting.
             Ok(_) => Waited::Settled,
-            Err(_) => {
-                let progress = self.progress.borrow();
-                let mut pending = progress.pending(names());
-                pending.extend(progress.pending(through_build.iter().map(String::as_str)));
-                pending.sort();
-                pending.dedup();
-                Waited::GaveUp(pending)
-            }
+            Err(_) => Waited::GaveUp(self.progress.borrow().waiting_on(servers, through_build)),
         }
     }
 
@@ -349,6 +367,47 @@ mod tests {
                 )
                 .await,
             Waited::GaveUp(vec!["gateway".to_string()])
+        );
+    }
+
+    /// A gateway server's wait is the build's, so a wait that gives up names what holds the build:
+    /// the servers it is still discovering, whether or not the gateway server is one of them. Before
+    /// this a gateway server that had settled, or whose tools the cache held, gave up naming
+    /// nothing, and so was neither noted nor remembered as waited out.
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_servers_wait_that_gives_up_names_what_holds_the_build() {
+        let pass = StartupPass::new();
+        pass.plan(["gateway".to_string(), "slow".to_string()]);
+        pass.settle("gateway");
+        assert_eq!(
+            pass.wait_for(
+                &BTreeSet::new(),
+                &names(&["gateway", "cached"]),
+                Duration::from_secs(1)
+            )
+            .await,
+            Waited::GaveUp(vec!["slow".to_string()])
+        );
+        assert_eq!(
+            pass.progress()
+                .waiting_on(&names(&["gateway"]), &BTreeSet::new()),
+            Vec::<String>::new(),
+            "a server reached through its own tools waits only for itself"
+        );
+
+        let unplanned = StartupPass::new();
+        assert_eq!(
+            unplanned
+                .progress()
+                .waiting_on(&BTreeSet::new(), &names(&["gateway"])),
+            ["gateway"],
+            "before the plan, the server itself may be what the build is discovering"
+        );
+        pass.finish();
+        assert!(
+            pass.progress()
+                .waiting_on(&names(&["slow"]), &names(&["gateway"]))
+                .is_empty()
         );
     }
 

@@ -19,7 +19,7 @@
 > dependency on pi's in-monorepo `packages/mcp`, and every citation in `13-cyrup-mcp.md` and
 > `13a`–`13i` resolves at that tag. `MCP-587` records the rule.
 >
-> Numbering resumes from **`MCP-634`** (it read `MCP-633` until 2026-10-11, one short: `MCP-633` is taken, filed with `MCP-622`…`MCP-632` on 2026-10-10; it read `MCP-616` when written; `MCP-616` was filed 2026-10-07, `MCP-618`…`MCP-621` on 2026-10-09 and `MCP-622`…`MCP-633` on 2026-10-10; table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
+> Numbering resumes from **`MCP-640`** (it read `MCP-634` until 2026-10-12, when `MCP-634`…`MCP-639` were filed in `13e`; it read `MCP-633` until 2026-10-11, one short: `MCP-633` is taken, filed with `MCP-622`…`MCP-632` on 2026-10-10; it read `MCP-616` when written; `MCP-616` was filed 2026-10-07, `MCP-618`…`MCP-621` on 2026-10-09 and `MCP-622`…`MCP-633` on 2026-10-10; table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
 > *Post-pin triage 2026-10-03*, took `MCP-609`–`MCP-611`; `MCP-586` was never allocated and is still free).
 > **2026-10-09:** numbering now resumes from **`MCP-618`** (`MCP-612`–`MCP-616` were filed 2026-10-06 and 2026-10-07;
 > `MCP-617` by the pi v1.1.0 drift triage, §*Additions — 2026-10-09*). The `pi-mcp-adapter` pin is now **`2ccf648`**
