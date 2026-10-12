@@ -46,6 +46,7 @@ use crate::provider::{
     LlamaRefreshContext, LlamaRefreshHost, RegisterProviderFn, SetCatalogOptions,
 };
 use crate::tests::fake_server::{FakeLlamaServer, Reply, model_with, model_with_status};
+use cyrup_ext::provider::ProviderWrite;
 
 // --------------------------------------------------------------------------------------- harness --
 
@@ -130,7 +131,7 @@ fn harness_with_store(host: Option<Arc<TestHost>>, store: Arc<dyn CredentialStor
     let sink = registered.clone();
     let register: RegisterProviderFn = Arc::new(move |provider| {
         lock(&sink).push(provider);
-        Ok(())
+        Ok(ProviderWrite::Landed)
     });
     let mut options = LlamaControllerOptions::new(store, register)
         .with_auth_context(Arc::new(MapContext::default()));
@@ -398,6 +399,29 @@ fn a_bad_server_url_changes_and_registers_nothing() {
     assert!(error.to_string().contains("http or https"), "{error}");
     assert!(harness.controller.provider().models().is_empty());
     assert!(lock(&harness.registered).is_empty());
+}
+
+/// SEAM-151 — a write the host's registry refuses as a superseded publication's changes nothing
+/// in the controller: `current` stays the provider it was, and nothing is recorded as a refusal
+/// (it is not one).
+///
+/// Red by mutation: `try_install` writing `current` before the hand-over (as at `4f522804b`)
+/// makes `provider()` the new, refused catalog.
+#[test]
+fn a_superseded_install_changes_nothing_in_the_controller() {
+    let register: RegisterProviderFn = Arc::new(|_| Ok(ProviderWrite::Superseded));
+    let controller = LlamaController::new(LlamaControllerOptions::new(
+        Arc::new(InMemoryCredentialStore::new()),
+        register,
+    ));
+    let before = controller.provider();
+    let catalog = vec![info(json!({ "id": "m", "status": { "value": "loaded" } }))];
+    controller
+        .set_catalog(&catalog, "http://h:1", SetCatalogOptions::default())
+        .unwrap();
+    assert!(Arc::ptr_eq(&controller.provider(), &before));
+    assert!(controller.provider().models().is_empty());
+    assert_eq!(controller.register_error(), None);
 }
 
 #[test]
@@ -1932,7 +1956,7 @@ async fn a_stored_credential_routes_the_stream_to_its_server() {
 /// without any server.
 #[tokio::test]
 async fn a_model_on_an_api_the_registry_lacks_reports_the_registry_miss() {
-    let register: RegisterProviderFn = Arc::new(|_| Ok(()));
+    let register: RegisterProviderFn = Arc::new(|_| Ok(ProviderWrite::Landed));
     let controller = LlamaController::new(
         LlamaControllerOptions::new(Arc::new(InMemoryCredentialStore::new()), register)
             .with_auth_context(Arc::new(MapContext::default()))
@@ -2026,7 +2050,7 @@ fn two_installs_never_interleave_between_the_current_provider_and_the_host() {
                 let _ = lock(&release_rx).recv_timeout(Duration::from_secs(10));
             }
             lock(&events).push(format!("exit {ids:?}"));
-            Ok(())
+            Ok(ProviderWrite::Landed)
         })
     };
     let controller = LlamaController::new(LlamaControllerOptions::new(
@@ -2064,9 +2088,12 @@ fn two_installs_never_interleave_between_the_current_provider_and_the_host() {
             .map(|model| model.id.to_string())
             .collect()
     };
+    // While the first install is still in the host, `current` is the provider from before BOTH
+    // installs: it changes only once the host has taken the new one (SEAM-151), and the second
+    // install has not run. A second install that ran ahead would make this `["b"]`.
     assert_eq!(
         ids(&controller),
-        ["a"],
+        Vec::<String>::new(),
         "the second install must not replace the current provider while the first is still being \
          handed to the host"
     );

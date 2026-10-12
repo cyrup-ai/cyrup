@@ -127,7 +127,7 @@ fn follow_installed_adopts_a_provider_registered_before_the_slot_was_bound() {
         }),
     )
     .unwrap();
-    let registry = Arc::new(GuestProviderRegistry::new());
+    let registry = GuestProviderRegistry::new();
     ext.bind_model_registry(registry.clone()).unwrap();
 
     let started_on =
@@ -174,4 +174,162 @@ async fn a_registration_under_an_unknown_id_lands_as_before() {
     assert!(session.has_configured_auth(&rows[0]));
     let provider = session.services().guest_providers.provider("acme").unwrap();
     assert_eq!(provider.name(), "Acme");
+}
+
+// ---- PROV-164: a registration over a refreshable base still refreshes ----------------------
+
+/// A one-route loopback gateway answering every request with `body`; returns its URL and the raw
+/// requests it saw.
+async fn serve_gateway(body: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 16384];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            sink.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf[..n]).to_string());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.flush().await;
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// An auth context holding exactly `vars` and no files.
+struct ScriptedEnv(Vec<(&'static str, &'static str)>);
+
+#[async_trait::async_trait]
+impl cyrup_provider::AuthContext for ScriptedEnv {
+    async fn env(&self, name: &str) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| (*v).to_string())
+    }
+    async fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
+}
+
+/// The gateway's `GET /v1/config` body: one model (radius-config.ts's shape).
+const RADIUS_CONFIG: &str = r#"{"baseUrl":"https://api.example.test/v1","models":[{"id":"radius-1","name":"Radius One","reasoning":true,"input":["text"],"cost":{"input":1,"output":2,"cacheRead":0.1,"cacheWrite":0.2},"contextWindow":128000,"maxTokens":8192}]}"#;
+
+/// PROV-164's Verify — a registration over radius still refreshes its catalog. pi's composed
+/// provider has `refreshModels` whenever its base does and runs `await base.refreshModels(context)`
+/// before publishing its own `update` (`provider-composer.ts:613-635` @f1b2e77f5); its `getAllModels`
+/// reads the base live, so the refreshed rows are the composed provider's rows.
+///
+/// The base is what the session's resolver hands a registration: radius with the overlay restored
+/// over it (`builder.rs`, `attach_base_resolver`). Here the overlay is read from radius's own store
+/// at resolve time, which is radius's restore half (`providers/radius.rs`, "Where the catalog lives
+/// in cyrup"); the production radius is built with no store and is static, see `PROV-014`'s
+/// residual (2).
+///
+/// RED at `4f522804b`: the composed `WireProvider` reported `has_refresh_models() == false`, so the
+/// refresh engine skipped the id (no request reached the gateway) and the composed rows stayed the
+/// empty catalog the registration was made over.
+#[tokio::test]
+async fn a_registration_over_radius_still_refreshes_its_catalog() {
+    let (gateway, seen) = serve_gateway(RADIUS_CONFIG).await;
+    let store: Arc<dyn cyrup_provider::ModelsStore> =
+        Arc::new(cyrup_provider::InMemoryModelsStore::new());
+    let registry = GuestProviderRegistry::new();
+    registry.attach_refresh_auth(
+        Arc::new(InMemoryCredentialStore::new()),
+        Arc::new(ScriptedEnv(Vec::new())),
+    );
+    {
+        let store = Arc::clone(&store);
+        registry.attach_base_resolver(Arc::new(move |id: &str| {
+            (id == "radius").then(|| {
+                let radius: Arc<dyn Provider> = Arc::new(
+                    cyrup_provider::RadiusProvider::new(
+                        cyrup_provider::RadiusProviderOptions {
+                            gateway: Some(gateway.clone()),
+                            ..Default::default()
+                        },
+                        Arc::new(InMemoryCredentialStore::new()),
+                        Arc::new(builtin_registry()),
+                    )
+                    .with_auth_context(Arc::new(ScriptedEnv(vec![(
+                        "RADIUS_API_KEY",
+                        "sk-gateway",
+                    )])))
+                    .with_models_store(Arc::clone(&store)),
+                );
+                futures::executor::block_on(
+                    cyrup_provider::RemoteCatalog::new(Arc::clone(&store))
+                        .load_overlay(&["radius"]),
+                )
+                .apply(radius)
+            })
+        }));
+    }
+    let ext = cyrup_ext::registry::ExtensionRegistry::new();
+    ext.bind_model_registry(registry.clone()).unwrap();
+    ext.register_provider(
+        ExtensionId::from("proxy-ext"),
+        "radius",
+        serde_json::json!({ "baseUrl": "http://proxy.test", "apiKey": "sk-proxy" }),
+    )
+    .unwrap();
+
+    let composed = registry.provider("radius").unwrap();
+    assert!(
+        composed.models().is_empty(),
+        "radius ships no rows of its own"
+    );
+    assert!(
+        composed.has_refresh_models(),
+        "a provider composed over a refreshable base is refreshable"
+    );
+
+    let result = registry
+        .refresh(cyrup_ext::host::services::ProviderRefreshRequest {
+            providers: Some(vec!["radius".to_string()]),
+            allow_network: Some(true),
+            force: false,
+            cancel: cyrup_core::CancelToken::new(),
+        })
+        .await;
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    while registry.refresh_tasks_in_flight() > 0 {
+        tokio::task::yield_now().await;
+    }
+
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests[0].starts_with("GET /v1/config HTTP/1.1"),
+        "{}",
+        requests[0]
+    );
+    let persisted = store
+        .read("radius", None)
+        .await
+        .unwrap()
+        .expect("persisted");
+    let persisted: Vec<&str> = persisted.models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(persisted, ["radius-1"], "radius's own refresh ran");
+
+    let rows = registry.provider("radius").unwrap().models().to_vec();
+    let listed: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|m| (m.id.as_str(), m.base_url.as_str()))
+        .collect();
+    assert_eq!(
+        listed,
+        [("radius-1", "http://proxy.test")],
+        "the refreshed catalog is the composed provider's, at the registration's URL"
+    );
 }

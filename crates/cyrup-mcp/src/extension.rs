@@ -3656,7 +3656,7 @@ mod tests {
             &self,
             id: String,
             _provider: Arc<dyn cyrup_provider::Provider>,
-        ) -> Result<(), ExtError> {
+        ) -> Result<cyrup_ext::provider::ProviderWrite, ExtError> {
             Err(ExtError::Component(format!(
                 "RecordingRegistrar was asked to register provider `{id}`"
             )))

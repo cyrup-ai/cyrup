@@ -139,20 +139,30 @@ impl NativeExtension for Registrant {
 struct SinkLog(Mutex<Vec<String>>);
 
 impl crate::provider::ModelRegistrySink for SinkLog {
-    fn upsert_provider(&self, reg: &crate::provider::ProviderRegistration) {
+    fn upsert_provider(
+        &self,
+        reg: &crate::provider::ProviderRegistration,
+    ) -> crate::provider::ProviderWrite {
         if let Ok(mut g) = self.0.lock() {
             g.push(format!("upsert:{}", reg.id));
         }
+        crate::provider::ProviderWrite::Landed
     }
-    fn upsert_live_provider(&self, id: &str, _provider: Arc<dyn cyrup_provider::Provider>) {
+    fn upsert_live_provider(
+        &self,
+        id: &str,
+        _provider: Arc<dyn cyrup_provider::Provider>,
+    ) -> crate::provider::ProviderWrite {
         if let Ok(mut g) = self.0.lock() {
             g.push(format!("upsert-live:{id}"));
         }
+        crate::provider::ProviderWrite::Landed
     }
-    fn remove_provider(&self, id: &str) {
+    fn remove_provider(&self, id: &str) -> crate::provider::ProviderWrite {
         if let Ok(mut g) = self.0.lock() {
             g.push(format!("remove:{id}"));
         }
+        crate::provider::ProviderWrite::Landed
     }
     fn upsert_virtual_model(
         &self,

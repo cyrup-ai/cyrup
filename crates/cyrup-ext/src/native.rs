@@ -1456,11 +1456,17 @@ pub trait LateRegistrar: Send + Sync {
     /// Required, like every other method here: pi's `registerProvider` always reaches the model
     /// registry (`loader.ts:449-462`), so an implementor either does the registration or returns
     /// an `Err` of its own. There is no default that would let a registrar compile and then refuse.
+    ///
+    /// The answer says whether the write landed ([`crate::provider::ProviderWrite`]). A native
+    /// that keeps its own copy of what it registered records the new provider only on
+    /// [`crate::provider::ProviderWrite::Landed`]: a catalog publication superseded while its
+    /// `update` ran is refused by the model registry, and must change nothing (SEAM-151).
+    #[must_use = "a superseded write must not be recorded by the caller (SEAM-151)"]
     fn register_provider_live(
         &self,
         id: String,
         provider: Arc<dyn cyrup_provider::Provider>,
-    ) -> Result<(), ExtError>;
+    ) -> Result<crate::provider::ProviderWrite, ExtError>;
 
     /// pi `api.unregisterProvider(name)` (`extensions/types.ts:1819` @v0.99.2-17), for a provider THIS extension
     /// registered (live or JSON): removes it from the model registry and returns whether it was

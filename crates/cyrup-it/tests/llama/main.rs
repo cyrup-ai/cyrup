@@ -13,6 +13,8 @@
 //! * [`classify`] - the classifier twin and `Models::classify` against the fake's `/tokenize`,
 //!   `/apply-template` and `/completion`.
 //! * [`binary`] - the spawned `cyrup`: `--list-models`, a one-shot turn, `/llama` over RPC.
+//! * [`supersession`] - SEAM-151: a catalog publication superseded mid-flight changes no provider
+//!   state in the controller, the extension registry or the session registry (no server needed).
 //!
 //! Curation note: the fake in [`fake`] is the only fake. A test that needs a second server shape
 //! belongs in `cyrup-llama`'s own fake, where the router management api (load, unload, download,
@@ -33,3 +35,4 @@ mod classify;
 mod fake;
 mod fixture;
 mod session_chain;
+mod supersession;

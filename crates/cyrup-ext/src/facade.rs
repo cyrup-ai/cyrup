@@ -249,7 +249,7 @@ impl crate::native::LateRegistrar for HostLateRegistrar {
         &self,
         id: String,
         provider: Arc<dyn cyrup_provider::Provider>,
-    ) -> Result<(), ExtError> {
+    ) -> Result<crate::provider::ProviderWrite, ExtError> {
         self.registry
             .register_provider_live(self.owner.clone(), id, provider)
     }

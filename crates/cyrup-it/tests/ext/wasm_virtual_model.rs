@@ -109,9 +109,19 @@ struct Sink {
 }
 
 impl ModelRegistrySink for Sink {
-    fn upsert_provider(&self, _reg: &ProviderRegistration) {}
-    fn upsert_live_provider(&self, _id: &str, _provider: Arc<dyn cyrup_provider::Provider>) {}
-    fn remove_provider(&self, _id: &str) {}
+    fn upsert_provider(&self, _reg: &ProviderRegistration) -> cyrup_ext::provider::ProviderWrite {
+        cyrup_ext::provider::ProviderWrite::Landed
+    }
+    fn upsert_live_provider(
+        &self,
+        _id: &str,
+        _provider: Arc<dyn cyrup_provider::Provider>,
+    ) -> cyrup_ext::provider::ProviderWrite {
+        cyrup_ext::provider::ProviderWrite::Landed
+    }
+    fn remove_provider(&self, _id: &str) -> cyrup_ext::provider::ProviderWrite {
+        cyrup_ext::provider::ProviderWrite::Landed
+    }
     fn upsert_virtual_model(&self, definition: &VirtualModelDefinition) -> Result<(), String> {
         let catalog = Catalog {
             models: self.catalog.lock().unwrap().clone(),

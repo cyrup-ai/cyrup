@@ -1836,7 +1836,7 @@ impl SessionBuilder {
         // + disk extensions loaded (Pi `runner.bindCore` pending-flush, runner.ts:345-362). The SAME
         // `Arc` is the `ext_host` sink (future `registerProvider`s upsert live) and the session's read
         // view (its catalog is UNIONed into the model registry, and its provider installed on select).
-        let guest_providers = Arc::new(crate::guest_providers::GuestProviderRegistry::new());
+        let guest_providers = crate::guest_providers::GuestProviderRegistry::new();
         // pi `modelNetworkEnabled`: what a refresh that does not say `allowNetwork` gets. Set before
         // anything can refresh, so an offline run never reaches the network by leaving it unsaid.
         guest_providers.set_network_enabled(cfg.model_network_enabled);
@@ -1882,6 +1882,10 @@ impl SessionBuilder {
                 models.get_provider(id)
             }));
         }
+        // PROV-164 — the `models.json` `modelOverrides` a registration's own rows take (pi applies
+        // them over the extension layer, `provider-composer.ts:553-575` @f1b2e77f5). Attached
+        // beside the base resolver, before the bind flush.
+        guest_providers.attach_model_config(Arc::clone(&model_config));
         host_services.attach_provider_refresher(guest_providers.clone());
         // EXT-093 — `HostServices::flag_value` answers from the extension host's registry (the CLI
         // overrides applied above, then the registered default). Weak: the host holds `host_services`.

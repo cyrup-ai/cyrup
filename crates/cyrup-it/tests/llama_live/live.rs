@@ -521,7 +521,7 @@ async fn a_real_llama_server_agrees_with_the_wire_definitions_and_cyrups_llama_p
     let store: Arc<dyn CredentialStore> = Arc::new(
         InMemoryCredentialStore::new().with_credential("llama.cpp".into(), credential(&url)),
     );
-    let register: RegisterProviderFn = Arc::new(|_provider| Ok(()));
+    let register: RegisterProviderFn = Arc::new(|_provider| Ok(cyrup_ext::ProviderWrite::Landed));
     let controller = LlamaController::new(
         LlamaControllerOptions::new(store.clone(), register).with_auth_context(Arc::new(NoEnv)),
     );

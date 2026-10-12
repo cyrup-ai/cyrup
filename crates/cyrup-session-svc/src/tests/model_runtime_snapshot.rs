@@ -540,8 +540,76 @@ async fn a_registration_composes_over_the_models_json_layer_and_sits_above_it() 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].base_url, "https://models-json.test");
 
+    // A re-registration MERGES over the previous one (PROV-163, pi `registerProvider`,
+    // `model-runtime.ts:926-933`), so the definitions above would survive a `{ baseUrl }`; an
+    // unregistration drops the stored registration (pi `unregisterProvider`, `:944-950`) and the
+    // next one starts from nothing, which is the registration-without-`models` this half is about.
+    session
+        .services()
+        .ext_host
+        .registry()
+        .unregister_provider("anthropic")
+        .unwrap();
     register(serde_json::json!({ "baseUrl": "http://proxy.test" }));
     let rows = rows_of(&session, "anthropic");
     assert!(rows.len() > 1);
     assert!(rows.iter().all(|m| m.base_url == "http://proxy.test"));
+}
+
+/// PROV-164 — a `models.json` `modelOverrides` entry reaches a model an extension RE-DECLARES: pi
+/// applies the overrides last, over the extension's rows ("models.json modelOverrides are the
+/// topmost user-config layer: they apply once, after custom-model upserts, extension model
+/// replacement…", `provider-composer.ts:555-575` @f1b2e77f5). Asserted on the session's list AND on
+/// the provider the session streams through, which reads its OWN row (`ProviderStreamFn`
+/// re-resolves `provider.get_model`), so the two cannot disagree.
+///
+/// RED at `4f522804b`: the registration's definitions replaced the base's (overridden) rows and no
+/// override reached them — the row kept the extension's name and the default `contextWindow`.
+#[tokio::test]
+async fn a_models_json_override_reaches_a_model_the_extension_re_declares() {
+    let fx = fixture();
+    let id = cyrup_provider::anthropic_provider()
+        .models()
+        .first()
+        .expect("anthropic lists models")
+        .id
+        .as_str()
+        .to_string();
+    std::fs::write(
+        fx.agent_dir.join("models.json"),
+        serde_json::json!({ "providers": { "anthropic": { "modelOverrides": {
+            id.as_str(): { "name": "From models.json", "contextWindow": 4242 }
+        } } } })
+        .to_string(),
+    )
+    .unwrap();
+    let (provider, _calls) = CountingProvider::install("faux-1");
+    let session = session_with(&fx, provider).await;
+    session
+        .services()
+        .ext_host
+        .registry()
+        .register_provider(
+            ExtensionId::from("e"),
+            "anthropic",
+            serde_json::json!({ "models": [{ "id": id.as_str(), "name": "From the extension" }] }),
+        )
+        .unwrap();
+
+    let rows = rows_of(&session, "anthropic");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.as_str(), id);
+    assert_eq!(rows[0].name, "From models.json");
+    assert_eq!(rows[0].context_window, 4242);
+
+    let streamed = session
+        .services()
+        .guest_providers
+        .provider("anthropic")
+        .expect("the registration landed");
+    let row = streamed
+        .get_model(&id)
+        .expect("the streamed provider lists it");
+    assert_eq!(row.name, "From models.json");
+    assert_eq!(row.context_window, 4242);
 }

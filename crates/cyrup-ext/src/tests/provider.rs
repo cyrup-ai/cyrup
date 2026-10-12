@@ -8,7 +8,9 @@
     clippy::indexing_slicing
 )]
 
-use crate::provider::{ModelRegistrySink, ProviderHub, ProviderRegistration, resolve_api_key};
+use crate::provider::{
+    ModelRegistrySink, ProviderHub, ProviderRegistration, ProviderWrite, resolve_api_key,
+};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -18,14 +20,21 @@ struct FakeSink {
     removes: Mutex<Vec<String>>,
 }
 impl ModelRegistrySink for FakeSink {
-    fn upsert_provider(&self, reg: &ProviderRegistration) {
+    fn upsert_provider(&self, reg: &ProviderRegistration) -> ProviderWrite {
         self.upserts.lock().unwrap().push(reg.id.clone());
+        ProviderWrite::Landed
     }
-    fn upsert_live_provider(&self, id: &str, _provider: Arc<dyn cyrup_provider::Provider>) {
+    fn upsert_live_provider(
+        &self,
+        id: &str,
+        _provider: Arc<dyn cyrup_provider::Provider>,
+    ) -> ProviderWrite {
         self.upserts.lock().unwrap().push(format!("live:{id}"));
+        ProviderWrite::Landed
     }
-    fn remove_provider(&self, id: &str) {
+    fn remove_provider(&self, id: &str) -> ProviderWrite {
         self.removes.lock().unwrap().push(id.to_string());
+        ProviderWrite::Landed
     }
     fn upsert_virtual_model(
         &self,
@@ -491,6 +500,7 @@ fn composed_over(
         base,
         Arc::new(cyrup_provider::InMemoryCredentialStore::new()),
         None,
+        crate::provider::ComposeOptions::default(),
     )
     .expect("the base has auth")
 }
@@ -705,4 +715,349 @@ fn a_registration_under_an_unknown_id_builds_the_base_less_provider_as_before() 
     let unnamed = registration("acme-unnamed", json!({ "models": [] }));
     assert_eq!(unnamed.build_provider().name(), "acme-unnamed");
     assert!(unnamed.build_provider().models().is_empty());
+}
+
+// ---- PROV-163: a re-registration merges over the previous one -------------------------------
+
+/// An auth context with no environment and no files, so a resolved key can only be the one the
+/// layers carry (no ambient `ANTHROPIC_API_KEY` can answer instead).
+struct NoAmbient;
+
+#[async_trait::async_trait]
+impl cyrup_provider::AuthContext for NoAmbient {
+    async fn env(&self, _name: &str) -> Option<String> {
+        None
+    }
+    async fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
+}
+
+/// The api key the composed provider authenticates `model` with.
+async fn composed_key(provider: &dyn cyrup_provider::Provider) -> Option<String> {
+    let model = provider
+        .models()
+        .first()
+        .expect("a model to authenticate")
+        .clone();
+    cyrup_provider::resolve_provider_auth(
+        provider.id(),
+        provider.provider_auth().expect("composed auth"),
+        &model,
+        &cyrup_provider::InMemoryCredentialStore::new(),
+        &NoAmbient,
+        cyrup_provider::AuthOverrides::default(),
+    )
+    .await
+    .expect("auth resolves")
+    .and_then(|result| result.auth.api_key)
+}
+
+/// PROV-163's Verify: two registrations of one id, `{ baseUrl }` then `{ apiKey }`, compose to the
+/// base's models at that URL with that key. pi `registerProvider` merges every defined value of the
+/// new config over the previous registration and keeps the rest (`core/model-runtime.ts:926-933`
+/// @f1b2e77f5).
+///
+/// RED at `4f522804b`: the hub dropped the first registration whole, so the composed rows were at
+/// the built-in's `https://api.anthropic.com`.
+#[tokio::test]
+async fn a_base_url_then_an_api_key_compose_to_the_bases_models_at_that_url_with_that_key() {
+    let mut hub = ProviderHub::new();
+    hub.register(
+        "anthropic".into(),
+        &json!({ "baseUrl": "http://proxy.test" }),
+    )
+    .unwrap();
+    hub.register("anthropic".into(), &json!({ "apiKey": "sk-second" }))
+        .unwrap();
+    let reg = hub.get("anthropic").unwrap().clone();
+
+    let base: Arc<dyn cyrup_provider::Provider> = Arc::new(cyrup_provider::anthropic_provider());
+    let composed = composed_over(&reg, base.clone());
+    let expected: Vec<cyrup_provider::Model> = base
+        .models()
+        .iter()
+        .cloned()
+        .map(|mut m| {
+            m.base_url = "http://proxy.test".to_string();
+            m
+        })
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(composed.models(), expected.as_slice());
+    assert_eq!(composed.base_url(), Some("http://proxy.test"));
+    assert_eq!(
+        composed_key(composed.as_ref()).await.as_deref(),
+        Some("sk-second")
+    );
+}
+
+/// PROV-163 — what a re-registration does NOT name, it keeps; what it names, it replaces whole
+/// (pi's merge is one level deep: `effective[key] = value`, so `models` and `headers` are replaced,
+/// not merged). The key a `!command` resolved is kept without running the command again, because the
+/// spec did not change.
+///
+/// RED at `4f522804b`: the second registration replaced the first, so its key, headers and URL were
+/// gone.
+#[test]
+fn a_re_registration_keeps_what_it_does_not_name_and_replaces_what_it_does() {
+    let marker = std::env::temp_dir().join(format!("cyrup-prov163-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let marker_path = marker.display().to_string();
+    let mut hub = ProviderHub::new();
+    hub.register(
+        "acme".into(),
+        &json!({
+            "baseUrl": "https://acme.test/v1",
+            "api": "openai-completions",
+            "apiKey": format!("!echo run >> {marker_path}; echo sk-command"),
+            "headers": { "x-first": "1" },
+            "models": [{ "id": "first" }],
+        }),
+    )
+    .unwrap();
+    hub.register(
+        "acme".into(),
+        &json!({ "name": "Acme", "models": [{ "id": "second" }] }),
+    )
+    .unwrap();
+
+    let reg = hub.get("acme").unwrap();
+    assert_eq!(reg.config.name, "Acme");
+    assert_eq!(reg.config.base_url.as_deref(), Some("https://acme.test/v1"));
+    assert_eq!(reg.config.api.as_deref(), Some("openai-completions"));
+    assert_eq!(
+        reg.config.headers.get("x-first").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(reg.resolved_api_key.as_deref(), Some("sk-command"));
+    let ids: Vec<&str> = reg
+        .config
+        .models
+        .iter()
+        .flatten()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(ids, ["second"], "`models` is replaced whole, not merged");
+    let runs = std::fs::read_to_string(&marker).unwrap().lines().count();
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(
+        runs, 1,
+        "the unchanged key spec must not run its command again"
+    );
+}
+
+/// PROV-163's control — a registration under an id with NO previous registration stores exactly
+/// what it parses to, its key resolved as before, and reaches the sink once: there is nothing to
+/// merge over.
+///
+/// Non-regression guard: GREEN at `4f522804b` (before the merge), and must stay green.
+#[test]
+fn a_registration_naming_an_unknown_id_is_stored_exactly_as_parsed() {
+    let config = json!({
+        "baseUrl": "https://fresh.test/v1",
+        "api": "openai-completions",
+        "apiKey": "sk-fresh",
+        "headers": { "x-h": "v" },
+        "models": [{ "id": "m1" }],
+    });
+    let sink = Arc::new(FakeSink::default());
+    let mut hub = ProviderHub::new();
+    hub.bind(sink.clone());
+    hub.register("fresh".into(), &config).unwrap();
+
+    let reg = hub.get("fresh").unwrap();
+    let parsed: crate::provider::ProviderConfig = serde_json::from_value(config).unwrap();
+    assert_eq!(
+        serde_json::to_value(&reg.config).unwrap(),
+        serde_json::to_value(&parsed).unwrap()
+    );
+    assert_eq!(reg.resolved_api_key.as_deref(), Some("sk-fresh"));
+    assert_eq!(*sink.upserts.lock().unwrap(), vec!["fresh".to_string()]);
+}
+
+// ---- SEAM-151: a write the registry refuses changes nothing here ---------------------------
+
+/// A sink that, while `refusing`, refuses every provider write as a superseded publication's —
+/// as the session's registry does for an `update` whose refresh was superseded while it ran — and
+/// otherwise accepts it.
+struct RefusingSink {
+    asked: Mutex<Vec<String>>,
+    refusing: std::sync::atomic::AtomicBool,
+}
+
+impl Default for RefusingSink {
+    fn default() -> Self {
+        Self {
+            asked: Mutex::default(),
+            refusing: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+
+impl RefusingSink {
+    fn answer(&self, asked: String) -> ProviderWrite {
+        self.asked.lock().unwrap().push(asked);
+        if self.refusing.load(std::sync::atomic::Ordering::SeqCst) {
+            ProviderWrite::Superseded
+        } else {
+            ProviderWrite::Landed
+        }
+    }
+}
+
+impl ModelRegistrySink for RefusingSink {
+    fn upsert_provider(&self, reg: &ProviderRegistration) -> ProviderWrite {
+        self.answer(format!("upsert:{}", reg.id))
+    }
+    fn upsert_live_provider(
+        &self,
+        id: &str,
+        _provider: Arc<dyn cyrup_provider::Provider>,
+    ) -> ProviderWrite {
+        self.answer(format!("upsert-live:{id}"))
+    }
+    fn remove_provider(&self, id: &str) -> ProviderWrite {
+        self.answer(format!("remove:{id}"))
+    }
+    fn upsert_virtual_model(
+        &self,
+        _definition: &cyrup_provider::VirtualModelDefinition,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn remove_virtual_model(&self, _provider: &str, _id: &str) {}
+}
+
+fn live(id: &str) -> Arc<dyn cyrup_provider::Provider> {
+    cyrup_provider::ConfigProvider::new(id, id, None, Vec::new()).into_arc()
+}
+
+/// SEAM-151 — the hub asks the sink FIRST and records a write only if it landed: a JSON
+/// re-registration, a live replacement and a removal the registry refuses leave the hub's
+/// registration, live provider and answers exactly as they were.
+///
+/// Red by mutation (the API is new): with `register_live` inserting into `live` before asking the
+/// sink, as it did at `4f522804b`, the live assertion fails; likewise `register` recording before
+/// asking, and `unregister` removing before asking.
+#[test]
+fn a_write_the_sink_refuses_changes_nothing_in_the_hub() {
+    let mut hub = ProviderHub::new();
+    hub.register("acme".into(), &json!({ "baseUrl": "https://acme.test/v1" }))
+        .unwrap();
+    let first = live("llama.cpp");
+    let _ = hub
+        .register_live("llama.cpp".into(), Arc::clone(&first))
+        .unwrap();
+    let sink = Arc::new(RefusingSink::default());
+    hub.bind(sink.clone());
+    // The bind flushed the two queued registrations; what follows is what is asked after it.
+    sink.asked.lock().unwrap().clear();
+
+    assert_eq!(
+        hub.register(
+            "acme".into(),
+            &json!({ "baseUrl": "https://stale.test/v1" })
+        )
+        .unwrap(),
+        ProviderWrite::Superseded
+    );
+    assert_eq!(
+        hub.get("acme").unwrap().config.base_url.as_deref(),
+        Some("https://acme.test/v1")
+    );
+
+    assert_eq!(
+        hub.register_live("llama.cpp".into(), live("llama.cpp"))
+            .unwrap(),
+        ProviderWrite::Superseded
+    );
+    assert!(Arc::ptr_eq(
+        &hub.live_provider("llama.cpp").unwrap(),
+        &first
+    ));
+
+    assert!(
+        !hub.unregister("llama.cpp"),
+        "a refused removal removes nothing"
+    );
+    assert!(hub.live_provider("llama.cpp").is_some());
+    assert!(!hub.unregister("acme"));
+    assert!(hub.get("acme").is_some());
+
+    assert_eq!(
+        *sink.asked.lock().unwrap(),
+        [
+            "upsert:acme",
+            "upsert-live:llama.cpp",
+            "remove:llama.cpp",
+            "remove:acme"
+        ],
+        "every write was asked of the sink"
+    );
+}
+
+/// SEAM-151 — the extension registry records the id's owner only for a write that landed: a
+/// refused re-registration by another extension leaves the first one owning (and able to retract)
+/// the provider, and a refused removal leaves both the provider and its owner in place.
+///
+/// Red by mutation: `register_provider_live` inserting the owner whatever the hub answered (as at
+/// `4f522804b`) makes `b` the owner, so `b` can retract it and `a` cannot; `unregister_provider_owned`
+/// forgetting the owner before the hub answered (as at `4f522804b`) leaves nobody able to retract it
+/// once the refusal passes.
+#[test]
+fn a_refused_write_changes_no_owner() {
+    let registry = crate::registry::ExtensionRegistry::new();
+    let a = cyrup_core::ExtensionId::from("a");
+    let b = cyrup_core::ExtensionId::from("b");
+    let _ = registry
+        .register_provider_live(a.clone(), "llama.cpp", live("llama.cpp"))
+        .unwrap();
+    let sink = Arc::new(RefusingSink::default());
+    registry.bind_model_registry(sink.clone()).unwrap();
+
+    // While the registry refuses (a superseded publication's writes):
+    assert_eq!(
+        registry
+            .register_provider_live(b.clone(), "llama.cpp", live("llama.cpp"))
+            .unwrap(),
+        ProviderWrite::Superseded
+    );
+    assert!(
+        !registry.unregister_provider_owned(&a, "llama.cpp").unwrap(),
+        "the refused removal removed nothing"
+    );
+
+    // Once writes land again, ownership is what it was before the refused ones.
+    sink.refusing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        !registry.unregister_provider_owned(&b, "llama.cpp").unwrap(),
+        "b's refused registration made it the owner"
+    );
+    assert!(
+        registry.unregister_provider_owned(&a, "llama.cpp").unwrap(),
+        "a still owns the provider it registered"
+    );
+    assert!(registry.provider_ids().unwrap().is_empty());
+}
+
+/// PROV-163's `[CYRUP-DELTA]` — an EMPTY `name` in a re-registration is no name, so it keeps the one
+/// an earlier registration set: the SDK always serializes `name`, as `""` when the guest gave none,
+/// and must not blank it.
+///
+/// Red by mutation: dropping the empty-name skip in `merge_config` turns the name into `""`.
+#[test]
+fn an_empty_name_in_a_re_registration_keeps_the_previous_name() {
+    let mut hub = ProviderHub::new();
+    hub.register(
+        "acme".into(),
+        &json!({ "name": "Acme", "baseUrl": "https://acme.test/v1" }),
+    )
+    .unwrap();
+    hub.register("acme".into(), &json!({ "name": "", "apiKey": "sk-later" }))
+        .unwrap();
+    let reg = hub.get("acme").unwrap();
+    assert_eq!(reg.config.name, "Acme");
+    assert_eq!(reg.resolved_api_key.as_deref(), Some("sk-later"));
 }

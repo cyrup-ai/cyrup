@@ -19,7 +19,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::provider::{ModelRegistrySink, ProviderRegistration};
+use crate::provider::{ModelRegistrySink, ProviderRegistration, ProviderWrite};
 use crate::{
     ExtError, ExtMode, ExtensionHost, HookOutcome, HostConfig, HostCtx, HostEvent, InitApi,
     LateRegistrar, NativeExtension,
@@ -92,20 +92,23 @@ impl Sink {
 }
 
 impl ModelRegistrySink for Sink {
-    fn upsert_provider(&self, reg: &ProviderRegistration) {
+    fn upsert_provider(&self, reg: &ProviderRegistration) -> ProviderWrite {
         self.events
             .lock()
             .unwrap()
             .push(format!("upsert:{}", reg.id));
+        ProviderWrite::Landed
     }
-    fn upsert_live_provider(&self, id: &str, _provider: Arc<dyn Provider>) {
+    fn upsert_live_provider(&self, id: &str, _provider: Arc<dyn Provider>) -> ProviderWrite {
         self.events
             .lock()
             .unwrap()
             .push(format!("upsert-live:{id}"));
+        ProviderWrite::Landed
     }
-    fn remove_provider(&self, id: &str) {
+    fn remove_provider(&self, id: &str) -> ProviderWrite {
         self.events.lock().unwrap().push(format!("remove:{id}"));
+        ProviderWrite::Landed
     }
     fn upsert_virtual_model(&self, definition: &VirtualModelDefinition) -> Result<(), String> {
         let key = (
