@@ -203,9 +203,10 @@ When a rule resolves to `ask`, the call stops and you get four options:
 | Reject with Reason | Refuse it and type an explanation the model receives |
 
 The dialog of a call a [`codemode`](../guides/codemode.md) script made has a fifth option,
-**Reject All From This Script**: it refuses that call and every other call the same script makes, the
-ones waiting behind the dialog included, without another dialog. Each fails with `the user rejected
-this script's tool calls`; the script is not aborted, and other scripts are asked as before.
+**Reject All From This Script**: it refuses that call and ends the script, without another dialog.
+The script makes no further call, the calls waiting behind the dialog end with it, and the model is
+told `Script stopped:` with the refusal (`... the user rejected this script and stopped it`). What the
+script did before the refusal is not undone. Other scripts are asked as before.
 
 Pressing `Esc` counts as a reject, and so does a timeout. **The gate fails closed on anything but an
 explicit allow.** A headless run — a script, a piped invocation (`-p`, `--mode json`), anything with no

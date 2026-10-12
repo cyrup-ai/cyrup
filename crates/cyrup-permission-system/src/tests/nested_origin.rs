@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cyrup_core::ToolCallId;
+use cyrup_core::{TerminateHint, ToolCallId};
 use cyrup_ext::{
     ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, HumanInteractionLock, InitApi,
     NativeExtension,
@@ -320,6 +320,8 @@ fn an_ask_on_codemode_and_on_bash_prompts_twice_and_only_the_nested_prompt_is_la
 /// What a scripted person did with one prompt; a prompt past the script is allowed once.
 enum Answer {
     RejectScript,
+    /// Plain "Reject": this call only.
+    Reject,
 }
 
 /// Records `(prompt, whether the dialog offered to reject the whole script)` for every prompt, takes
@@ -343,8 +345,14 @@ impl AskChannel for Scripted {
             Some(Answer::RejectScript) => PermissionPromptDecision {
                 approved: false,
                 state: PermissionDecisionState::Reject,
-                denial_reason: Some("the user rejected this script's tool calls".to_string()),
+                denial_reason: Some(crate::ask::SCRIPT_REJECTED_REASON.to_string()),
                 reject_script: true,
+            },
+            Some(Answer::Reject) => PermissionPromptDecision {
+                approved: false,
+                state: PermissionDecisionState::Reject,
+                denial_reason: None,
+                reject_script: false,
             },
             None => PermissionPromptDecision {
                 approved: true,
@@ -450,7 +458,7 @@ fn rejecting_the_script_refuses_its_later_calls_without_asking_and_no_other_scri
             )
             .await;
         assert!(
-            reason_of(first).contains("the user rejected this script's tool calls"),
+            reason_of(first).contains(crate::ask::SCRIPT_REJECTED_REASON),
             "the answer that refused the script"
         );
         let later = ext
@@ -461,8 +469,7 @@ fn rejecting_the_script_refuses_its_later_calls_without_asking_and_no_other_scri
             .await;
         let later = reason_of(later);
         assert!(
-            later.contains("echo 2")
-                && later.contains("the user rejected this script's tool calls"),
+            later.contains("echo 2") && later.contains(crate::ask::SCRIPT_REJECTED_REASON),
             "a later call of the same script is refused with the user's refusal: {later}"
         );
         assert_eq!(seen.lock().unwrap().len(), 1, "and was not asked about");
@@ -513,8 +520,7 @@ fn rejecting_the_script_reaches_the_calls_already_waiting_for_their_turn() {
         assert!(
             outcomes
                 .into_iter()
-                .all(|outcome| reason_of(outcome)
-                    .contains("the user rejected this script's tool calls")),
+                .all(|outcome| reason_of(outcome).contains(crate::ask::SCRIPT_REJECTED_REASON)),
             "every call of the script was refused"
         );
     });
@@ -558,5 +564,71 @@ fn only_the_most_recently_refused_scripts_are_remembered() {
             .await;
         assert!(matches!(oldest, HookOutcome::Noop), "{oldest:?}");
         assert_eq!(seen.lock().unwrap().len(), 101, "s0 was asked about again");
+    });
+}
+
+fn terminate_of(outcome: &HookOutcome) -> TerminateHint {
+    match outcome {
+        HookOutcome::Block { terminate, .. } => *terminate,
+        other => panic!("expected a block: {other:?}"),
+    }
+}
+
+/// PERM-046: the refusal that rejects the script, and every later refusal of that script's calls,
+/// is a block that asks for the caller to stop ([`TerminateHint::Terminate`], pi's
+/// `ToolCallEventResult.terminate`). A nested call's caller is the script, and the `codemode` tool
+/// ends the script on it. A plain "Reject" of a script's call says nothing of the kind, so the
+/// script goes on; nor does any refusal of a call the model made, which would end the agent's turn.
+#[test]
+fn rejecting_the_script_asks_the_caller_to_stop_and_a_plain_reject_does_not() {
+    block_on(true, async {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let (ext, _seen) = ext_asking(
+            &cwd,
+            vec![Answer::Reject, Answer::RejectScript, Answer::Reject],
+            Duration::ZERO,
+        )
+        .await;
+        ext.on_event(&call("call-1", "codemode", json!({})), &ctx(&cwd))
+            .await;
+
+        let plain = ext
+            .on_event(
+                &call("call-1/1", "bash", bash("echo 1")),
+                &nested_ctx(&cwd, "call-1"),
+            )
+            .await;
+        assert_eq!(
+            terminate_of(&plain),
+            TerminateHint::Unspecified,
+            "plain Reject: {plain:?}"
+        );
+        let refusing = ext
+            .on_event(
+                &call("call-1/2", "bash", bash("echo 2")),
+                &nested_ctx(&cwd, "call-1"),
+            )
+            .await;
+        assert_eq!(
+            terminate_of(&refusing),
+            TerminateHint::Terminate,
+            "{refusing:?}"
+        );
+        let later = ext
+            .on_event(
+                &call("call-1/3", "bash", bash("echo 3")),
+                &nested_ctx(&cwd, "call-1"),
+            )
+            .await;
+        assert_eq!(terminate_of(&later), TerminateHint::Terminate, "{later:?}");
+        let direct = ext
+            .on_event(&call("call-2", "bash", bash("echo 4")), &ctx(&cwd))
+            .await;
+        assert_eq!(
+            terminate_of(&direct),
+            TerminateHint::Unspecified,
+            "a direct call's refusal: {direct:?}"
+        );
     });
 }

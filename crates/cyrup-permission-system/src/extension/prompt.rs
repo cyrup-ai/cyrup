@@ -21,6 +21,20 @@ use super::decide::{NestedOrigin, dedup_details};
 use super::env::is_subagent_child;
 use super::{PermissionSystemExtension, guard};
 
+/// [CYRUP-DELTA] PERM-046 — the `terminate` of the block a refused decision becomes:
+/// [`TerminateHint::Terminate`] when the person refused the whole script
+/// ([`crate::ask::REJECT_SCRIPT_OPTION`]), which asks the caller of the call, the script, to stop
+/// there (the `codemode` tool ends it on that request); [`TerminateHint::Unspecified`] (pi's
+/// `undefined`) for every other refusal. Only a call a script made can carry `reject_script`, so
+/// this never asks the agent loop to end a turn.
+pub(super) fn script_terminate(decision: &PermissionPromptDecision) -> TerminateHint {
+    if decision.reject_script {
+        TerminateHint::Terminate
+    } else {
+        TerminateHint::Unspecified
+    }
+}
+
 /// How many refused scripts [`PermissionSystemExtension`] remembers. A script is refused by a person,
 /// one at a time, so this is far more than a session sees; it only bounds the memory.
 const REJECTED_SCRIPTS_CAP: usize = 64;
@@ -410,7 +424,7 @@ impl PermissionSystemExtension {
                     check,
                     decision.denial_reason.as_deref(),
                 )),
-                terminate: TerminateHint::Unspecified,
+                terminate: script_terminate(&decision),
             };
         }
         if decision.state == PermissionDecisionState::Always {

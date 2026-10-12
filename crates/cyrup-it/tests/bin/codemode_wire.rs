@@ -1057,7 +1057,9 @@ fn an_ask_rule_puts_the_nested_call_to_the_person_and_their_answer_decides_it() 
 /// A script that starts several calls together under `bash = ask` is one dialog per call, and the only
 /// way out used to be answering each (measured in the TUI: Esc rejected one and the next appeared at
 /// once, 25 times over). "Reject All From This Script" refuses the call on screen and every other call
-/// of that script, the ones waiting behind the dialog included, with no further dialog.
+/// of that script, the ones waiting behind the dialog included, with no further dialog; and since
+/// PERM-046 it also ends the script, so the `Promise.allSettled` never settles and the script never
+/// gets to report the three refusals itself: the result is the user's stop.
 #[test]
 fn rejecting_the_script_in_the_dialog_refuses_the_rest_of_its_calls_without_more_dialogs() {
     let policy = json!({
@@ -1084,14 +1086,15 @@ fn rejecting_the_script_in_the_dialog_refuses_the_rest_of_its_calls_without_more
         f["type"] == "tool_execution_end" && f["toolName"] == "codemode"
     });
     let text = content_text(&settled["result"]["content"]);
-    assert_eq!(
-        text.matches("rejected:").count(),
-        3,
-        "all three calls were refused: {text}"
+    assert_eq!(settled["isError"], true, "{settled}");
+    assert!(
+        text.contains("Script stopped: ")
+            && text.contains("the user rejected this script and stopped it"),
+        "the result says the user stopped the script: {text}"
     );
     assert!(
-        text.contains("the user rejected this script's tool calls"),
-        "{text}"
+        !text.contains("rejected:"),
+        "the script did not run on to report the refusals itself: {text}"
     );
     for n in 1..=3 {
         assert!(
@@ -1110,6 +1113,204 @@ fn rejecting_the_script_in_the_dialog_refuses_the_rest_of_its_calls_without_more
         "one dialog for the whole script:\n{}",
         rpc.dump()
     );
+}
+
+/// What PERM-046's script does after its first call is refused: it carries on and writes a file
+/// with a tool the policy allows, then returns. The ask comes first, so the refusal is the only
+/// thing standing between the script and that write.
+const RUNS_ON_AFTER_A_REFUSAL: &str = "let refused = 'ran'; try { await tools.bash({ command: 'echo asked > asked.txt' }) } catch (e) { refused = e.message } await tools.write({ path: 'after.txt', content: refused }); return 'finished: ' + refused";
+
+/// The policy for [`RUNS_ON_AFTER_A_REFUSAL`]: `bash` asks, `write` and `codemode` are allowed.
+fn runs_on_policy() -> String {
+    json!({
+        "defaultPolicy": { "tools": "ask", "bash": "ask", "mcp": "ask", "skills": "ask", "special": "ask" },
+        "tools": { "codemode": "allow", "write": "allow" },
+    })
+    .to_string()
+}
+
+/// What a run of [`RUNS_ON_AFTER_A_REFUSAL`] must show for `answer`: "Reject All From This Script"
+/// ends the parent `codemode` call at the refusal (no later call, no `after.txt`, a failed result
+/// that says the user stopped the script, and the model is told so); plain "Reject" refuses that
+/// one call and the script runs on to its end (the positive control).
+fn assert_runs_on_outcome(answer: &str, home: &Home, settled: &Value, model_saw: &str) {
+    let text = content_text(&settled["result"]["content"]);
+    let calls = settled["result"]["details"]["calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !home.project.join("asked.txt").exists(),
+        "{answer}: the refused call must not run"
+    );
+    if answer == "Reject All From This Script" {
+        assert_eq!(settled["isError"], true, "{answer}: {settled}");
+        assert!(
+            text.contains("Script stopped: ")
+                && text.contains("the user rejected this script and stopped it"),
+            "{answer}: the result says the user stopped the script: {text}"
+        );
+        assert!(!text.contains("finished:"), "{answer}: {text}");
+        assert!(
+            !home.project.join("after.txt").exists(),
+            "{answer}: the script made a call after the refusal: {text}"
+        );
+        assert_eq!(
+            calls.len(),
+            1,
+            "{answer}: the refused call is the script's last: {calls:?}"
+        );
+        assert!(
+            model_saw.contains("Script stopped: ")
+                && model_saw.contains("the user rejected this script and stopped it"),
+            "{answer}: the model is told the user stopped the script: {model_saw}"
+        );
+    } else {
+        assert_eq!(settled["isError"], false, "{answer}: {settled}");
+        assert!(text.contains("finished: User denied"), "{answer}: {text}");
+        assert!(
+            std::fs::read_to_string(home.project.join("after.txt"))
+                .unwrap()
+                .starts_with("User denied"),
+            "{answer}: the script runs on after a single refusal"
+        );
+        assert_eq!(calls.len(), 2, "{answer}: {calls:?}");
+        assert!(
+            model_saw.contains("finished: User denied"),
+            "{answer}: {model_saw}"
+        );
+    }
+}
+
+/// The last tool-result text the model was sent.
+fn last_tool_result(requests: &[Value]) -> String {
+    requests
+        .iter()
+        .rev()
+        .find_map(|request| {
+            request["messages"]
+                .as_array()
+                .and_then(|messages| messages.iter().rev().find(|m| m["role"] == "tool"))
+                .map(|m| content_text(&m["content"]))
+        })
+        .unwrap_or_default()
+}
+
+/// PERM-046: "Reject All From This Script" ENDS the parent `codemode` call. It used to refuse the
+/// rest of the script's calls and leave the script running, so a script that did not stop on a
+/// rejected call carried on with its other work (here: a `write` the policy allows) until it ended
+/// or timed out. Plain "Reject" is the control: it refuses that call only and the script goes on.
+/// The calls a script made before the refusal are not undone (not exercised: nothing can retract a
+/// written file or a command that ran).
+#[test]
+fn rejecting_the_script_in_the_dialog_ends_the_script_and_a_plain_reject_does_not() {
+    for answer in ["Reject All From This Script", "Reject"] {
+        let home = Home::new();
+        let policy = runs_on_policy();
+        let (cmd, server) = Wire::script(RUNS_ON_AFTER_A_REFUSAL)
+            .args(&["--mode", "rpc", "--tools", "bash,write,codemode"])
+            .agent_files(&[(POLICY_FILE, &policy)])
+            .command(&home, false);
+        let mut rpc = Lines::spawn(cmd);
+        rpc.send(&json!({ "type": "prompt", "message": "go", "id": "p1" }));
+        let dialog = rpc.wait_for_frame("the permission dialog", Duration::from_secs(30), |f| {
+            f["type"] == "extension_ui_request" && f["method"] == "select"
+        });
+        rpc.send(&json!({
+            "type": "extension_ui_response", "id": dialog["id"], "value": answer,
+        }));
+        let settled = rpc.wait_for_frame("the codemode result", Duration::from_secs(30), |f| {
+            f["type"] == "tool_execution_end" && f["toolName"] == "codemode"
+        });
+        rpc.wait_for_frame("the end of the run", Duration::from_secs(30), |f| {
+            f["type"] == "agent_end"
+        });
+        assert_runs_on_outcome(
+            answer,
+            &home,
+            &settled,
+            &last_tool_result(&server.requests()),
+        );
+    }
+}
+
+/// PERM-046 through the second front end: an ACP client answers `session/request_permission` with
+/// the option named "Reject All From This Script" (or plain "Reject"), and the outcome is the RPC
+/// one above, because the client's choice is handed back to the same dialog code as the option
+/// string itself.
+#[test]
+fn rejecting_the_script_over_acp_ends_the_script_and_a_plain_reject_does_not() {
+    for answer in ["Reject All From This Script", "Reject"] {
+        let home = Home::new();
+        let policy = runs_on_policy();
+        let (cmd, server) = Wire::script(RUNS_ON_AFTER_A_REFUSAL)
+            .args(&["--mode", "acp", "--tools", "bash,write,codemode"])
+            .agent_files(&[(POLICY_FILE, &policy)])
+            .command(&home, false);
+        let mut acp = Lines::spawn(cmd);
+        acp.send(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": 1, "clientCapabilities": {} },
+        }));
+        acp.wait_for_frame("the initialize response", Duration::from_secs(30), |f| {
+            f["id"] == 1 && f.get("method").is_none()
+        });
+        acp.send(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": { "cwd": home.project.to_string_lossy(), "mcpServers": [] },
+        }));
+        let opened = acp.wait_for_frame("the session/new response", Duration::from_secs(30), |f| {
+            f["id"] == 2 && f.get("method").is_none()
+        });
+        let session = opened["result"]["sessionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no session id: {opened}"))
+            .to_owned();
+        acp.send(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": { "sessionId": session, "prompt": [{ "type": "text", "text": "go" }] },
+        }));
+        let asked = acp.wait_for_frame("the permission request", Duration::from_secs(30), |f| {
+            f["method"] == "session/request_permission"
+        });
+        let option = asked["params"]["options"]
+            .as_array()
+            .and_then(|options| options.iter().find(|o| o["name"] == answer))
+            .unwrap_or_else(|| panic!("no option {answer:?}: {asked}"));
+        assert_eq!(option["kind"], "reject_once", "{option}");
+        acp.send(&json!({
+            "jsonrpc": "2.0", "id": asked["id"],
+            "result": { "outcome": { "outcome": "selected", "optionId": option["optionId"] } },
+        }));
+        acp.wait_for_frame(
+            "the session/prompt response",
+            Duration::from_secs(60),
+            |f| f["id"] == 3 && f.get("method").is_none(),
+        );
+        // The codemode call's last update carries its result, as the client renders it.
+        let update = acp
+            .seen
+            .iter()
+            .rev()
+            .find(|f| {
+                f["method"] == "session/update"
+                    && f["params"]["update"]["sessionUpdate"] == "tool_call_update"
+                    && f["params"]["update"]["rawOutput"]["details"]["calls"].is_array()
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no codemode result update:\n{}", acp.dump()));
+        let raw = &update["params"]["update"]["rawOutput"];
+        let settled = json!({
+            "isError": update["params"]["update"]["status"] == "failed",
+            "result": { "content": raw["content"], "details": raw["details"] },
+        });
+        assert_runs_on_outcome(
+            answer,
+            &home,
+            &settled,
+            &last_tool_result(&server.requests()),
+        );
+    }
 }
 
 /// The script reference the `codemode` description sends the model to lives under the agent

@@ -417,32 +417,34 @@ fn error_heads_follow_the_failure_kind() {
         format_error(
             &error(ErrorKind::Script, Some("TypeError"), None),
             none,
-            false
+            false,
+            None
         ),
         "TypeError: msg\n\nNo tool calls were made."
     );
     assert_eq!(
-        format_error(&error(ErrorKind::Script, None, None), none, false),
+        format_error(&error(ErrorKind::Script, None, None), none, false, None),
         "Error: msg\n\nNo tool calls were made."
     );
     assert_eq!(
         format_error(
             &error(ErrorKind::Script, Some("X"), Some("X: msg\n  at a")),
             none,
-            false
+            false,
+            None
         ),
         "X: msg\n  at a\n\nNo tool calls were made."
     );
     assert_eq!(
-        format_error(&error(ErrorKind::Timeout, None, None), none, false),
+        format_error(&error(ErrorKind::Timeout, None, None), none, false, None),
         "Script timed out: msg\n\nNo tool calls were made."
     );
     assert_eq!(
-        format_error(&error(ErrorKind::Aborted, None, None), none, false),
+        format_error(&error(ErrorKind::Aborted, None, None), none, false, None),
         "Script aborted: msg\n\nNo tool calls were made."
     );
     assert_eq!(
-        format_error(&error(ErrorKind::Sandbox, None, None), none, false),
+        format_error(&error(ErrorKind::Sandbox, None, None), none, false, None),
         "Script sandbox failed: msg\n\nNo tool calls were made."
     );
 }
@@ -518,6 +520,98 @@ async fn cancelling_the_tool_call_yields_an_aborted_result() {
     assert_eq!(
         result_text(&result),
         "so far\nScript error:\nScript aborted: This operation was aborted\n\nNo tool calls were made."
+    );
+}
+
+/// PERM-046: a nested call that was blocked with a request to stop (`terminate`, which the
+/// permission gate sets when the person chose "Reject All From This Script") ends the script: it
+/// makes no further call, and the result says it was stopped and why, in the blocked call's words,
+/// instead of reporting a script that ran on. A blocked call without that request, and a call that
+/// succeeded with it, leave the script running (the controls).
+#[tokio::test]
+async fn a_blocked_call_that_asks_to_stop_ends_the_script() {
+    const REFUSAL: &str = "User denied bash command 'rm x'. Reason: the user rejected this script and stopped it. Hard stop.";
+    for (is_error, terminate, stops) in [
+        (true, cyrup_core::TerminateHint::Terminate, true),
+        (true, cyrup_core::TerminateHint::Unspecified, false),
+        (false, cyrup_core::TerminateHint::Terminate, false),
+    ] {
+        let rig = rig(
+            tools(),
+            script(|_code, env| async move {
+                // What the sandbox does: a call's answer that arrives after the caller's token
+                // fired is never seen by the script, which is aborted with the caller's reason.
+                let _ = env.tool("echo", json!({})).await;
+                if env.cancel.is_cancelled() {
+                    let reason = env.cancel_reason.clone().unwrap_or_default();
+                    return failed(ErrorKind::Aborted, &reason, None, Vec::new());
+                }
+                let _ = env.tool("stats", json!({})).await;
+                completed(Vec::new(), Some(json!("finished")))
+            }),
+        );
+        *rig.host.on_nested.lock().unwrap() = Some(Arc::new(move |name, _| {
+            let mut outcome =
+                RecordingHost::text_outcome(&format!("call-1/{name}"), REFUSAL, is_error);
+            outcome.result.terminate = terminate;
+            outcome
+        }));
+        let parent = CancelToken::new();
+        let result = rig.run_with("x", parent.clone()).await.unwrap();
+        let made: Vec<String> = rig
+            .host
+            .nested
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, name, _)| name.clone())
+            .collect();
+        let text = result_text(&result);
+        if stops {
+            assert_eq!(made, ["echo"], "no call after the stop");
+            assert!(result.is_error);
+            assert!(
+                text.starts_with(&format!("Script error:\nScript stopped: {REFUSAL}\n\n")),
+                "{text}"
+            );
+            assert!(
+                !parent.is_cancelled(),
+                "the parent call's own token is not the one that fired"
+            );
+        } else {
+            assert_eq!(made, ["echo", "stats"], "{is_error} {terminate:?}");
+            assert!(!result.is_error, "{text}");
+            assert_eq!(text, "finished");
+        }
+    }
+}
+
+/// PERM-046's stop and an abort of the parent call at the same time: the parent's abort is what the
+/// result reports, as it does for any abort.
+#[tokio::test]
+async fn an_abort_of_the_parent_call_is_reported_as_an_abort_even_after_a_stop() {
+    let rig = rig(
+        tools(),
+        script(|_code, env| async move {
+            let _ = env.tool("echo", json!({})).await;
+            env.cancel.cancelled().await;
+            let reason = env.cancel_reason.clone().unwrap_or_default();
+            failed(ErrorKind::Aborted, &reason, None, Vec::new())
+        }),
+    );
+    let parent = CancelToken::new();
+    let trigger = parent.clone();
+    *rig.host.on_nested.lock().unwrap() = Some(Arc::new(move |_, _| {
+        trigger.cancel();
+        let mut outcome = RecordingHost::text_outcome("call-1/1", "refused", true);
+        outcome.result.terminate = cyrup_core::TerminateHint::Terminate;
+        outcome
+    }));
+    let result = rig.run_with("x", parent).await.unwrap();
+    let text = result_text(&result);
+    assert!(
+        text.starts_with("Script error:\nScript aborted: This operation was aborted"),
+        "{text}"
     );
 }
 

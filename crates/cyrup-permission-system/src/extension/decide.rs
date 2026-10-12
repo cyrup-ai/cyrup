@@ -550,7 +550,7 @@ impl PermissionSystemExtension {
                             path,
                             d.denial_reason.as_deref(),
                         )),
-                        terminate: TerminateHint::Unspecified,
+                        terminate: super::prompt::script_terminate(&d),
                     }),
                     AskOutcome::Decided(d) => {
                         // pi `persistPatternApprovalDecision` (`:2391`): an approved-Always persists an

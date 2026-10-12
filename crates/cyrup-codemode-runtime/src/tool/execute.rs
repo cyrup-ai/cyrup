@@ -68,6 +68,57 @@ const CANCELLED_WHILE_QUEUED: &str = "The tool call was cancelled before it star
 /// user or the run, never with a more specific one.
 pub const ABORT_REASON: &str = "This operation was aborted";
 
+/// [CYRUP-DELTA] PERM-046 — how a nested call ends the script that made it.
+///
+/// A blocked call can ask its caller to stop (`terminate`, pi's `ToolCallEventResult.terminate`;
+/// the permission gate sets it when the person chose "Reject All From This Script"). The agent loop
+/// reads that hint for the model's own calls; for a nested call the caller is the script, so this
+/// is where it is read. Upstream's `codemode` ignores the hint on a nested outcome
+/// (`execute.ts:462-466`), which left a refused script running until it ended or timed out.
+///
+/// The token is a child of the parent `codemode` call's own token, which the agent loop made for
+/// this call (a child of the run's) and which only the run fires (abort, session close). Firing
+/// this child ends the script without touching the parent's token, the run, or any sibling call;
+/// an abort of the parent still reaches the script through it.
+struct ScriptStop {
+    token: CancelToken,
+    /// The text of the call that asked to stop, the first one if several did.
+    reason: std::sync::Mutex<Option<String>>,
+}
+
+impl ScriptStop {
+    fn new(parent: &CancelToken) -> Self {
+        Self {
+            token: parent.child_token(),
+            reason: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// End the script, saying why. The reason is recorded before the token fires, so whoever sees
+    /// the script aborted by this token also sees the reason.
+    fn stop(&self, reason: String) {
+        self.reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(reason);
+        self.token.cancel();
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Whether a nested call's outcome asks the script to stop: a call that failed (a block is one)
+/// and whose result requests termination. A call that succeeded with the hint does not stop the
+/// script; the hint is about a blocked call, which is the case pi defines it for.
+fn asks_to_stop(outcome: &NestedOutcome) -> bool {
+    outcome.is_error && outcome.result.terminate.requested()
+}
+
 /// The text items of a tool result joined with `\n` (`textOf`, `execute.ts:58-63`).
 fn text_of(result: &ToolResult) -> String {
     result
@@ -261,12 +312,17 @@ fn default_limits_hint() -> String {
 /// The failure text after `Script error:` (`formatError`, `execute.ts:247-258`): the script's own
 /// stack (or `Name: message`), a timeout, abort or sandbox failure, then the call summary.
 /// `default_limits` is whether the script ran under the default limits, not a `timeout_ms` of its
-/// own.
+/// own; `stopped` is the text of the nested call that ended the script, if one did.
 fn format_error(
     error: &CodemodeError,
     calls: &[CodemodeNestedCall],
     default_limits: bool,
+    stopped: Option<&str>,
 ) -> String {
+    // [CYRUP-DELTA] PERM-046: a nested call ended the script ([`ScriptStop`]), in its own words.
+    if let (ErrorKind::Aborted, Some(reason)) = (&error.kind, stopped) {
+        return format!("Script stopped: {reason}\n\n{}", format_call_summary(calls));
+    }
     let head = match error.kind {
         ErrorKind::Script => error.stack.clone().unwrap_or_else(|| {
             format!(
@@ -312,23 +368,26 @@ fn nested_tool(
     host: Option<&Arc<dyn CodemodeHost>>,
     recorder: &Arc<Recorder>,
     slots: &Arc<Semaphore>,
+    stop: &Arc<ScriptStop>,
 ) -> CodemodeTool {
-    let (tool, host, recorder, slots) = (
+    let (tool, host, recorder, slots, stop) = (
         Arc::clone(tool),
         host.cloned(),
         Arc::clone(recorder),
         Arc::clone(slots),
+        Arc::clone(stop),
     );
     let declaration = ToolDeclaration::new(tool.name())
         .with_identifier(identifiers.get(tool.name()))
         .with_description(sample);
     let execute: ToolCallback =
         Arc::new(move |args: Option<Value>, context: CodemodeToolContext| {
-            let (tool, host, recorder, slots) = (
+            let (tool, host, recorder, slots, stop) = (
                 Arc::clone(&tool),
                 host.clone(),
                 Arc::clone(&recorder),
                 Arc::clone(&slots),
+                Arc::clone(&stop),
             );
             let call: BoxFuture<'static, crate::types::ToolResult> = Box::pin(async move {
                 // Held until the call ends. The script ending fires the call's token, so a queued
@@ -385,6 +444,11 @@ fn nested_tool(
                         call.status = CodemodeNestedCallStatus::Ok;
                     }
                 });
+                // Before the answer goes back: the sandbox looks at its token before it delivers a
+                // call's answer, so the script never sees this one and makes no further call.
+                if asks_to_stop(&outcome) {
+                    stop.stop(text_of(&outcome.result));
+                }
                 converted
             });
             call
@@ -454,11 +518,20 @@ pub async fn execute_codemode(
         })
         .collect();
     let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_NESTED_CALLS));
+    let stop = Arc::new(ScriptStop::new(&cancel));
     let tools: Vec<CodemodeTool> = callable
         .iter()
         .map(|tool| {
             let sample = samples.get(tool.name()).map_or("", String::as_str);
-            nested_tool(tool, sample, &identifiers, host.as_ref(), &recorder, &slots)
+            nested_tool(
+                tool,
+                sample,
+                &identifiers,
+                host.as_ref(),
+                &recorder,
+                &slots,
+                &stop,
+            )
         })
         .collect();
 
@@ -503,7 +576,7 @@ pub async fn execute_codemode(
         settled = sandbox.execute(
             &parsed.code,
             ExecuteOptions {
-                cancel: Some(cancel),
+                cancel: Some(stop.token.clone()),
                 cancel_reason: Some(ABORT_REASON.to_owned()),
                 deadline: None,
                 store,
@@ -566,9 +639,12 @@ pub async fn execute_codemode(
         }
         CodemodeResult::Failed { error, output, .. } => {
             items = format_output(output);
+            // An abort of the parent call is reported as one even when a call had also asked to
+            // stop: the run's abort is the user's last word.
+            let stopped = (!cancel.is_cancelled()).then(|| stop.reason()).flatten();
             items.push(OutputItem::Text(format!(
                 "Script error:\n{}",
-                format_error(&error, &calls, !explicit_timeout)
+                format_error(&error, &calls, !explicit_timeout, stopped.as_deref())
             )));
         }
     }
