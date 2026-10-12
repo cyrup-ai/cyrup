@@ -553,7 +553,14 @@ impl ExtensionHost {
         ext: Arc<dyn NativeExtension>,
         services: Arc<dyn crate::host::HostServices>,
     ) -> Result<(), ExtError> {
-        ext.set_host_services(services.clone());
+        // EXT-105: the native sees the backend through a handle scoped to its own id — pi's
+        // per-extension `ExtensionAPI`, whose `getFlag` answers only for the extension's own flags.
+        // The id is the one its registrations are recorded under.
+        ext.set_host_services(Arc::new(crate::host::CallerScopedServices::new(
+            services.clone(),
+            ext.id(),
+            Arc::clone(&self.registry),
+        )));
         // Keep the backend so EVERY native dispatch/command ctx can carry live rich fields
         // (EXT-005), not just the built-ins that stash the Arc themselves. It is held as the
         // feature-independent [`crate::native::HostCtxSource`] slice (EXT-060) — the ONLY thing the

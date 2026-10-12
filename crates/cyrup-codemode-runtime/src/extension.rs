@@ -32,6 +32,8 @@ pub const EXTENSION_ID: &str = "codemode";
 #[derive(Clone)]
 pub struct CodemodeExtension {
     options: CodemodeToolOptions,
+    /// Loaded by `-e builtin:codemode` ([`Self::loaded_explicitly`]).
+    explicit: bool,
 }
 
 impl CodemodeExtension {
@@ -41,7 +43,18 @@ impl CodemodeExtension {
     pub fn new(host: CodemodeHostSlot, sandboxes: Arc<dyn SandboxFactory>) -> Self {
         Self {
             options: CodemodeToolOptions::new(host, sandboxes),
+            explicit: false,
         }
+    }
+
+    /// The extension as `-e builtin:codemode` loads it (EXT-112): an explicit `-e` path, which pi
+    /// keeps under `--no-extensions` (`noExtensions ? cliEnabledExtensions : …`,
+    /// `core/resource-loader.ts:578` @f1b2e77f5), so it is not
+    /// [ambient](NativeExtension::is_ambient).
+    #[must_use]
+    pub fn loaded_explicitly(mut self) -> Self {
+        self.explicit = true;
+        self
     }
 
     /// Overrides the `codemode.mode` setting (`CodemodeExtensionOptions.mode`).
@@ -132,9 +145,10 @@ impl NativeExtension for CodemodeExtension {
 
     /// Ambient: pi's `builtin:codemode` is a path in the tier `--no-extensions` collapses
     /// (`package-manager.ts:972-974`, `resource-loader.ts:706-730` @v1.0.1), so the flag drops it
-    /// here too.
+    /// here too — unless `-e builtin:codemode` named it, which puts it in `cliEnabledExtensions`
+    /// (`core/resource-loader.ts:578` @f1b2e77f5; [`CodemodeExtension::loaded_explicitly`]).
     fn is_ambient(&self) -> bool {
-        true
+        !self.explicit
     }
 
     /// Replaceable: pi's entry is `{ name: "codemode", factory, replaceable: true, builtin: true }`

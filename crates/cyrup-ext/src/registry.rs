@@ -2031,6 +2031,19 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.flags.get(name).cloned())
     }
 
+    /// Whether `owner` declared the flag `name` — pi's `extension.flags.has(name)`, the gate of
+    /// `getFlag` (`core/extensions/loader.ts:376` @f1b2e77f5). A conflict loser declared it too:
+    /// pi sets its own `extension.flags` whatever another extension holds, and only the CLI side
+    /// resolves the conflict. A poisoned registry declares nothing.
+    #[must_use]
+    pub fn declares_flag(&self, owner: &ExtensionId, name: &str) -> bool {
+        self.lock_read().is_ok_and(|g| {
+            g.flag_declarations
+                .iter()
+                .any(|d| &d.extension == owner && d.name == name)
+        })
+    }
+
     /// Every flag extensions declared, in pi's `--help` order — extension load order, then each
     /// extension's own declaration order, conflict losers included — the list `main.ts:859-862`
     /// @v0.87.1 hands `printHelp`.
