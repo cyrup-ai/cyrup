@@ -196,7 +196,9 @@ fn to_model_info(model: &AnyModel) -> Result<Value, String> {
     Ok(info)
 }
 
-const CLASSIFIER_CONTEXT_SHAPE: &str = r#"{ state: { ... }, questions: { <id>: { type: "choice", instructions, criteria: { <label>: <meaning> } } | { type: "score", instructions, criteria: [<lowest level>, ..., <highest level>] } | { type: "bool", instructions, criteria: { true: <meaning>, false: <meaning> } } } }"#;
+/// What a script's classifier context must look like, as the model reads it in every
+/// `models.classify()` argument error (`CLASSIFIER_CONTEXT_SHAPE`, `execute.ts:118-119` @ce8972a0e).
+const CLASSIFIER_CONTEXT_SHAPE: &str = r#"{ state: { ... }, images?: [{ type: "image", data: <base64>, mimeType }], questions: { <id>: { type: "choice", instructions, criteria: { <label>: <meaning> } } | { type: "score", instructions, criteria: [<lowest level>, ..., <highest level>] } | { type: "bool", instructions, criteria: { true: <meaning>, false: <meaning> } } } }"#;
 
 /// Check a script's classifier context, so mistakes fail with the expected shape instead of a
 /// provider error (`checkClassifierContext`, `execute.ts:123-157` @v1.0.1).
@@ -232,6 +234,31 @@ fn check_classifier_context(
             "context.state must be an object, got {}",
             describe_value(state)
         )));
+    }
+    // CODE-023 — `execute.ts:129-142` @ce8972a0e, between the state and the questions as upstream
+    // checks them. Only `type`, `data` and `mimeType` are read, so a `tools.read()` image block (it
+    // also carries `note`) is accepted, and the typed parse below drops what it does not name. A
+    // present `images: null` is refused: upstream tests `!== undefined`.
+    if let Some(images) = context_object.get("images") {
+        let Some(blocks) = images.as_array() else {
+            return Err(fail(format!(
+                "context.images must be an array, got {}",
+                describe_value(Some(images))
+            )));
+        };
+        for (index, image) in blocks.iter().enumerate() {
+            let valid = is_record(Some(image)).is_some_and(|map| {
+                map.get("type").and_then(Value::as_str) == Some("image")
+                    && map.get("data").is_some_and(Value::is_string)
+                    && map.get("mimeType").is_some_and(Value::is_string)
+            });
+            if !valid {
+                return Err(fail(format!(
+                    "context.images[{index}] must be an image block, got {}",
+                    describe_value(Some(image))
+                )));
+            }
+        }
     }
     let questions = context_object.get("questions");
     let Some(questions_object) = is_record(questions).filter(|map| !map.is_empty()) else {

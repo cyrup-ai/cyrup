@@ -563,7 +563,9 @@ async fn reports_provider_errors_as_results_and_invalid_arguments_as_exceptions(
         .await;
     assert!(no_state.contains("models.classify() context.state must be an object, got undefined."));
     assert!(no_state.contains("codemode.md"));
-    assert!(no_state.contains("Expected context: { state: { ... }, questions:"));
+    assert!(no_state.contains(
+        "Expected context: { state: { ... }, images?: [{ type: \"image\", data: <base64>, mimeType }], questions:"
+    ));
     assert!(
         rig.err(
             "models.classify",
@@ -706,6 +708,153 @@ async fn context_mistakes_never_reach_the_provider() {
     );
     assert!(rig.recorder.snapshot().calls.is_empty(), "no row either");
     assert!(rig.updates.lock().unwrap().is_empty());
+}
+
+/// CODE-023 — `context.images` is checked as upstream checks it (`execute.ts:129-142` @ce8972a0e),
+/// with upstream's two messages, after `state` and before `questions`, and the shape every message
+/// carries names the field (`:118-119`). Upstream's own case is `images: [{ data: "aW1hZ2U=" }]` →
+/// `models.classify() context.images[0] must be an image block, got { data }.`
+/// (`agent-session-codemode.test.ts`, the `textOnly`/`badClassifierImage` additions).
+///
+/// RED at the base: `images` was not read before the typed parse, so every case below failed with
+/// that parse's `could not be read: …` instead — except `[{ type: "text", text }]`, which parsed as a
+/// `Content::Text` "image" and reached the classifier — and the shape had no `images?`.
+#[tokio::test]
+async fn classifier_images_are_checked_with_upstreams_messages() {
+    let rig = rig();
+    let model = json!({ "provider": "scorer", "id": "judge" });
+    let image = json!({ "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" });
+    for (images, expected) in [
+        (json!("x"), "context.images must be an array, got a string"),
+        (json!(null), "context.images must be an array, got null"),
+        (
+            json!({ "type": "image" }),
+            "context.images must be an array, got { type }",
+        ),
+        (
+            json!([{ "type": "text" }]),
+            "context.images[0] must be an image block, got { type }",
+        ),
+        (
+            json!([{ "type": "text", "text": "a caption" }]),
+            "context.images[0] must be an image block, got { type, text }",
+        ),
+        (
+            json!([{ "data": "aW1hZ2U=" }]),
+            "context.images[0] must be an image block, got { data }",
+        ),
+        (
+            json!([image.clone(), { "type": "image", "data": "aW1hZ2U=" }]),
+            "context.images[1] must be an image block, got { type, data }",
+        ),
+        (
+            json!([image.clone(), { "type": "image", "data": 1, "mimeType": "image/png" }]),
+            "context.images[1] must be an image block, got { type, data, mimeType }",
+        ),
+        (
+            json!(["aW1hZ2U="]),
+            "context.images[0] must be an image block, got a string",
+        ),
+    ] {
+        let message = rig
+            .err(
+                "models.classify",
+                vec![
+                    model.clone(),
+                    json!({ "state": {}, "images": images, "questions": questions() }),
+                ],
+            )
+            .await;
+        assert!(
+            message.starts_with(&format!("models.classify() {expected}. Expected context: ")),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(&format!(". See \"Classify\" in {CODEMODE_DOCS_PATH}.")),
+            "{message}"
+        );
+    }
+    // Upstream's order: a bad `images` is reported before a missing `questions`.
+    let message = rig
+        .err(
+            "models.classify",
+            vec![model.clone(), json!({ "state": {}, "images": "x" })],
+        )
+        .await;
+    assert!(
+        message.starts_with("models.classify() context.images must be an array, got a string."),
+        "{message}"
+    );
+    // The shape the model reads advertises the field, where upstream puts it.
+    assert!(
+        message.contains(
+            "Expected context: { state: { ... }, images?: [{ type: \"image\", data: <base64>, mimeType }], questions: { <id>: "
+        ),
+        "{message}"
+    );
+    assert!(
+        rig.models.calls.lock().unwrap().is_empty(),
+        "no provider was called"
+    );
+    assert!(rig.recorder.snapshot().calls.is_empty(), "no row either");
+}
+
+/// CODE-023 — a valid image reaches the classifier's context as a `Content::Image`, and so does a
+/// `tools.read()` image block, whose `note` is not part of the context (upstream reads only `type`,
+/// `data` and `mimeType`). An empty array passes, as upstream's check passes it.
+///
+/// NON-REGRESSION GUARD, green at the base: `PROV-148` gave `ClassifierContext` its `images` field,
+/// and `check_classifier_context`'s typed parse has carried a script's images to the provider since.
+/// Red if the new check refused a valid block, or if the parse were replaced by one that drops them.
+#[tokio::test]
+async fn a_valid_image_reaches_the_classifiers_context() {
+    let rig = rig();
+    let model = json!({ "provider": "scorer", "id": "judge" });
+    let result = rig
+        .ok(
+            "models.classify",
+            vec![
+                model.clone(),
+                json!({
+                    "state": { "text": "good" },
+                    "images": [
+                        { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" },
+                        { "type": "image", "data": TINY_PNG, "mimeType": "image/png", "note": "[resized]" },
+                    ],
+                    "questions": questions(),
+                }),
+            ],
+        )
+        .await;
+    assert_eq!(result["stopReason"], "stop", "{result}");
+    rig.ok(
+        "models.classify",
+        vec![
+            model,
+            json!({ "state": { "text": "good" }, "images": [], "questions": questions() }),
+        ],
+    )
+    .await;
+    let contexts = rig.observed.classify_contexts.lock().unwrap().clone();
+    assert_eq!(
+        contexts
+            .iter()
+            .map(|c| c.images.clone())
+            .collect::<Vec<_>>(),
+        [
+            Some(vec![
+                Content::Image {
+                    data: "aW1hZ2U=".to_owned(),
+                    mime_type: "image/png".to_owned(),
+                },
+                Content::Image {
+                    data: TINY_PNG.to_owned(),
+                    mime_type: "image/png".to_owned(),
+                },
+            ]),
+            Some(Vec::new()),
+        ]
+    );
 }
 
 #[tokio::test]

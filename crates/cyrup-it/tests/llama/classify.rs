@@ -217,3 +217,91 @@ async fn classify_answers_from_the_routers_next_token_probabilities() {
         "the answer is read from ONE predicted token's probabilities"
     );
 }
+
+/// CODE-023 — a codemode script that sends an image to the llama.cpp classifier twin gets an error
+/// result, never an answer judged from `state` alone: the script's `models.classify()` (the global
+/// `cyrup-codemode-runtime` registers) over the same `Models` the host composes, with the real
+/// llama.cpp provider. The twin declares `input: ["text"]` (`provider.ts:102-` @f1b2e77f5, cyrup's
+/// `to_classifier_model`), so the model-level check (`assertClassifierInputSupported`,
+/// `utils/model-operations.ts:46-53`) answers before the `llama-cpp-classify` api's own `does not
+/// support image input` guard (`llama-cpp-classify.ts:437`) is reached — upstream's order, and the
+/// same error result upstream's script sees. Nothing is sent to the server.
+///
+/// NON-REGRESSION GUARD, green at the base: `PROV-148` landed the provider half, and the script's
+/// images reached `Models::classify` through the typed parse. Red if codemode dropped the images on
+/// the way (the classifier would then answer from `/completion`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_codemode_script_sending_an_image_to_the_llama_classifier_gets_an_error_result() {
+    use cyrup_codemode_runtime::tool::models::{CodemodeModels, models_globals};
+    use cyrup_codemode_runtime::tool::recorder::Recorder;
+    use cyrup_codemode_runtime::types::CodemodeToolContext;
+    use cyrup_core::{CancelToken, ToolCallId};
+
+    let fx = fixture();
+    let fake = router().await;
+    store_credential(&fx, fake.url(), Some(KEY));
+    let session = session(&fx, &Opts::default()).await;
+    assert!(refresh_llama(&session).await.is_empty());
+    let provider = session
+        .services()
+        .guest_providers
+        .provider(PROVIDER)
+        .unwrap();
+    let auth = session.services().auth.clone();
+    let mut models = create_models(CreateModelsOptions {
+        credentials: Some(auth.clone() as Arc<dyn CredentialStore>),
+        auth_context: Some(Arc::new(StoreAuthContext(auth))),
+        catalog_overlay: None,
+    });
+    models.set_provider(provider);
+
+    let recorder = Arc::new(Recorder::new(ToolCallId::from("call-1"), Box::new(|_| {})));
+    let globals = models_globals(
+        Arc::new(models) as Arc<dyn CodemodeModels>,
+        Arc::clone(&recorder),
+        "/opt/cyrup/docs/codemode.md",
+    );
+    let classify = globals
+        .iter()
+        .find(|global| global.declaration.name == "models.classify")
+        .unwrap();
+    let result = (classify.execute)(
+        Some(json!([
+            { "provider": PROVIDER, "id": "qwen3" },
+            {
+                "state": { "message": "Is the layout broken?" },
+                "images": [{ "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" }],
+                "questions": {
+                    "broken": {
+                        "type": "bool",
+                        "instructions": "Does the screenshot show a broken layout?",
+                        "criteria": { "true": "Broken", "false": "Clean" },
+                    },
+                },
+            },
+        ])),
+        CodemodeToolContext {
+            cancel: CancelToken::new(),
+        },
+    )
+    .await
+    .expect("a provider error is a result, not an exception")
+    .expect("a result value");
+
+    assert_eq!(result["stopReason"], "error", "{result}");
+    assert_eq!(
+        result["errorMessage"], "Model llama.cpp/qwen3 does not accept image input",
+        "{result}"
+    );
+    assert_eq!(
+        result["answers"],
+        json!({}),
+        "no answer was judged from `state` alone"
+    );
+    for path in ["/tokenize", "/apply-template", "/completion"] {
+        assert!(
+            fake.requests_to("POST", path).is_empty(),
+            "`POST {path}`: nothing was sent to the server"
+        );
+    }
+}

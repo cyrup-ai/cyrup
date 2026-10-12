@@ -131,7 +131,7 @@ The store is for small state such as IDs, cursors, or summaries. One value may h
 
 ## Models
 
-`models` reaches the model catalog and runs non-LLM models with the session's credentials: classifiers, which answer typed questions about JSON state, and image models, which generate images. Chat models are listed but cannot be run from scripts. Classifier models come from [llama.cpp](guide/llama-cpp.md#classifier-models), where every model the router lists is also a classifier model, and from six hosted providers: `typesafe` lists TypeSafe's `jev-latest` for a `TYPESAFE_API_KEY`; `openai` lists `gpt-6-luna` (OpenAI's Decisions API) for an `OPENAI_API_KEY` credential but not for Sign in with ChatGPT, whose tokens that API rejects; `openrouter` lists the decision models OpenRouter serves, such as `typesafe/jev-1.13`; `cloudflare-workers-ai` lists `typesafe/jev`, `@cf/cloudflare/clef` and `@cf/cloudflare/clef-flash` for `CLOUDFLARE_API_KEY` with `CLOUDFLARE_ACCOUNT_ID`; `vercel-ai-gateway` lists AI Gateway's evaluation models, such as `typesafe-ai/jev`; and `opencode` lists `jev-1.13` and `jev-1.13-free`; image models come from the `openrouter` provider and need OpenRouter credentials. Catalog entries carry no `headers`.
+`models` reaches the model catalog and runs non-LLM models with the session's credentials: classifiers, which answer typed questions about JSON state and, for some models, images, and image models, which generate images. Chat models are listed but cannot be run from scripts. Classifier models come from [llama.cpp](guide/llama-cpp.md#classifier-models), where every model the router lists is also a classifier model, and from six hosted providers: `typesafe` lists TypeSafe's `jev-latest` for a `TYPESAFE_API_KEY`; `openai` lists `gpt-6-luna` (OpenAI's Decisions API) for an `OPENAI_API_KEY` credential but not for Sign in with ChatGPT, whose tokens that API rejects; `openrouter` lists the decision models OpenRouter serves, such as `typesafe/jev-1.13`; `cloudflare-workers-ai` lists `typesafe/jev`, `@cf/cloudflare/clef` and `@cf/cloudflare/clef-flash` for `CLOUDFLARE_API_KEY` with `CLOUDFLARE_ACCOUNT_ID`; `vercel-ai-gateway` lists AI Gateway's evaluation models, such as `typesafe-ai/jev`; and `opencode` lists `jev-1.13` and `jev-1.13-free`; image models come from the `openrouter` provider and need OpenRouter credentials. Catalog entries carry no `headers`.
 
 The `codemode` description points the model at this page. A cyrup binary carries a copy of it and writes that copy to `docs/codemode.md` under the agent directory when a session starts (replacing a copy an older build left there), so the path the model reads exists wherever cyrup is installed. That copy is outside the project, so under a permission policy a `read` of exactly that file skips the `external_directory` rule (the `read` rule still applies); every other path outside the project is gated as usual. The same goes for the spill files below: a `read` of exactly the `pi-codemode-*` file that a result names skips `external_directory`, in a script and for the model alike.
 
@@ -174,6 +174,8 @@ Model IDs differ between providers, and one model can be listed by several. Use 
 interface ClassifierContext {
   /** The data to classify. */
   state: Record<string, unknown>;
+  /** Images judged together with `state`. Only models whose `input` includes "image" accept them. */
+  images?: { type: "image"; data: string; mimeType: string }[];
   /** Questions by ID. One call answers all of them. */
   questions: Record<string, ClassifierQuestion>;
 }
@@ -235,6 +237,24 @@ return results.map((result, i) =>
     ? { message: messages[i], sentiment: result.answers.sentiment.choice, urgency: result.answers.urgency.score }
     : { message: messages[i], error: result.errorMessage },
 );
+```
+
+Classifiers whose `input` includes `"image"` also judge images. `tools.read()` returns an image file as an image block that `images` accepts. Other classifiers return an error result when `images` is not empty.
+
+```js
+const luna = await models.getModelOfType("classifier", "openai", "gpt-6-luna");
+const photo = await tools.read({ path: "screenshot.png" });
+const result = await models.classify(luna, {
+  state: { task: "Settings page redesign" },
+  images: [photo],
+  questions: {
+    broken: {
+      type: "bool",
+      instructions: "Does the screenshot show a broken layout?",
+      criteria: { true: "Overlapping, cut-off, or misaligned elements", false: "Clean layout" },
+    },
+  },
+});
 ```
 
 ### Generate images
