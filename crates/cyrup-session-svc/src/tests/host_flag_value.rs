@@ -190,3 +190,123 @@ async fn an_unregistered_flag_reads_none() {
 
     assert_eq!(answers, vec!["None"]);
 }
+
+/// A second native in the same session: it declares `neighbour-token` and `probe-path` (a conflict
+/// loser — `flag-reader` loads first and owns the CLI side of it), and answers `/neighbourflag
+/// <name>` through the handle the builder bound to IT.
+struct Neighbour {
+    services: OnceLock<Arc<dyn HostServices>>,
+}
+
+#[async_trait::async_trait]
+impl NativeExtension for Neighbour {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("neighbour")
+    }
+
+    fn set_host_services(&self, services: Arc<dyn HostServices>) {
+        let _ = self.services.set(services);
+    }
+
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.register_flag(
+            "neighbour-token",
+            json!({"type": "string", "default": "neighbour-default"}),
+        );
+        api.register_flag("probe-path", json!({"type": "string"}));
+        api.register_command(
+            "neighbourflag",
+            CommandDescriptor {
+                description: "report a flag's value".into(),
+                completions: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+
+    async fn execute_command(
+        &self,
+        _name: &str,
+        args: &str,
+        _ctx: &HostCtx,
+    ) -> Result<Option<String>, ExtError> {
+        let services = self
+            .services
+            .get()
+            .ok_or_else(|| ExtError::Component("no host services were bound".into()))?;
+        Ok(Some(format!("{:?}", services.flag_value(args.trim()))))
+    }
+}
+
+/// Run each `/command flag` of `reads` in a session holding `flag-reader` and `neighbour`, whose
+/// CLI set `--probe-switch` (a flag only `flag-reader` declared, so it has a value to leak).
+async fn read_flags_of_two(reads: &[&str]) -> Vec<String> {
+    let fx = fixture();
+    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
+    cfg.trust_override = Some(true);
+    cfg.no_extensions = true;
+    cfg.extension_flag_values = [("probe-switch".to_string(), ExtensionFlagValue::Bool(true))]
+        .into_iter()
+        .collect();
+    let session = SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
+        .with_native_extension(Arc::new(FlagReader {
+            services: OnceLock::new(),
+        }))
+        .with_native_extension(Arc::new(Neighbour {
+            services: OnceLock::new(),
+        }))
+        .build()
+        .await
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+    session.services().host_services.set_ui_effect_sink(tx);
+
+    let mut answers = Vec::new();
+    for read in reads {
+        let _ = session.prompt(format!("/{read}")).await.unwrap();
+        session.wait_for_idle().await;
+        answers.push(drain_one(&mut rx));
+    }
+    answers
+}
+
+/// EXT-105, THE ROW'S VERIFY, in both directions: a native reading a flag only the other native
+/// declared gets `None` (pi `getFlag`, `if (!extension.flags.has(name)) return undefined`,
+/// `core/extensions/loader.ts:376` @f1b2e77f5), while each still reads its own — the positive
+/// controls, without which a gate that refused everything would pass. RED at the base: the builder
+/// bound both natives to the one session backend, so each read the other's flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_native_does_not_read_a_flag_only_another_extension_declared() {
+    let answers = read_flags_of_two(&[
+        "readflag probe-switch",
+        "readflag neighbour-token",
+        "neighbourflag neighbour-token",
+        "neighbourflag probe-switch",
+    ])
+    .await;
+
+    assert_eq!(
+        answers,
+        vec![
+            "Some(Bool(true))",
+            "None",
+            r#"Some(String("neighbour-default"))"#,
+            "None",
+        ]
+    );
+}
+
+/// A conflict LOSER declared the flag too, so it reads it: pi sets the loser's own
+/// `extension.flags` and only the CLI side resolves the conflict, and `getFlag` reads the one
+/// shared `runtime.flagValues` — here the winner's default. NON-REGRESSION GUARD, green at the base
+/// (nothing was gated); red if the gate keyed on the flag's CLI owner instead of the declaration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conflict_loser_reads_the_flag_it_declared() {
+    let answers = read_flags_of_two(&["neighbourflag probe-path"]).await;
+
+    assert_eq!(answers, vec![r#"Some(String("from-default"))"#]);
+}

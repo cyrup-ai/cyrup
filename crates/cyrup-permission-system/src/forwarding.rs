@@ -44,9 +44,12 @@ use serde::{Deserialize, Serialize};
 
 use cyrup_ext::{HostServices, NotifyKind};
 use cyrup_ext_subagents::background::async_retention::machine_hostname;
-use cyrup_ext_subagents::background::reconcile::{Liveness, check_pid_liveness_probing_zombie};
+use cyrup_ext_subagents::background::reconcile::{
+    Liveness, check_pid_liveness_probing_zombie, current_pid_namespace_scope,
+};
 use cyrup_ext_subagents::background::session_lease::{
-    ProcessStartIdentity, process_demonstrably_gone, process_start_identity, runtime_start_identity,
+    OwnerStamp, ProcessStartIdentity, owner_demonstrably_gone, process_start_identity,
+    runtime_start_identity,
 };
 use cyrup_ext_subagents::{
     CONTROL_INBOX_POLL_INTERVAL, validate_contains_root, validate_safe_token,
@@ -706,10 +709,23 @@ pub fn resolve_child_wait_timeout() -> Duration {
 /// `requests` and `responses` directories. See [`mark_session_unattended`].
 const UNATTENDED_MARKER_FILE_NAME: &str = "no-ui";
 
-/// How many entries of the spool's `sessions` directory one [`mark_session_unattended`] sweep looks
-/// at when it removes the markers of roots that are gone. A bound, not a quota: the sweep runs on
-/// every headless start, so a spool that outgrew it is worked down a bound at a time.
+/// How many markers one [`mark_session_unattended`] sweep judges when it removes the markers of roots
+/// that are gone. A bound, not a quota: the sweep runs on every headless start, and judging a marker
+/// is the expensive part (a file read and parse, `kill(2)`, a `/proc` read), so it bounds what a
+/// spool full of markers adds to a headless start; a spool that outgrew it is worked down a bound
+/// at a time, because every marker judged gone is removed.
+///
+/// Only entries that hold a marker count against it (PERM-045(c)): a session root without one (a
+/// UI session's inbox, a child's request in flight) is never removed by the sweep, so counting it
+/// let such entries, first in directory order, keep the sweep from ever reaching a marker.
 const UNATTENDED_SWEEP_LIMIT: usize = 256;
+
+/// How many entries of the spool's `sessions` directory one sweep looks at, markers or not: one
+/// `lstat` each for an entry without a marker. Bounds the walk itself, since a spool keeps one
+/// directory per session whose inbox outlived it (upstream's spool, not this marker's). Past it, a
+/// marker of a gone root is left for a later sweep or a UI that resumes its session; it is litter,
+/// not a wrong answer, because every reader judges the writer itself.
+const UNATTENDED_SWEEP_SCAN_LIMIT: usize = 16_384;
 
 /// What a `no-ui` marker says: this root process, and no other, has the session and no UI.
 ///
@@ -730,6 +746,11 @@ struct UnattendedMarker {
     #[serde(default)]
     process_start_identity: Option<ProcessStartIdentity>,
     hostname: String,
+    /// The writer's PID namespace (`readlink /proc/self/ns/pid`, PERM-045(a)): a reader in another
+    /// one cannot see the writer's pid, so it cannot prove the writer gone. Absent off Linux, and in
+    /// a marker an earlier build wrote, which is then probed as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid_namespace_scope: Option<String>,
 }
 
 impl UnattendedMarker {
@@ -745,36 +766,60 @@ impl UnattendedMarker {
             process_start_identity: process_start_identity(pid)
                 .or_else(|| Some(runtime_start_identity())),
             hostname: machine_hostname(),
+            pid_namespace_scope: current_pid_namespace_scope(),
         }
     }
 
     /// Whether the process that wrote this is demonstrably gone, so that the statement no longer
-    /// describes anything. Positive evidence only, as for a lease (`demonstrably_stale`): another
-    /// machine's pid table says nothing about this one's, and an inconclusive probe is not death.
-    /// A wrong "alive" costs a refusal that the UI which resumes the session withdraws; a wrong
-    /// "gone" costs the child a wait it was spared.
+    /// describes anything. Positive evidence only, and by the session lease's own verdict
+    /// (`owner_demonstrably_gone`, the first rungs of `demonstrably_stale`, one implementation):
+    /// another machine's pid table, or another PID namespace's, says nothing about the writer's, and
+    /// an inconclusive probe is not death. A wrong "alive" costs a refusal that the UI which resumes
+    /// the session withdraws; a wrong "gone" costs the child a wait it was spared, and lets a sweep
+    /// remove the marker of a root that is still there.
     ///
-    /// Both probes are injected, as in the lease, so a test can present a recycled pid.
-    fn writer_is_gone(
-        &self,
-        hostname: &str,
-        liveness: fn(u32) -> Liveness,
-        start_identity_of: fn(u32) -> Option<ProcessStartIdentity>,
-    ) -> bool {
-        if self.hostname != hostname {
-            return false;
-        }
+    /// The reader's host and namespace and both probes are injected, as in the lease, so a test can
+    /// present a foreign namespace or a recycled pid.
+    fn writer_is_gone(&self, reader: &MarkerReader) -> bool {
         // `kill(2)` reads 0 and a negative number as a process group, which is always there: not a
-        // pid a root of ours ever had, so not a writer that is alive.
+        // pid a root of ours ever had, so not a writer that is alive. Asked before the host and
+        // namespace rungs, because such a pid names no process on any host.
         if !i32::try_from(self.pid).is_ok_and(|pid| pid > 0) {
             return true;
         }
-        process_demonstrably_gone(
-            self.pid,
-            self.process_start_identity.as_ref(),
-            liveness,
-            start_identity_of,
+        owner_demonstrably_gone(
+            &OwnerStamp {
+                pid: self.pid,
+                start_identity: self.process_start_identity.as_ref(),
+                hostname: &self.hostname,
+                pid_namespace_scope: self.pid_namespace_scope.as_deref(),
+            },
+            &reader.hostname,
+            reader.pid_namespace_scope.as_deref(),
+            reader.liveness,
+            reader.start_identity_of,
         )
+    }
+}
+
+/// Where a marker is read from: the reader's host and PID namespace, and the two probes. Injected so
+/// a test can present another host, another namespace or a recycled pid.
+struct MarkerReader {
+    hostname: String,
+    pid_namespace_scope: Option<String>,
+    liveness: fn(u32) -> Liveness,
+    start_identity_of: fn(u32) -> Option<ProcessStartIdentity>,
+}
+
+impl MarkerReader {
+    /// This process, with the production probes.
+    fn here() -> Self {
+        Self {
+            hostname: machine_hostname(),
+            pid_namespace_scope: current_pid_namespace_scope(),
+            liveness: root_liveness,
+            start_identity_of: process_start_identity,
+        }
     }
 }
 
@@ -840,9 +885,8 @@ fn write_unattended_marker(
     prune_unattended_markers(
         default_agent_dir,
         UNATTENDED_SWEEP_LIMIT,
-        &machine_hostname(),
-        root_liveness,
-        process_start_identity,
+        UNATTENDED_SWEEP_SCAN_LIMIT,
+        &MarkerReader::here(),
         audit,
     );
     if !ensure_directory_exists(
@@ -861,19 +905,23 @@ fn write_unattended_marker(
 }
 
 /// Remove the `no-ui` markers of roots that are gone from the spool's session roots, and the roots
-/// they leave empty (a root holding a request keeps its directories). Looks at no more than `limit`
-/// entries of the `sessions` directory; one that is not a directory, holds no marker or holds the
-/// marker of a live root is left as it is.
+/// they leave empty (a root holding a request keeps its directories). Judges no more than `limit`
+/// markers and looks at no more than `scan_limit` entries of the `sessions` directory; an entry that
+/// is not a directory or holds no marker is passed over without counting against `limit`
+/// (PERM-045(c)), and one that holds the marker of a live root is left as it is.
 ///
 /// Best effort, like every cleanup in this file: a marker that cannot be removed is warned about
-/// and judged again by the next sweep, and one that another process replaces between the read and
-/// the removal costs that root's children one wait, never a wrong answer to a question.
+/// and judged again by the next sweep. A marker that another process replaces between the read and
+/// the removal is not removed: the file is read again just before the removal and removed only if
+/// it still holds the bytes that were judged. A replacement that lands between that second read
+/// and the `unlink` (two system calls apart) still costs that root's children one wait each until
+/// the root's process with a UI, if any, settles the session again; no platform offers an
+/// "unlink if unchanged".
 fn prune_unattended_markers(
     default_agent_dir: &Path,
     limit: usize,
-    hostname: &str,
-    liveness: fn(u32) -> Liveness,
-    start_identity_of: fn(u32) -> Option<ProcessStartIdentity>,
+    scan_limit: usize,
+    reader: &MarkerReader,
     audit: Option<&AuditTrail>,
 ) {
     let sessions_dir =
@@ -881,19 +929,31 @@ fn prune_unattended_markers(
     let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
         return;
     };
-    for entry in entries.flatten().take(limit) {
+    let mut judged = 0;
+    for entry in entries.flatten().take(scan_limit) {
+        if judged >= limit {
+            break;
+        }
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
         let location = location_at(entry.path());
         let marker_path = location.session_root.join(UNATTENDED_MARKER_FILE_NAME);
-        let gone = match read_unattended_marker(&marker_path) {
-            Some(marker) => marker.writer_is_gone(hostname, liveness, start_identity_of),
-            // Present but not one of ours (an earlier build's, which never stamped a writer): the
-            // defect itself, so it goes too. Absent: nothing to prune.
-            None => marker_path.is_file(),
+        // One `lstat` for an entry that cannot hold a marker; it does not count.
+        if std::fs::symlink_metadata(&marker_path).is_err() {
+            continue;
+        }
+        judged += 1;
+        let Ok(bytes) = std::fs::read(&marker_path) else {
+            continue;
         };
-        if gone {
+        let gone = match serde_json::from_slice::<UnattendedMarker>(&bytes) {
+            Ok(marker) => marker.writer_is_gone(reader),
+            // Present but not one of ours (an earlier build's, which never stamped a writer): the
+            // defect itself, so it goes too.
+            Err(_) => true,
+        };
+        if gone && std::fs::read(&marker_path).is_ok_and(|now| now == bytes) {
             safe_delete_file(
                 &marker_path,
                 "permission forwarding unattended marker",
@@ -902,6 +962,15 @@ fn prune_unattended_markers(
             cleanup_location_if_empty(&location, audit);
         }
     }
+}
+
+/// Whether a `no-ui` marker (or anything in its place) is there for `session_id`: one `lstat`, so a
+/// process with a UI can ask it on every turn (PERM-044).
+#[must_use]
+pub fn session_has_unattended_marker(default_agent_dir: &Path, session_id: &str) -> bool {
+    forwarding_location(default_agent_dir, session_id).is_ok_and(|location| {
+        std::fs::symlink_metadata(location.session_root.join(UNATTENDED_MARKER_FILE_NAME)).is_ok()
+    })
 }
 
 /// Withdraw [`mark_session_unattended`]'s marker, for a session that has a UI after all, whichever
@@ -930,28 +999,20 @@ pub fn clear_session_unattended(
 /// that session for an answer.
 #[must_use]
 pub fn session_is_unattended(default_agent_dir: &Path, session_id: &str) -> bool {
-    session_is_unattended_with(
-        default_agent_dir,
-        session_id,
-        &machine_hostname(),
-        root_liveness,
-        process_start_identity,
-    )
+    session_is_unattended_with(default_agent_dir, session_id, &MarkerReader::here())
 }
 
-/// [`session_is_unattended`] with the host and both probes named.
+/// [`session_is_unattended`] with the reader named.
 fn session_is_unattended_with(
     default_agent_dir: &Path,
     session_id: &str,
-    hostname: &str,
-    liveness: fn(u32) -> Liveness,
-    start_identity_of: fn(u32) -> Option<ProcessStartIdentity>,
+    reader: &MarkerReader,
 ) -> bool {
     let Ok(location) = forwarding_location(default_agent_dir, session_id) else {
         return false;
     };
     read_unattended_marker(&location.session_root.join(UNATTENDED_MARKER_FILE_NAME))
-        .is_some_and(|marker| !marker.writer_is_gone(hostname, liveness, start_identity_of))
+        .is_some_and(|marker| !marker.writer_is_gone(reader))
 }
 
 #[cfg(test)]

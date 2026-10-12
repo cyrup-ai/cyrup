@@ -337,11 +337,10 @@ impl ProcessTerminalAnnouncingCompletionObserver {
         let Some(pid) = status.pid else {
             return true;
         };
-        if status
-            .pid_namespace_scope
-            .as_deref()
-            .is_some_and(|recorded| current_pid_namespace_scope().as_deref() != Some(recorded))
-        {
+        if crate::background::reconcile::pid_namespace_scope_differs(
+            status.pid_namespace_scope.as_deref(),
+            current_pid_namespace_scope().as_deref(),
+        ) {
             return true;
         }
         check_pid_liveness(pid) != Liveness::Dead

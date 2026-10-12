@@ -9,6 +9,7 @@
 //! timeout, or OOM is mapped to a typed `ExtError` and surfaced — the host never crashes
 //! (R-08-036).
 
+pub mod caller_scoped;
 pub mod engine;
 pub mod epoch;
 pub mod limits;
@@ -20,6 +21,7 @@ pub mod services;
 pub mod store_state;
 pub mod testkit;
 
+pub use caller_scoped::CallerScopedServices;
 pub use engine::{build_engine, build_engine_on_demand, build_engine_or_on_demand, map_wasm_error};
 pub use epoch::EpochDriver;
 pub use limits::StoreLimits;

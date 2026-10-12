@@ -2137,3 +2137,147 @@ fn a_ui_withdraws_a_no_ui_marker_whose_writer_is_still_running() {
         std::fs::write(marker, written.to_string()).unwrap();
     });
 }
+
+/// PERM-044, with the real binary: two live processes on one session file. A process with a UI
+/// (rpc, resuming a session a first headless run made) runs a turn, which settles its session; a
+/// second headless `-p -c` run then starts on the same
+/// session file while the rpc process is still running, and leaves a `no-ui` marker. Its writer is
+/// made a process that is still running (this test), as it is while a headless run lasts. The rpc
+/// process's next turn must put its subagent child's question to the person, not refuse it.
+#[test]
+fn a_ui_withdraws_a_no_ui_marker_a_headless_run_left_on_its_session_mid_session() {
+    let persona = "---\nname: scriptor\ndescription: runs commands\ntools: bash\nextensions:\n---\n\nYou run commands.\n";
+    let policy = json!({
+        "defaultPolicy": { "tools": "ask", "bash": "ask", "mcp": "ask", "skills": "ask", "special": "ask" },
+        "tools": { "subagent": "allow", "read": "allow" },
+    })
+    .to_string();
+    let home = Home::new();
+    let env = [
+        ("CYRUP_SUBAGENTS", "1"),
+        ("CYRUP_PERMISSION_FORWARDING_TIMEOUT_MS", "8000"),
+    ];
+
+    // A first headless run makes the session file (an rpc process writes none of its own) and
+    // leaves a marker of a writer that has exited.
+    let first = Wire::turns(vec![Turn::text("headless done")])
+        .args(&["--tools", "read,subagent", "-c"])
+        .agent_files(&[(POLICY_FILE, &policy)])
+        .files(&[(".cyrup/agents/scriptor.md", persona)])
+        .env(&env)
+        .persist()
+        .run_in(&home);
+    assert_eq!(first.code, 0, "{}", first.context());
+
+    let (cmd, server) = Wire::turns(vec![
+        Turn::text("first turn done"),
+        Turn::Tools(vec![(
+            "subagent".to_owned(),
+            json!({ "agent": "scriptor", "task": "run a command", "async": false }),
+        )]),
+        Turn::Tools(vec![(
+            "bash".to_owned(),
+            json!({ "command": "echo from-child" }),
+        )]),
+        Turn::text("CHILD-ANSWER done"),
+        Turn::text("parent done"),
+    ])
+    .args(&["--mode", "rpc", "--tools", "read,subagent", "-c"])
+    .env(&env)
+    .persist()
+    .command(&home, false);
+    let mut rpc = Lines::spawn(cmd);
+    rpc.send(&json!({ "type": "prompt", "message": "hello", "id": "p1" }));
+    rpc.wait_for_frame("the first turn to end", Duration::from_secs(30), |f| {
+        f["type"] == "agent_end"
+    });
+    rpc.send(&json!({ "type": "get_state", "id": "s1" }));
+    let state = rpc.wait_for_frame("the rpc session's state", Duration::from_secs(30), |f| {
+        f["type"] == "response" && f["command"] == "get_state"
+    });
+    let session_id = state["data"]["sessionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!session_id.is_empty(), "{state}");
+    let left: Vec<String> = no_ui_markers(&home)
+        .iter()
+        .map(|marker| std::fs::read_to_string(marker).unwrap_or_default())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the process with the UI settled its session {session_id}: {left:?}"
+    );
+    // The headless run, on the same session file, while the rpc process runs.
+    let headless = Wire::turns(vec![Turn::text("headless done")])
+        .args(&["--tools", "read,subagent", "-c"])
+        .env(&env)
+        .persist()
+        .run_in(&home);
+    assert_eq!(headless.code, 0, "{}", headless.context());
+    // The headless run pointed the home's model catalogue at its own server; the rpc process's
+    // subagent child reads it afresh, so point it back.
+    server.write_models_json(&home.agent_dir);
+    let markers = no_ui_markers(&home);
+    assert_eq!(
+        markers.len(),
+        1,
+        "the headless run says it has no UI: {markers:?}"
+    );
+    let mut written: Value = serde_json::from_slice(&std::fs::read(&markers[0]).unwrap()).unwrap();
+    assert_eq!(
+        written["sessionId"], session_id,
+        "the premise: the headless run continued the rpc process's session"
+    );
+    written["pid"] = json!(std::process::id());
+    written["processStartIdentity"] = Value::Null;
+    std::fs::write(&markers[0], written.to_string()).unwrap();
+
+    rpc.send(&json!({ "type": "prompt", "message": "go", "id": "p2" }));
+    let frame = rpc.wait_for_frame(
+        "the dialog for the child's question, or the end of the run",
+        Duration::from_secs(30),
+        |f| {
+            (f["type"] == "extension_ui_request" && f["method"] == "select")
+                || f["type"] == "agent_end"
+        },
+    );
+    assert_eq!(
+        frame["type"],
+        "extension_ui_request",
+        "the child's question was not put to the person: the marker refused it\n{}",
+        rpc.dump()
+    );
+    let title = frame["title"].as_str().unwrap();
+    assert!(
+        title.contains("Subagent 'scriptor' requested permission")
+            && title.contains("echo from-child"),
+        "{title}"
+    );
+    rpc.send(&json!({
+        "type": "extension_ui_response", "id": frame["id"], "value": "Allow Once",
+    }));
+    rpc.wait_for_frame("the run to end", Duration::from_secs(30), |f| {
+        f["type"] == "agent_end"
+    });
+    let requests = server.requests();
+    let child_result = requests
+        .get(3)
+        .and_then(|request| request["messages"].as_array())
+        .and_then(|messages| messages.iter().rev().find(|m| m["role"] == "tool"))
+        .map(|m| content_text(&m["content"]))
+        .unwrap_or_default();
+    assert!(
+        child_result.contains("from-child"),
+        "the child's bash ran once the person allowed it: {child_result}\n{}",
+        rpc.dump()
+    );
+    let left: Vec<String> = no_ui_markers(&home)
+        .iter()
+        .map(|marker| std::fs::read_to_string(marker).unwrap_or_default())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the process with the UI withdrew the marker: {left:?} (rpc session {session_id})"
+    );
+}
