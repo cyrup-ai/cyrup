@@ -175,16 +175,18 @@ fn attach_native_extensions(
     //
     // The script reference the description points at is embedded in the binary and written under
     // the agent directory, because an installed binary has no `docs/` next to it.
-    //
-    // `-e builtin:codemode` attaches it but cannot keep it under `--no-extensions`: its ambient
-    // tier is fixed in `cyrup-codemode-runtime`, which has no explicit-load constructor.
     if builtins.attaches(cyrup_codemode_runtime::EXTENSION_ID) {
+        let ext = cyrup_codemode_runtime::CodemodeExtension::new(
+            cyrup_codemode_runtime::tool::CodemodeHostSlot::new(),
+            codemode_sandbox_factory(),
+        )
+        .with_agent_dir(agent_dir);
         builder = builder.with_codemode(
-            cyrup_codemode_runtime::CodemodeExtension::new(
-                cyrup_codemode_runtime::tool::CodemodeHostSlot::new(),
-                codemode_sandbox_factory(),
-            )
-            .with_agent_dir(agent_dir),
+            if builtins.is_explicit(cyrup_codemode_runtime::EXTENSION_ID) {
+                ext.loaded_explicitly()
+            } else {
+                ext
+            },
         );
     }
     // `tool_search` follows it (`extensions/index.ts:12` @v1.0.1): registered inactive and
@@ -2615,7 +2617,13 @@ mod tests {
                 "--no-extensions drops {id}; got {bare:?}"
             );
         }
-        for id in [LLAMA_ID, cyrup_tool_search::EXTENSION_ID, MCP_ID] {
+        // EXT-112: codemode too, which `-ne` dropped even when `-e builtin:codemode` named it.
+        for id in [
+            LLAMA_ID,
+            cyrup_codemode_runtime::EXTENSION_ID,
+            cyrup_tool_search::EXTENSION_ID,
+            MCP_ID,
+        ] {
             let path = format!("builtin:{id}");
             let run = launch_with_builtins(None, true, &[&path]).await;
             let loaded = &run.loaded;

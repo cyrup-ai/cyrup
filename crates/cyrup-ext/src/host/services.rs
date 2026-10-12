@@ -1003,9 +1003,13 @@ pub trait HostServices: Send + Sync {
     /// applied once every extension has loaded, so during `init` only the default is visible, as in
     /// pi (`runtime.flagValues` is filled after the load).
     ///
-    /// Unlike pi's per-extension `getFlag`, the answer is not scoped to the flags the CALLER
-    /// registered: the backend has no notion of who is asking, so any registered flag name reads.
-    /// The value is the same one the CLI printed in `--help`, so nothing secret is exposed.
+    /// Scoped to the CALLER's own flags, as pi's per-extension `getFlag` is (`:368`,
+    /// `if (!extension.flags.has(name)) return undefined;`). A backend has no notion of who is
+    /// asking, so the gate is not here: a native is handed the session's backend through a
+    /// [`crate::host::CallerScopedServices`] fixed to its own [`ExtensionId`], which answers `None`
+    /// for a flag that extension did not declare (EXT-105). A conflict loser did declare its flag,
+    /// and reads the shared value, as in pi. A backend implementation answers for any registered
+    /// flag name; only the scoped handle is what a native sees.
     ///
     /// Synchronous: a lock-and-clone of the registry, nothing awaited. The default has no registry
     /// to read, so it answers `None`.
