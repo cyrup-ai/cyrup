@@ -369,7 +369,11 @@ re-evaluating acceptance does not re-run a passing command, and evaluation can b
 ## `bg_wait`
 
 `bg_wait` blocks until background runs finish. `id` waits for one run, `all` waits for every run that
-was in flight when the wait began, and `timeoutMs` bounds it (30 minutes by default). It is gated by
+was in flight when the wait began, and `timeoutMs` bounds it (30 minutes by default). A steer or
+follow-up the operator sends while a blocking wait is open also ends it, with a non-error `user_input`
+result listing the still-active work, so the turn does not sit out the window. A steer reaches the
+model on its next request; a follow-up is delivered once the turn ends, so waiting again holds it
+back. It is gated by
 `waitTool` in `config.json` and by `CYRUP_SUBAGENT_WAIT_TOOL_ENABLED`; an unrecognised value for that
 variable is a hard configuration error rather than a silent default.
 

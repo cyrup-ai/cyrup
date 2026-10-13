@@ -545,9 +545,10 @@ pub fn build_watchdog_system_prompt(cwd: &str, has_scope: bool) -> String {
     ];
     if has_scope {
         lines.push(
-            "When the review input includes a Current scope block, treat newer scope prompts as \
-             superseding/mutating older prompts and use category='scope-drift' for work that serves \
-             no current scope item."
+            // The pin's line (`review.ts:230` @ad11b7ab, `6c1af3a2`); see `scope.rs`'s render for
+            // why `SUBA-198` needs it. The category instruction lives in the scope block itself.
+            "Use the Current scope record alongside supplied activity evidence; an unrelated user \
+             question does not cancel older authorized work."
                 .to_string(),
         );
     }
@@ -1321,18 +1322,22 @@ mod tests {
     #[test]
     fn the_system_prompt_includes_the_scope_line_only_when_there_is_scope() {
         let without = build_watchdog_system_prompt("/repo", false);
-        assert!(!without.contains("Current scope block"));
+        assert!(!without.contains("Use the Current scope record"));
         assert!(without.contains("Working directory: /repo"));
         assert_eq!(without.lines().count(), 9);
         let with = build_watchdog_system_prompt("/repo", true);
-        assert!(with.contains("use category='scope-drift'"));
+        // The pin's line (`review.ts:230` @ad11b7ab), verbatim.
+        assert!(with.contains(
+            "Use the Current scope record alongside supplied activity evidence; an unrelated user \
+             question does not cancel older authorized work."
+        ));
         assert_eq!(with.lines().count(), 10);
         // The scope line sits fourth, immediately after the review-scope instruction.
         assert!(
             with.lines()
                 .nth(3)
                 .unwrap()
-                .starts_with("When the review input includes")
+                .starts_with("Use the Current scope record")
         );
     }
 

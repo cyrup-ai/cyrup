@@ -429,6 +429,12 @@ impl NativeExtension for SubagentsExtension {
                     // @v0.76.1): tree navigation re-decides the loader selection from the branch
                     // it lands on.
                     cyrup_ext::EventKind::SessionTree,
+                    // SUBA-192 / SUBA-198 — pi's two `input` listeners, `wait-tool.ts:32` and
+                    // `register-main.ts:406` @ad11b7ab: a steer or follow-up the operator sends
+                    // while the agent streams ends any open `bg_wait` and joins the main watchdog's
+                    // scope record. Queued onto the live run, such a message never reaches
+                    // `before_agent_start`, so this is the only edge either can see it on.
+                    cyrup_ext::EventKind::Input,
                     // R-SA-132/134 — the packaged-resources contribution. Upstream declares it
                     // statically in `package.json`'s `pi` block (`"skills": ["./skills"]`,
                     // `"prompts": ["./prompts"]`, `pi-subagents/package.json:52-62` @v0.34.0), which
@@ -1032,6 +1038,26 @@ impl NativeExtension for SubagentsExtension {
                     "skillPaths": skill_paths,
                     "promptPaths": prompt_paths,
                 })));
+            }
+            // SUBA-192 / SUBA-198 — pi's two `input` listeners, here one arm feeding both
+            // consumers. Each asks the same rule, `crate::mid_run_input::admits`, whether this is
+            // the operator talking to a busy agent; neither re-derives it.
+            //
+            // Observe-only, as both upstream listeners return nothing: the arm falls through to
+            // `Noop`, so the message is queued exactly as sent. Synchronous on purpose — it runs
+            // inside the host's `input` dispatch, ahead of the message being queued, under the
+            // dispatcher's handler budget.
+            HostEvent::Input {
+                text,
+                source,
+                streaming_behavior,
+                ..
+            } => {
+                self.executor
+                    .user_input_waits()
+                    .on_input(*source, *streaming_behavior);
+                self.watchdog
+                    .handle_user_input(text, *source, *streaming_behavior);
             }
             _ => {}
         }

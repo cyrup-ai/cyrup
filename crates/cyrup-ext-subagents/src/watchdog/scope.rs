@@ -6,8 +6,9 @@
 //! session, newest last, bounded three ways (`:3-5`) — at most 8 entries, each at most 2 000
 //! characters, and at most 16 000 characters in total. [`WatchdogScopeArtifact::render`] turns it
 //! into the "Current scope:" block `runtime.ts:820` prepends to the review input, whose second
-//! paragraph is the instruction that makes newer prompts SUPERSEDE older ones and tells the
-//! reviewer to file anything serving no current scope item as `scope-drift`.
+//! paragraph tells the reviewer how to read it — side questions add to the record, only an
+//! explicit change supersedes — and to file unauthorized work as `scope-drift`. That paragraph
+//! is the pin's (`scope.ts:35` @ad11b7ab), not v0.43.0's.
 //!
 //! Only REAL user prompts enter it. `runtime.ts:315-318` adds a prompt only when the turn is not an
 //! auto-follow turn, so the watchdog's own synthetic follow-up text can never widen the scope it is
@@ -92,7 +93,7 @@ impl WatchdogScopeArtifact {
     }
 
     /// `render()` (`scope.ts:33-43`) — the empty string when there is no scope at all, else the
-    /// header, the supersede/scope-drift instruction, and one numbered block per entry, all joined
+    /// header, the scope instruction, and one numbered block per entry, all joined
     /// by a BLANK line (`join("\n\n")`) while the two lines WITHIN a block are joined by a single
     /// newline.
     #[must_use]
@@ -103,7 +104,12 @@ impl WatchdogScopeArtifact {
         let mut blocks: Vec<String> = Vec::with_capacity(self.entries.len() + 2);
         blocks.push("Current scope:".to_string());
         blocks.push(
-            "The following real user prompts are the current scope record, newest last. Newer prompts supersede and mutate older prompts: they may add, modify, or remove requirements. Flag work that serves no current scope item as category 'scope-drift'."
+            // The pin's line (`scope.ts:35` @ad11b7ab), from `6c1af3a2` (#2018). The v0.43.0 line
+            // this replaces had newer prompts SUPERSEDE older ones; `SUBA-198` records mid-run
+            // messages here, and upstream only ever did that under this additive wording
+            // (`ff2e00bd` landed after `6c1af3a2`) — a side question must not read as cancelling
+            // the task.
+            "The following real user prompts are the current scope record, newest last. Side questions are additive, not scope drift or cancellation of older objectives; only explicit changes supersede requirements. Use watchdog_warn for evidence-backed reminders of forgotten authorized work, not dependencies still pending or explicit holds. The orchestrator owns task tracking. Flag unauthorized work as category 'scope-drift'."
                 .to_string(),
         );
         for (index, entry) in self.entries.iter().enumerate() {
@@ -260,15 +266,18 @@ mod tests {
         assert_eq!(scope.render(), "");
     }
 
+    /// The instruction line is the pin's (`scope.ts:35` @ad11b7ab, from `6c1af3a2`): side
+    /// questions ADD to the record and only an explicit change supersedes — which is what makes
+    /// it safe for `SUBA-198` to record a mid-run message here at all.
     #[test]
-    fn prompts_are_trimmed_and_rendered_newest_last_with_the_supersede_instruction() {
+    fn prompts_are_trimmed_and_rendered_newest_last_with_the_scope_instruction() {
         let mut scope = WatchdogScopeArtifact::new();
         scope.add_prompt("  first  ", at(1));
         scope.add_prompt("second", at(2));
         let rendered = scope.render();
         let expected = [
             "Current scope:",
-            "The following real user prompts are the current scope record, newest last. Newer prompts supersede and mutate older prompts: they may add, modify, or remove requirements. Flag work that serves no current scope item as category 'scope-drift'.",
+            "The following real user prompts are the current scope record, newest last. Side questions are additive, not scope drift or cancellation of older objectives; only explicit changes supersede requirements. Use watchdog_warn for evidence-backed reminders of forgotten authorized work, not dependencies still pending or explicit holds. The orchestrator owns task tracking. Flag unauthorized work as category 'scope-drift'.",
             "Scope prompt 1 (1970-01-01T00:00:01.000Z):\nfirst",
             "Scope prompt 2 (1970-01-01T00:00:02.000Z):\nsecond",
         ]

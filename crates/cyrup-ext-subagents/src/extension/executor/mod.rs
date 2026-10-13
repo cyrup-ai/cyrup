@@ -114,6 +114,11 @@ pub struct SubagentExecutor {
     /// every `SessionStart`, and a ledger recreated with it would drop the claims of a wait
     /// already in flight.
     inline_answers: crate::background::watch::InlineAnswerLedger,
+    /// SUBA-192 — the `bg_wait` calls currently blocking, which a message from the operator must
+    /// end (pi's `userInputWaits`, `wait-tool.ts:31`). Executor-owned because two different
+    /// objects reach it: the tool opens an entry per call, and the extension's `input` handler
+    /// ends them.
+    user_input_waits: crate::background::wait::UserInputWaits,
     /// The late-bound live capability backend (P-1, reconciliation §2 item 1). Captured by
     /// [`cyrup_ext::native::NativeExtension::set_host_services`] (which the builder calls via
     /// `load_native_with_services` BEFORE `init`), so a background task / the `SessionStart` handler
@@ -323,6 +328,7 @@ impl SubagentExecutor {
             wait_subscriptions: Arc::new(std::sync::Mutex::new(None)),
             scheduled_runs: Arc::new(std::sync::Mutex::new(None)),
             inline_answers: crate::background::watch::InlineAnswerLedger::default(),
+            user_input_waits: crate::background::wait::UserInputWaits::default(),
             host_services: Arc::new(cyrup_ext::host::HostServicesSlot::new()),
             root_parent_session: Arc::new(std::sync::Mutex::new(None)),
             root_parent_session_name: Arc::new(std::sync::Mutex::new(None)),
@@ -508,6 +514,14 @@ impl SubagentExecutor {
     #[must_use]
     pub fn inline_answers(&self) -> crate::background::watch::InlineAnswerLedger {
         self.inline_answers.clone()
+    }
+
+    /// SUBA-192 — a handle on this executor's open `bg_wait` calls (see the field): the tool opens
+    /// one per call, the extension's `input` handler ends them. Cloning shares the one set,
+    /// mirroring [`Self::completion_bus`].
+    #[must_use]
+    pub fn user_input_waits(&self) -> crate::background::wait::UserInputWaits {
+        self.user_input_waits.clone()
     }
 
     /// Thread the intercom companion's real broker-backed delivery + clarify + steer channels into

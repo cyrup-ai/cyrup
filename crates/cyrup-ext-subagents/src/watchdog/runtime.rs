@@ -78,6 +78,14 @@ const MAX_REVIEW_INPUT_CHARS: usize = 24_000;
 /// [`super::turn_delta::WATCHDOG_DELTA_SECTION_SEPARATOR`] joins turn sections with, so a buffer of
 /// deltas reads as one continuous transcript.
 const REVIEW_DELTA_SEPARATOR: &str = "\n\n---\n\n";
+/// SUBA-198 — the first line of the review input's changed-paths block, pi `runtime.ts:855`
+/// @ad11b7ab (`ff2e00bd`) verbatim. The paths come from the working tree's dirty set
+/// ([`super::change_signature`]), which no one attributes to a session: a file another session in
+/// this checkout edited, or one left dirty before this session began, is listed the same. Saying
+/// so is what keeps the reviewer from reading the list as this session's work.
+const CHANGED_REPO_PATHS_HEADER: &str = "Changed repo paths: every dirty path in the working \
+                                         tree. Authorship is not verified; a path may predate \
+                                         this session or come from another session.";
 
 // =================================================================================================
 // The review seam (`runtime.ts:28-45`)
@@ -871,6 +879,50 @@ impl MainWatchdogRuntime {
             }
         }
         self.reset_repo_change_baseline(None, false);
+    }
+
+    /// SUBA-198 — `handleUserInput(event)` (`runtime.ts:512-517` @ad11b7ab, wired at
+    /// `register-main.ts:406`): *"A real user input sent while the agent streams reaches the loop
+    /// without before_agent_start, so record it in scope here."*
+    ///
+    /// A steer or follow-up is queued onto the live run, so [`Self::handle_before_agent_start`] —
+    /// the only other place a prompt enters the scope record — never sees it, and the next review
+    /// would judge the work it asked for against a scope that never authorized it. Whether an
+    /// input is such a message is the rule `bg_wait` applies too, [`crate::mid_run_input::admits`];
+    /// idle input is left to `before_agent_start`, which records it once.
+    ///
+    /// `[CYRUP-DELTA]` upstream's second line (`:515`) resets an in-flight clarification on any
+    /// non-extension input. cyrup's watchdog has no clarification lifecycle (`watchdog_ask` is not
+    /// adopted — see `review.rs`'s `ModelTurnReviewAgent`), and upstream's own default leaves it
+    /// off (`settings.ts:65`), so there is nothing here for it to reset.
+    pub fn handle_user_input(
+        &self,
+        text: &str,
+        source: cyrup_ext::InputEventSource,
+        streaming_behavior: Option<cyrup_ext::InputStreamingBehavior>,
+    ) {
+        let mut inner = self.lock();
+        // pi `:514` — `this.disposed ||`, ahead of everything else.
+        if inner.disposed {
+            return;
+        }
+        // pi `:516` — `if (event.streamingBehavior) this.scope.addPrompt(event.text)`, behind
+        // `:514`'s extension skip; together they are the shared rule.
+        if crate::mid_run_input::admits(source, streaming_behavior) {
+            inner.scope.add_prompt(text, None);
+        }
+    }
+
+    /// The scope record's entries, oldest first — what the next review's `Current scope:` block is
+    /// rendered from. Test-only: production reads the scope through that block alone.
+    #[cfg(test)]
+    pub(crate) fn scope_prompts(&self) -> Vec<String> {
+        self.lock()
+            .scope
+            .snapshot()
+            .into_iter()
+            .map(|entry| entry.prompt)
+            .collect()
     }
 
     /// `handleTurnEnd(event, ctx)` (`runtime.ts:324-340`).
@@ -1936,7 +1988,7 @@ impl RuntimeInner {
         let scope_block = self.scope_block();
         let changes = match change_signature {
             Some(signature) if !signature.changed_paths.is_empty() => {
-                let mut lines = vec!["Changed repo paths:".to_string()];
+                let mut lines = vec![CHANGED_REPO_PATHS_HEADER.to_string()];
                 lines.extend(
                     signature
                         .changed_paths
@@ -3036,7 +3088,7 @@ mod tests {
         assert!(
             calls.lock().unwrap()[0]
                 .delta
-                .contains("Changed repo paths:\n- src/lib.rs"),
+                .contains(&format!("{CHANGED_REPO_PATHS_HEADER}\n- src/lib.rs")),
             "{}",
             calls.lock().unwrap()[0].delta
         );
@@ -3139,10 +3191,125 @@ mod tests {
         };
         let input = inner.build_review_input(Some(&signature), "LSP BLOCK");
         assert!(input.contains("Current scope:"));
-        assert!(input.contains("Changed repo paths:\n- a.rs\n- b.rs"));
+        assert!(input.contains(&format!("{CHANGED_REPO_PATHS_HEADER}\n- a.rs\n- b.rs")));
         assert!(input.contains("LSP BLOCK"));
         assert!(input.ends_with("recent work"));
         assert!(input.encode_utf16().count() <= MAX_REVIEW_INPUT_CHARS);
+    }
+
+    /// SUBA-198 — the changed-paths block says what it actually is: EVERY dirty path in the
+    /// working tree, whose authorship nobody checked. pi `runtime.ts:855` @ad11b7ab (`ff2e00bd`),
+    /// verbatim. The bare `Changed repo paths:` it replaces let a reviewer take another session's
+    /// dirty files — or files dirty before this session began — for this session's work.
+    #[test]
+    fn the_changed_paths_header_says_authorship_is_not_verified() {
+        assert_eq!(
+            CHANGED_REPO_PATHS_HEADER,
+            "Changed repo paths: every dirty path in the working tree. Authorship is not \
+             verified; a path may predate this session or come from another session."
+        );
+        let mut inner = test_inner();
+        let signature = WatchdogRepoChangeSignature {
+            root: "/repo".into(),
+            key: "k".into(),
+            changed_paths: vec!["a.rs".into()],
+        };
+        let input = inner.build_review_input(Some(&signature), "");
+        assert!(
+            input.starts_with(
+                "Changed repo paths: every dirty path in the working tree. Authorship is not \
+                 verified; a path may predate this session or come from another session.\n- a.rs"
+            ),
+            "{input}"
+        );
+    }
+
+    /// The `Scope prompt N (…):` entries of a review delta, in order — what the reviewer is told
+    /// the user authorized.
+    fn scope_prompts_in(delta: &str) -> Vec<String> {
+        let mut prompts = Vec::new();
+        let mut lines = delta.lines();
+        while let Some(line) = lines.next() {
+            if line.starts_with("Scope prompt ")
+                && line.ends_with("):")
+                && let Some(prompt) = lines.next()
+            {
+                prompts.push(prompt.to_string());
+            }
+        }
+        prompts
+    }
+
+    /// SUBA-198 — pi `watchdog-runtime.test.ts:1102-1123` @ad11b7ab ("adds user messages sent
+    /// while the agent streams to the scope record"), input for input: a steer and an RPC
+    /// follow-up sent mid-run reach the next review's scope record, so the reviewer judges the
+    /// work they asked for as authorized rather than as scope drift; the idle prompt is recorded
+    /// once (by `before_agent_start`, not twice), and an extension's own message never is.
+    ///
+    /// **Gutting mutation this fails on:** make [`MainWatchdogRuntime::handle_user_input`] a no-op
+    /// — the review then sees only the idle prompt, and the steered work reads as drift.
+    #[tokio::test]
+    async fn a_message_sent_while_the_agent_streams_joins_the_scope_record() {
+        use cyrup_ext::{InputEventSource, InputStreamingBehavior};
+        let sinks = Sinks::default();
+        let review = ScriptedReview::new();
+        let calls = Arc::clone(&review.calls);
+        let mut options = options_with(enabled_config(), &sinks);
+        options.review = Some(Arc::new(review));
+        let runtime = MainWatchdogRuntime::new(options);
+
+        runtime.handle_user_input("Idle prompt.", InputEventSource::Interactive, None);
+        runtime.handle_before_agent_start(&json!({ "prompt": "Idle prompt." }), &cwd());
+        runtime.handle_user_input(
+            "Also fix the tests.",
+            InputEventSource::Interactive,
+            Some(InputStreamingBehavior::Steer),
+        );
+        runtime.handle_user_input(
+            "Then purge them.",
+            InputEventSource::Rpc,
+            Some(InputStreamingBehavior::FollowUp),
+        );
+        runtime.handle_user_input(
+            "Extension text.",
+            InputEventSource::Extension,
+            Some(InputStreamingBehavior::Steer),
+        );
+        runtime.handle_turn_end(&turn_end_event("work"), &cwd());
+        runtime.handle_agent_end(&cwd()).await;
+
+        let requests = calls.lock().unwrap();
+        let reviewed = requests.last().expect("the agent_end boundary reviewed");
+        assert_eq!(
+            scope_prompts_in(&reviewed.delta),
+            vec!["Idle prompt.", "Also fix the tests.", "Then purge them."],
+            "{}",
+            reviewed.delta
+        );
+    }
+
+    /// pi `runtime.ts:514`'s `this.disposed` guard (added by `ff2e00bd`): a disposed runtime
+    /// records nothing, like every other handler after `dispose`.
+    #[tokio::test]
+    async fn a_disposed_runtime_records_no_mid_run_message() {
+        let sinks = Sinks::default();
+        let runtime = MainWatchdogRuntime::new(options_with(enabled_config(), &sinks));
+        runtime.handle_user_input(
+            "Before dispose.",
+            cyrup_ext::InputEventSource::Interactive,
+            Some(cyrup_ext::InputStreamingBehavior::Steer),
+        );
+        assert_eq!(runtime.scope_prompts(), vec!["Before dispose."]);
+        runtime.dispose();
+        runtime.handle_user_input(
+            "After dispose.",
+            cyrup_ext::InputEventSource::Interactive,
+            Some(cyrup_ext::InputStreamingBehavior::Steer),
+        );
+        assert!(
+            runtime.scope_prompts().is_empty(),
+            "dispose cleared the scope and nothing re-entered it"
+        );
     }
 
     #[test]

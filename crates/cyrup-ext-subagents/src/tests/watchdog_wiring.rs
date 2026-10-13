@@ -120,6 +120,9 @@ async fn the_extension_subscribes_every_event_the_watchdog_state_machine_needs()
         EventKind::SessionBeforeFork,
         EventKind::SessionCompact,
         EventKind::SessionShutdown,
+        // SUBA-198 — `register-main.ts:406` @ad11b7ab: a steer typed mid-run reaches the scope
+        // record only through `input`, never through `before_agent_start`.
+        EventKind::Input,
     ] {
         assert!(subs.contains(kind), "{kind:?} is subscribed");
     }
