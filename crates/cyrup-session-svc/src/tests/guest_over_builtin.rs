@@ -250,30 +250,36 @@ async fn a_registration_over_radius_still_refreshes_its_catalog() {
     );
     {
         let store = Arc::clone(&store);
-        registry.attach_base_resolver(Arc::new(move |id: &str| {
-            (id == "radius").then(|| {
-                let radius: Arc<dyn Provider> = Arc::new(
-                    cyrup_provider::RadiusProvider::new(
-                        cyrup_provider::RadiusProviderOptions {
-                            gateway: Some(gateway.clone()),
-                            ..Default::default()
-                        },
-                        Arc::new(InMemoryCredentialStore::new()),
-                        Arc::new(builtin_registry()),
-                    )
-                    .with_auth_context(Arc::new(ScriptedEnv(vec![(
-                        "RADIUS_API_KEY",
-                        "sk-gateway",
-                    )])))
-                    .with_models_store(Arc::clone(&store)),
-                );
-                futures::executor::block_on(
-                    cyrup_provider::RemoteCatalog::new(Arc::clone(&store))
-                        .load_overlay(&["radius"]),
-                )
-                .apply(radius)
-            })
-        }));
+        // The overlay handed in is ignored: this base restores from radius's own store instead.
+        registry.attach_base_resolver(
+            Arc::new(
+                move |id: &str, _overlay: Option<&Arc<cyrup_provider::CatalogOverlay>>| {
+                    (id == "radius").then(|| {
+                        let radius: Arc<dyn Provider> = Arc::new(
+                            cyrup_provider::RadiusProvider::new(
+                                cyrup_provider::RadiusProviderOptions {
+                                    gateway: Some(gateway.clone()),
+                                    ..Default::default()
+                                },
+                                Arc::new(InMemoryCredentialStore::new()),
+                                Arc::new(builtin_registry()),
+                            )
+                            .with_auth_context(Arc::new(ScriptedEnv(vec![(
+                                "RADIUS_API_KEY",
+                                "sk-gateway",
+                            )])))
+                            .with_models_store(Arc::clone(&store)),
+                        );
+                        futures::executor::block_on(
+                            cyrup_provider::RemoteCatalog::new(Arc::clone(&store))
+                                .load_overlay(&["radius"]),
+                        )
+                        .apply(radius)
+                    })
+                },
+            ),
+            Arc::new(cyrup_provider::CatalogOverlaySlot::new()),
+        );
     }
     let ext = cyrup_ext::registry::ExtensionRegistry::new();
     ext.bind_model_registry(registry.clone()).unwrap();

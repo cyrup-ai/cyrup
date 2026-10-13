@@ -111,11 +111,68 @@ pub struct GuestProviderRegistry {
     /// `provider-composer.ts:553-575` @f1b2e77f5). See
     /// [`GuestProviderRegistry::attach_model_config`].
     model_config: Mutex<Option<Arc<cyrup_config::ModelFile>>>,
+    /// PROV-165 — the session's pi.dev catalog overlay slot: the ONE input of the base that changes
+    /// during a session (see [`BaseResolver`]). Attached with the resolver; unattached, the base
+    /// never changes.
+    catalog_overlay: Mutex<Option<Arc<cyrup_provider::CatalogOverlaySlot>>>,
+    /// PROV-165 — every id whose provider is a registration COMPOSED over a base: the registration
+    /// and the overlay its base was resolved with. Read on every read of this registry
+    /// ([`Self::revalidate`]); written only with `providers` held, through
+    /// [`Self::lock_unless_stale`].
+    composed: Mutex<BTreeMap<String, Composition>>,
+    /// Stamps each landed registration, so a re-composition of an id writes only while the
+    /// registration it composed is still the id's ([`Composition::stamp`]).
+    next_stamp: AtomicU64,
 }
 
-/// Resolves the base provider a registration under `id` composes over (see
-/// [`GuestProviderRegistry::attach_base_resolver`]). `None`: no base owns the id.
-pub type BaseResolver = Arc<dyn Fn(&str) -> Option<Arc<dyn Provider>> + Send + Sync>;
+/// Resolves the base provider a registration under `id` composes over, from the catalog overlay
+/// the caller hands it (see [`GuestProviderRegistry::attach_base_resolver`]). `None`: no base owns
+/// the id.
+///
+/// PROV-165 — the overlay is a PARAMETER, not something the resolver reads for itself, because it
+/// is the one input of the base that changes during a session (`models.json` is read once, the
+/// credential store and auth context are live objects whose reads happen at request time, and the
+/// compiled-in catalogs do not change): the registry records the overlay each composition was
+/// resolved with and composes again when the slot holds another.
+pub type BaseResolver = Arc<
+    dyn Fn(&str, Option<&Arc<cyrup_provider::CatalogOverlay>>) -> Option<Arc<dyn Provider>>
+        + Send
+        + Sync,
+>;
+
+/// What a composed id's provider was built from (PROV-165): the registration, the overlay its base
+/// was resolved with, and the registration's stamp.
+struct Composition {
+    registration: ProviderRegistration,
+    over: Option<Arc<cyrup_provider::CatalogOverlay>>,
+    /// Bumped by every registration that lands for the id; a re-composition (a read that found
+    /// the overlay moved, or the composed provider's own refresh) carries the stamp it read and
+    /// writes nothing if a registration landed since.
+    stamp: u64,
+}
+
+/// Why [`GuestProviderRegistry::compose_and_write`] composes: a registration landing (pi
+/// `registerProvider` → `recomposeProvider`, which supersedes the id's refresh like every
+/// `setProvider`), or the SAME registration composed again over the base as it is now (pi has no
+/// such write: its composed `getAllModels` reads the base on every call, so nothing is superseded).
+#[derive(Clone, Copy)]
+enum ComposeCause {
+    Registration,
+    Recompose { stamp: u64 },
+}
+
+/// Whether two overlay reads are the same overlay: the slot replaces its `Arc` on every install, so
+/// identity is the change. Held `Arc`s, so an address cannot be reused while it is compared.
+fn same_overlay(
+    a: Option<&Arc<cyrup_provider::CatalogOverlay>>,
+    b: Option<&Arc<cyrup_provider::CatalogOverlay>>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
 
 /// What [`GuestProviderRegistry::attach_virtual_models`] binds: the registry a registration lands
 /// in, and the catalog its two validations read.
@@ -132,17 +189,21 @@ struct LiveGuestCatalog<'a> {
 }
 
 impl cyrup_provider::VirtualModelCatalog for LiveGuestCatalog<'_> {
+    /// A guest-registered id answers from its LIVE provider alone: the snapshot was taken before
+    /// any registration, and a registration over a built-in REPLACES the id's rows (pi validates
+    /// against `this.models.getModel(providerId, id)`, the composed id, `model-runtime.ts:960`
+    /// @f1b2e77f5), so a built-in row the registration no longer lists is not a conflict.
     fn get_model(&self, provider: &str, model_id: &str) -> Option<Model> {
-        self.snapshot.get_model(provider, model_id).or_else(|| {
-            self.guest
-                .models()
-                .into_iter()
-                .find(|m| m.provider.as_str() == provider && m.id.as_str() == model_id)
-        })
+        if let Some(guest) = self.guest.provider(provider) {
+            return guest.get_model(model_id).cloned();
+        }
+        self.snapshot.get_model(provider, model_id)
     }
 
     fn models(&self) -> Vec<Model> {
+        let guest_ids = self.guest.ids();
         let mut models = self.snapshot.models();
+        models.retain(|m| !guest_ids.iter().any(|id| id == m.provider.as_str()));
         for m in self.guest.models() {
             if !models
                 .iter()
@@ -184,26 +245,63 @@ impl GuestProviderRegistry {
             base_resolver: Mutex::default(),
             keyless_composed: Mutex::default(),
             model_config: Mutex::default(),
+            catalog_overlay: Mutex::default(),
+            composed: Mutex::default(),
+            next_stamp: AtomicU64::default(),
         })
     }
 
     /// The provider realized for `id`, if a guest registered one (cheap `Arc` clone). Poison-safe.
+    ///
+    /// Every public read of this registry first [`Self::revalidate`]s, so what it answers is the
+    /// registrations composed over their bases AS THE BASES ARE NOW (PROV-165).
     pub fn provider(&self, id: &str) -> Option<Arc<dyn Provider>> {
+        self.revalidate();
         self.lock().get(id).cloned()
     }
 
     /// Whether a guest provider with this id is registered.
     pub fn has_provider(&self, id: &str) -> bool {
+        self.revalidate();
         self.lock().contains_key(id)
     }
 
     /// Every guest-registered provider's model catalog, unioned (Pi folds registered models into the
     /// shared `ModelRegistry.models`, model-registry.ts:917-940). Stable order by provider id.
     pub fn models(&self) -> Vec<Model> {
+        self.revalidate();
         self.lock()
             .values()
             .flat_map(|p| p.models().to_vec())
             .collect()
+    }
+
+    /// PROV-165 — pi's composed provider reads its base on EVERY `getAllModels` call
+    /// (`provider-composer.ts:555-575` @f1b2e77f5), so a pi.dev catalog reload of a built-in
+    /// reaches a registration over it at once. A cyrup provider's rows are an immutable borrow, so
+    /// the same contract is kept one level up: every read of this registry compares the overlay
+    /// slot with the overlay each composition's base was resolved with, and composes again — the
+    /// same registration, over the base as it is now — when they differ. A read that finds nothing
+    /// moved costs one `RwLock` read and a pointer comparison per composed id.
+    ///
+    /// The base's other inputs do not change during a session (see [`BaseResolver`]), so "the
+    /// overlay is the one the composition was resolved with" is "the composition is the one a
+    /// per-read resolve would produce". The re-composition writes through
+    /// [`Self::compose_and_write`], so through the one gate ([`Self::lock_unless_stale`]), and
+    /// bumps the generation, which is what the session's composed-registry snapshot keys on.
+    fn revalidate(&self) {
+        let Some(slot) = poison_safe(&self.catalog_overlay).clone() else {
+            return;
+        };
+        let now = slot.load();
+        let moved: Vec<(ProviderRegistration, u64)> = poison_safe(&self.composed)
+            .values()
+            .filter(|c| !same_overlay(c.over.as_ref(), now.as_ref()))
+            .map(|c| (c.registration.clone(), c.stamp))
+            .collect();
+        for (registration, stamp) in moved {
+            let _ = self.compose_and_write(&registration, ComposeCause::Recompose { stamp });
+        }
     }
 
     /// The mutation generation — bumped by every `upsert_provider` / `upsert_live_provider` /
@@ -214,11 +312,15 @@ impl GuestProviderRegistry {
     /// recompose that follows a difference takes the registry's own `Mutex`, which is what
     /// publishes the new catalogs.
     pub fn generation(&self) -> u64 {
+        // A moved overlay is composed in BEFORE the counter is read, so the caller keying a cache
+        // on it sees the re-composition's bump (PROV-165).
+        self.revalidate();
         self.generation.load(Ordering::Relaxed)
     }
 
     /// The registered provider ids (diagnostics).
     pub fn ids(&self) -> Vec<String> {
+        self.revalidate();
         self.lock().keys().cloned().collect()
     }
 
@@ -265,8 +367,38 @@ impl GuestProviderRegistry {
     /// [`BaseResolver`]). Called by [`crate::SessionBuilder`] BEFORE the bind flush, so the
     /// extensions' startup registrations compose over the session's own built-ins and
     /// `models.json`.
-    pub fn attach_base_resolver(&self, resolver: BaseResolver) {
+    ///
+    /// PROV-165 — `overlay` is the session's catalog overlay slot, which the resolver is handed on
+    /// every resolve and which every read of this registry compares against
+    /// ([`Self::revalidate`]).
+    pub fn attach_base_resolver(
+        &self,
+        resolver: BaseResolver,
+        overlay: Arc<cyrup_provider::CatalogOverlaySlot>,
+    ) {
         *poison_safe(&self.base_resolver) = Some(resolver);
+        *poison_safe(&self.catalog_overlay) = Some(overlay);
+    }
+
+    /// SEAM-166 — `file` without the blocks of the ids a guest registered: those ids' rows already
+    /// carry their `models.json` layer UNDER the registration (pi's order built-in → `models.json`
+    /// → extension, `provider-composer.ts:555-560` @f1b2e77f5), so composing the block over them
+    /// again would put a `models.json` `baseUrl` back over the registration's. The ONE place that
+    /// rule is spelled; every composition of `models.json` over rows that may include a guest
+    /// provider's goes through it (`AgentSession::compose_model_registry`, the builder's step 3b).
+    pub fn without_guest_blocks<'a>(
+        &self,
+        file: &'a cyrup_config::ModelFile,
+    ) -> std::borrow::Cow<'a, cyrup_config::ModelFile> {
+        let guest = self.ids();
+        if !guest.iter().any(|id| file.providers.contains_key(id)) {
+            return std::borrow::Cow::Borrowed(file);
+        }
+        let mut stripped = file.clone();
+        stripped
+            .providers
+            .retain(|id, _| !guest.iter().any(|guest_id| guest_id == id));
+        std::borrow::Cow::Owned(stripped)
     }
 
     /// PROV-164 — install the session's `models.json`, whose `modelOverrides` for an id apply over
@@ -290,28 +422,52 @@ impl GuestProviderRegistry {
             .map(|block| block.model_overrides.clone())
             .unwrap_or_default();
         let this = self.this.clone();
-        let recompose = reg.clone();
+        let id = reg.id.clone();
         ComposeOptions {
             model_overrides,
+            // The id's CURRENT registration, composed again — not a copy of the one this provider
+            // was built from, which a re-registration may have replaced (PROV-165).
             refreshed: Some(Arc::new(move || {
                 if let Some(registry) = this.upgrade() {
-                    let _ = registry.upsert_provider(&recompose);
+                    registry.recompose(&id);
                 }
             })),
         }
     }
 
-    /// The base a registration under `id` composes over: the attached resolver's answer, else the
-    /// compiled-in built-in over the refresh engine's credential store.
-    fn base_provider(&self, id: &str) -> Option<Arc<dyn Provider>> {
+    /// Compose the id's current registration again over its base as it is now, if the id is
+    /// composed over one (PROV-164's refresh `update`).
+    fn recompose(&self, id: &str) {
+        let current = poison_safe(&self.composed)
+            .get(id)
+            .map(|c| (c.registration.clone(), c.stamp));
+        if let Some((registration, stamp)) = current {
+            let _ = self.compose_and_write(&registration, ComposeCause::Recompose { stamp });
+        }
+    }
+
+    /// The overlay the base is resolved with now (`None` when no slot is attached).
+    fn overlay_now(&self) -> Option<Arc<cyrup_provider::CatalogOverlay>> {
+        poison_safe(&self.catalog_overlay)
+            .as_ref()
+            .and_then(|slot| slot.load())
+    }
+
+    /// The base a registration under `id` composes over, resolved with `overlay`: the attached
+    /// resolver's answer, else the compiled-in built-in over the refresh engine's credential store.
+    fn base_provider(
+        &self,
+        id: &str,
+        overlay: Option<&Arc<cyrup_provider::CatalogOverlay>>,
+    ) -> Option<Arc<dyn Provider>> {
         let resolver = poison_safe(&self.base_resolver).clone();
         match resolver {
-            Some(resolver) => resolver(id),
+            Some(resolver) => resolver(id, overlay),
             None => cyrup_provider::builtin_provider(
                 id,
                 self.refresh.auth().0,
                 Arc::new(cyrup_provider::builtin_registry()),
-                None,
+                overlay.map(AsRef::as_ref),
             ),
         }
     }
@@ -328,10 +484,112 @@ impl GuestProviderRegistry {
 
     /// The registered providers, by id (a snapshot of the map).
     pub fn providers(&self) -> Vec<(String, Arc<dyn Provider>)> {
+        self.revalidate();
         self.lock()
             .iter()
             .map(|(id, provider)| (id.clone(), Arc::clone(provider)))
             .collect()
+    }
+
+    /// The id the bound installed-provider slot currently holds, if one is bound.
+    fn installed_id(&self) -> Option<String> {
+        poison_safe(&self.installed)
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|swap| swap.current().id().as_str().to_string())
+    }
+
+    /// Realize `reg` and write it: composed over the id's base when one owns the id (PROV-162),
+    /// else the registration alone. Every write a registration makes, and every re-composition of
+    /// one, is made here, in ONE hold of the provider map taken through [`Self::lock_unless_stale`]
+    /// (SEAM-145, SEAM-151): the stale check, the supersede, the map, the composition record, the
+    /// key-less set, the installed slot and the generation.
+    ///
+    /// Composed BEFORE the gate: composing writes nothing, and no lock is held across provider
+    /// code. The base is resolved with the overlay read once here, and that overlay is what the
+    /// record keeps, so a composition is never recorded as newer than the base it was made over
+    /// (PROV-165).
+    ///
+    /// PROV-166 — a composition that fails leaves the BASE serving the id: pi's `composeProvider`
+    /// records the error and returns `base` (`model-runtime.ts:312-315` @f1b2e77f5), which
+    /// `recomposeProvider` registers in place of whatever the id held. So the id's composed
+    /// provider and its record go, and the installed slot, when it holds the id, is handed the
+    /// base — under the same hold as the other writes. The hub still records the registration
+    /// (pi stores it, `:933`), which is why this answers [`ProviderWrite::Landed`].
+    fn compose_and_write(&self, reg: &ProviderRegistration, cause: ComposeCause) -> ProviderWrite {
+        let over = self.overlay_now();
+        let composed = self.base_provider(&reg.id, over.as_ref()).map(|base| {
+            let (store, ctx) = self.refresh.auth();
+            let result = reg.compose_over(
+                Arc::clone(&base),
+                store,
+                Some(ctx),
+                self.compose_options(reg),
+            );
+            (base, result)
+        });
+        let Some(mut providers) = self.lock_unless_stale(&reg.id) else {
+            return ProviderWrite::Superseded;
+        };
+        let mut records = poison_safe(&self.composed);
+        let stamp = match cause {
+            ComposeCause::Registration => {
+                // pi `registerProvider` → `setProvider` / `deleteProvider`, both of which
+                // supersede the id's refresh (`models.ts:405-413`).
+                self.supersede_refresh(&reg.id);
+                self.next_stamp.fetch_add(1, Ordering::Relaxed)
+            }
+            // A registration landed since this one was read: it owns the id, and it was composed
+            // over a base no older than this one.
+            ComposeCause::Recompose { stamp }
+                if records.get(&reg.id).map(|c| c.stamp) != Some(stamp) =>
+            {
+                return ProviderWrite::Superseded;
+            }
+            ComposeCause::Recompose { stamp } => stamp,
+        };
+        let (provider, keyless) = match composed {
+            Some((_, Ok(provider))) => {
+                records.insert(
+                    reg.id.clone(),
+                    Composition {
+                        registration: reg.clone(),
+                        over,
+                        stamp,
+                    },
+                );
+                (
+                    provider,
+                    reg.resolved_api_key.as_deref().is_none_or(str::is_empty),
+                )
+            }
+            Some((base, Err(message))) => {
+                tracing::warn!(provider = %reg.id, "{message}");
+                providers.remove(&reg.id);
+                records.remove(&reg.id);
+                poison_safe(&self.keyless_composed).remove(&reg.id);
+                self.replace_installed(&reg.id, &base);
+                self.generation.fetch_add(1, Ordering::Relaxed);
+                return ProviderWrite::Landed;
+            }
+            None => {
+                records.remove(&reg.id);
+                (reg.build_provider(), false)
+            }
+        };
+        drop(records);
+        providers.insert(reg.id.clone(), Arc::clone(&provider));
+        {
+            let mut keyless_composed = poison_safe(&self.keyless_composed);
+            if keyless {
+                keyless_composed.insert(reg.id.clone());
+            } else {
+                keyless_composed.remove(&reg.id);
+            }
+        }
+        self.replace_installed(&reg.id, &provider);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        ProviderWrite::Landed
     }
 
     /// Store `provider` into the bound installed-provider slot when that holds the same id.
@@ -1295,49 +1553,7 @@ impl ProviderRefresher for GuestProviderRegistry {
 impl ModelRegistrySink for GuestProviderRegistry {
     fn upsert_provider(&self, reg: &ProviderRegistration) -> ProviderWrite {
         // Full replacement for this provider id (Pi "replaces all models", model-registry.ts:919).
-        //
-        // PROV-162 — pi stores the registration as the id's `extension` layer and recomposes the
-        // id OVER its base (`model-runtime.ts:921-934` → `composeProvider`, `:301-310`). An id a
-        // base owns is composed over it with the session's own store and auth context (pi's
-        // `ModelRuntime` `credentials`/`authContext`) and its `models.json` layers (PROV-164); an
-        // id no base owns is realized from the registration alone, exactly as before. Composed
-        // BEFORE the gate: composing writes nothing, and no lock is held across provider code.
-        let composed = self.base_provider(&reg.id).map(|base| {
-            let (store, ctx) = self.refresh.auth();
-            reg.compose_over(base, store, Some(ctx), self.compose_options(reg))
-        });
-        // One hold of the map for the stale check, the supersede, the insert, the installed slot
-        // and the bump (SEAM-145, see `stale_publication`).
-        let Some(mut providers) = self.lock_unless_stale(&reg.id) else {
-            return ProviderWrite::Superseded;
-        };
-        let (provider, keyless) = match composed {
-            Some(Ok(provider)) => (
-                provider,
-                reg.resolved_api_key.as_deref().is_none_or(str::is_empty),
-            ),
-            // pi records the composition error and keeps the base registered
-            // (`model-runtime.ts:312-315`) — and keeps the registration it stored (`:933`), which is
-            // why this is not a refusal: the hub records it, nothing lands here.
-            Some(Err(message)) => {
-                tracing::warn!(provider = %reg.id, "{message}");
-                return ProviderWrite::Landed;
-            }
-            None => (reg.build_provider(), false),
-        };
-        self.supersede_refresh(&reg.id);
-        providers.insert(reg.id.clone(), Arc::clone(&provider));
-        {
-            let mut keyless_composed = poison_safe(&self.keyless_composed);
-            if keyless {
-                keyless_composed.insert(reg.id.clone());
-            } else {
-                keyless_composed.remove(&reg.id);
-            }
-        }
-        self.replace_installed(&reg.id, &provider);
-        self.generation.fetch_add(1, Ordering::Relaxed);
-        ProviderWrite::Landed
+        self.compose_and_write(reg, ComposeCause::Registration)
     }
 
     fn upsert_live_provider(&self, id: &str, provider: Arc<dyn Provider>) -> ProviderWrite {
@@ -1358,6 +1574,8 @@ impl ModelRegistrySink for GuestProviderRegistry {
                 .insert(id.to_string(), Arc::clone(&provider))
                 .is_none();
             poison_safe(&self.keyless_composed).remove(id);
+            // A live provider is not a composition: nothing re-composes it (PROV-165).
+            poison_safe(&self.composed).remove(id);
             let late_restore = if is_new {
                 self.begin_late_restore(id, &provider)
             } else {
@@ -1376,6 +1594,16 @@ impl ModelRegistrySink for GuestProviderRegistry {
     }
 
     fn remove_provider(&self, id: &str) -> ProviderWrite {
+        // pi `unregisterProvider` recomposes the id, which leaves its BASE registered
+        // (`model-runtime.ts:944-950` → `composeProvider`, `:301-310` @f1b2e77f5). The map entry
+        // going is that for every reader of the map; the installed slot is a COPY of the entry, so
+        // when it holds this id it is handed the base (resolved here, outside the lock, and only
+        // then). An id no base owns leaves the slot as it was.
+        let base = self
+            .installed_id()
+            .is_some_and(|installed| installed == id)
+            .then(|| self.base_provider(id, self.overlay_now().as_ref()))
+            .flatten();
         let restore = {
             // Same single hold as the upserts (SEAM-145): a stale publication's removal is
             // dropped, and the supersede happens under the lock its check reads under.
@@ -1385,6 +1613,10 @@ impl ModelRegistrySink for GuestProviderRegistry {
             self.supersede_refresh(id);
             providers.remove(id);
             poison_safe(&self.keyless_composed).remove(id);
+            poison_safe(&self.composed).remove(id);
+            if let Some(base) = &base {
+                self.replace_installed(id, base);
+            }
             // SEAM-144: begun under the same hold, so a registration that follows supersedes
             // this restore, never the reverse.
             let restore = self.begin_removal_restore(&providers);

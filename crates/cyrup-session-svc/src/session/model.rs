@@ -531,9 +531,13 @@ impl AgentSession {
     /// (`ModelRuntime.rebuildProviders`, model-runtime.ts:225-231). This is the resolution /
     /// enumeration source that spans providers, independent of which single provider is installed.
     pub(super) fn full_model_registry(&self) -> Arc<Vec<Model>> {
+        // The guest generation FIRST: reading it composes the guest registrations over a moved
+        // overlay (PROV-165, `GuestProviderRegistry::revalidate`), which may replace the installed
+        // provider, so the installed provider and the overlay read after it are the ones that
+        // re-composition saw (or newer, which the next read's key catches).
+        let guest_gen = self.services.guest_providers.generation();
         let provider = self.provider.current();
         let overlay = self.services.catalog_overlay.load();
-        let guest_gen = self.services.guest_providers.generation();
         // Key FOUR — the virtual-model registry's own counter. A `register_virtual_model` changes
         // none of the other three keys, so without this the composed catalog served before the
         // first registration is served forever (see `model_runtime`'s module docs).
@@ -647,20 +651,12 @@ impl AgentSession {
         // A guest-owned id is NOT composed again: its rows already carry its base's `models.json`
         // layer UNDER the registration (pi's layer order, built-in → `models.json` → extension,
         // `provider-composer.ts:556-560`), and re-applying the block here would put a `models.json`
-        // `baseUrl` back over the registration's (PROV-162).
-        let guest_free;
-        let model_config: &cyrup_config::ModelFile = if guest
-            .iter()
-            .any(|(id, _)| self.services.model_config.providers.contains_key(id))
-        {
-            let mut file = self.services.model_config.as_ref().clone();
-            file.providers
-                .retain(|id, _| !guest.iter().any(|(guest_id, _)| guest_id == id));
-            guest_free = file;
-            &guest_free
-        } else {
-            self.services.model_config.as_ref()
-        };
+        // `baseUrl` back over the registration's (PROV-162). The rule lives in one place, shared
+        // with the builder's step 3b (SEAM-166).
+        let model_config = self
+            .services
+            .guest_providers
+            .without_guest_blocks(&self.services.model_config);
         let (composed, _errors) = model_config.compose(&base);
         // --- VIRTUAL layer, applied LAST (pi `recomposeProvider`, model-runtime.ts:171-178) ---
         // pi composes the provider — which is where `models.json` lands — and only THEN wraps the
