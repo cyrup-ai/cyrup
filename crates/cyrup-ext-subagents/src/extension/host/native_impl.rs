@@ -999,15 +999,17 @@ impl NativeExtension for SubagentsExtension {
                         ..crate::watchdog::runtime::WatchdogResetOptions::default()
                     });
             }
-            // pi `register-main.ts:433` — a compaction rewrote the history the scope record was
-            // built from, so the scope goes; the auto-follow counters and the review-input hash do
-            // NOT (upstream passes only `clearScope`).
+            // pi `session_compact` → `runtime.reset("session compact", { clearActivity: true })`
+            // (`register-main.ts:418` @ad11b7ab) — the SCOPE IS KEPT: a compaction rewrites the
+            // history, not the prompts that authorized the work in progress, so the next review's
+            // `Current scope:` block still carries them (SUBA-235). An older upstream passed
+            // `clearScope` here (`register-main.ts:433`), which is what this arm used to port.
+            // `clearActivity` has nothing to clear in cyrup: there is no delivered-orchestration
+            // activity collection yet (SUBA-234). The reset itself (pending deltas, the in-flight
+            // review, the emission guard) still runs, as upstream's does.
             HostEvent::SessionCompact { .. } => {
                 self.watchdog
-                    .reset(crate::watchdog::runtime::WatchdogResetOptions {
-                        clear_scope: true,
-                        ..crate::watchdog::runtime::WatchdogResetOptions::default()
-                    });
+                    .reset(crate::watchdog::runtime::WatchdogResetOptions::default());
             }
             // R-SA-132/134: contribute this crate's BUNDLED packaged resources — the
             // `skills/pi-subagents/SKILL.md` operational skill and the seven `prompts/*.md`

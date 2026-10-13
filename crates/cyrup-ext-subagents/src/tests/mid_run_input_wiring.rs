@@ -142,3 +142,68 @@ async fn extension_and_idle_input_change_nothing_in_either_consumer() {
         extension.watchdog().scope_prompts()
     );
 }
+
+/// SUBA-235 — a steer recorded before a compaction is still in the scope record the next review
+/// reads. Upstream's compaction reset passes only `clearActivity` (`register-main.ts:418`
+/// @ad11b7ab), so the prompts that authorized the work in progress keep authorizing it. Red at
+/// the base, whose `SessionCompact` arm passed `clear_scope: true`: the record was empty.
+#[tokio::test]
+async fn a_steer_recorded_before_a_compaction_is_still_in_scope_after_it() {
+    let (_root, host, extension) = loaded().await;
+    host.emit_input(
+        "Also fix the tests.",
+        Vec::new(),
+        InputEventSource::Interactive,
+        Some(InputStreamingBehavior::Steer),
+        &CancelToken::new(),
+    )
+    .await;
+    assert_eq!(
+        extension.watchdog().scope_prompts(),
+        vec!["Also fix the tests."]
+    );
+
+    host.dispatcher()
+        .dispatch_notify(
+            &cyrup_ext::HostEvent::SessionCompact {
+                compaction_entry: serde_json::json!({}),
+                from_extension: false,
+                reason: "threshold".to_string(),
+                will_retry: false,
+            },
+            &CancelToken::new(),
+        )
+        .await;
+
+    assert_eq!(
+        extension.watchdog().scope_prompts(),
+        vec!["Also fix the tests."],
+        "a compaction must not forget what authorized the work in progress"
+    );
+}
+
+/// The control for the test above, green at the base and after: a session switch DOES abandon the
+/// scope record (`register-main.ts:416` @ad11b7ab passes `clearScope`), so keeping it across a
+/// compaction is the compaction arm's own change and not a reset that clears nothing.
+#[tokio::test]
+async fn a_session_switch_still_clears_the_scope_record() {
+    let (_root, host, extension) = loaded().await;
+    host.emit_input(
+        "Also fix the tests.",
+        Vec::new(),
+        InputEventSource::Interactive,
+        Some(InputStreamingBehavior::Steer),
+        &CancelToken::new(),
+    )
+    .await;
+    host.dispatcher()
+        .dispatch_notify(
+            &cyrup_ext::HostEvent::SessionBeforeSwitch {
+                reason: "new".to_string(),
+                target_session_file: None,
+            },
+            &CancelToken::new(),
+        )
+        .await;
+    assert!(extension.watchdog().scope_prompts().is_empty());
+}
