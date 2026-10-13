@@ -692,3 +692,119 @@ fn a_large_returned_value_costs_the_host_a_few_copies_of_its_text() {
         grew / 1024
     );
 }
+
+// ------------------------------------------------------------------------------------------------
+// What a running call's arguments cost the host
+// ------------------------------------------------------------------------------------------------
+
+/// `glibc`'s allocator with a fixed threshold for serving an allocation from a mapping of its own,
+/// so that a probe measures what the host holds rather than what its allocator kept: by default the
+/// threshold follows the largest block freed (up to 32 MiB), and a freed block of tens of megabytes
+/// can stay resident in one thread's heap while another thread allocates as much again.
+const LIVE_MEMORY: (&str, &str) = ("GLIBC_TUNABLES", "glibc.malloc.mmap_threshold=1048576");
+
+const ARGUMENTS_ENV: &str = "CYRUP_CODEMODE_TEST_ARGUMENT_MEMORY";
+const ARGUMENTS: &str = "sandbox::tests::process::argument_memory_probe_entry";
+/// Characters of the string argument the probe passes: below the 32 Mi argument limit, and large
+/// enough that the host's own noise is small beside a copy of it.
+const ARGUMENT_CHARS: usize = 30_000_000;
+
+/// Not a test of its own: runs a script whose one call has a 30-million-character string argument,
+/// in a sandbox process, and prints how far this process's peak resident memory grew meanwhile.
+/// The tool makes one copy of its arguments the moment it is called and holds both until it
+/// settles, as a stage of the nested pipeline does, so what the sandbox's own side of the call
+/// holds at that moment is counted with it.
+#[cfg(target_os = "linux")]
+#[test]
+fn argument_memory_probe_entry() {
+    if std::env::var_os(ARGUMENTS_ENV).is_none() {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (grew, seen) = runtime.block_on(async {
+        let hold = tool_with(
+            cyrup_codemode::types::ToolDeclaration::new("hold"),
+            |args, _| {
+                let copy = serde_json::to_string(&args).unwrap();
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let length = args
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .map_or(0, str::len);
+                    drop(copy);
+                    Ok(Some(json!(length)))
+                })
+            },
+        );
+        let sandbox = isolated(
+            host(ENTRY, ENTRY_ENV),
+            SandboxOptions {
+                tools: vec![hold],
+                memory_limit_bytes: Some(256 << 20),
+                deadline: Deadline::After(Duration::from_secs(60)),
+                ..SandboxOptions::default()
+            },
+        );
+        // The first script pays for starting the first sandbox process and everything lazy.
+        run(&sandbox, "return await tools.hold('x')").await;
+        let before = peak_resident_kib();
+        let result = run(
+            &sandbox,
+            &format!("return await tools.hold('x'.repeat({ARGUMENT_CHARS}))"),
+        )
+        .await;
+        let after = peak_resident_kib();
+        (after.saturating_sub(before), value(&result))
+    });
+    println!(
+        "argument-memory seen={} grew_kib={grew}",
+        seen.unwrap_or_default()
+    );
+    std::process::exit(0);
+}
+
+/// `CODE-053`: the host held a running call's arguments several times over: the frame they crossed
+/// the pipe in, kept as the reader's buffer for the rest of the execution; the reader's own buffer
+/// for unescaping them, since they crossed as a JSON string; the text, alive while the tool's first
+/// poll ran the nested pipeline; and the parsed value. It holds the frame and one copy at a time
+/// now, then the parsed value only, so the tool's one copy makes two.
+///
+/// The contract is a ratio to the size of the arguments, not a number of megabytes: what the host
+/// is before the call depends on the machine and the build, what each character of a call's
+/// arguments costs it does not. Linux only (`VmHWM`), in a process of its own, because the peak of
+/// a process that also runs other tests is not this test's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_running_calls_arguments_cost_the_sandbox_host_two_copies_of_their_text() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", ARGUMENTS, "--nocapture"])
+        .env(ARGUMENTS_ENV, "1")
+        .env(LIVE_MEMORY.0, LIVE_MEMORY.1)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let field = |name: &str| -> u64 {
+        stdout
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix(name))
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `{name}` in the probe's output\nstatus {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            })
+    };
+    assert_eq!(field("seen="), ARGUMENT_CHARS as u64, "{stdout}");
+    let ratio = (field("grew_kib=") * 1024) as f64 / ARGUMENT_CHARS as f64;
+    println!("a running call's arguments cost the sandbox host {ratio:.2} times their text");
+    assert!(
+        ratio < 2.5,
+        "a running call's arguments cost the sandbox host {ratio:.2} times their text"
+    );
+}

@@ -220,12 +220,15 @@ impl NestedToolCallRunner {
             thought_signature: None,
             namespace: None,
         };
-        let args_value = Value::Object((*call.arguments).clone());
         let record = lock(&recorder).start(&call);
+        // The event's copy is the only one made here, and it is gone once the event is delivered:
+        // the call's arguments are held once, by the call, for as long as it runs (CODE-053). A
+        // copy kept beside the call for the events was one more copy of a script's arguments for
+        // the whole of a nested call.
         host.emit(NestedToolExecutionEvent::ToolExecutionStart {
             tool_call_id: call.id.clone(),
             tool_name: name.to_string(),
-            args: args_value.clone(),
+            args: Value::Object((*call.arguments).clone()),
             parent_tool_call_id: caller.clone(),
         })
         .await;
@@ -251,7 +254,6 @@ impl NestedToolCallRunner {
                     caller_holds_queue,
                     &recorder,
                     call.clone(),
-                    &args_value,
                     cancel,
                     on_update,
                 )
@@ -290,7 +292,6 @@ impl NestedToolCallRunner {
         caller_holds_queue: bool,
         recorder: &Arc<Mutex<NestedCallRecorder>>,
         call: ToolCall,
-        args_value: &Value,
         cancel: Option<CancelToken>,
         on_update: Option<ToolUpdateSink>,
     ) -> ToolCallOutcome {
@@ -320,8 +321,7 @@ impl NestedToolCallRunner {
             scopes: &self.scopes,
             id: call.id.clone(),
         };
-        self.drive(host, caller, call, args_value, cancel, on_update)
-            .await
+        self.drive(host, caller, call, cancel, on_update).await
     }
 
     /// Run the call through the host while relaying its partial results: each goes to the caller's
@@ -331,7 +331,6 @@ impl NestedToolCallRunner {
         host: &dyn NestedToolCallHost,
         caller: &ToolCallId,
         call: ToolCall,
-        args_value: &Value,
         cancel: Option<CancelToken>,
         mut on_update: Option<ToolUpdateSink>,
     ) -> ToolCallOutcome {
@@ -343,6 +342,9 @@ impl NestedToolCallRunner {
         });
         let call_id = call.id.clone();
         let name = call.name.clone();
+        // A handle on the call's own arguments (cloning `LazyArgs` copies a pointer); an update
+        // event's copy is made when the event is.
+        let arguments = call.arguments.clone();
         let relay = async |update: ToolUpdate, on_update: &mut Option<ToolUpdateSink>| {
             if let Some(f) = on_update.as_mut() {
                 f(update.clone());
@@ -350,7 +352,7 @@ impl NestedToolCallRunner {
             host.emit(NestedToolExecutionEvent::ToolExecutionUpdate {
                 tool_call_id: call_id.clone(),
                 tool_name: name.clone(),
-                args: args_value.clone(),
+                args: Value::Object((*arguments).clone()),
                 partial_result: update_value(&update),
                 parent_tool_call_id: caller.clone(),
             })

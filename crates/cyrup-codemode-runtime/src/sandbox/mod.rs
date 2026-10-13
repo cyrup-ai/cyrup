@@ -202,20 +202,32 @@ pub const MAX_PENDING_CALLS: usize = 10_000;
 /// sandbox process down. The call that would pass this throws a `RangeError` in the script, as the
 /// call past [`MAX_PENDING_CALLS`] does. A call whose arguments alone pass it can never be made.
 ///
-/// A character of JSON weighs one, so this is 32 Mi characters of strings (what one call of
-/// 30 million characters cost the host: about 200 MB, on a debug build). Data made of many small
-/// values weighs more, by [`ARGUMENT_COMMA_WEIGHT`] and [`ARGUMENT_CONTAINER_WEIGHT`].
+/// A character of JSON weighs one, so this is 32 Mi characters of strings. Measured on a debug build
+/// of the pipeline as it is since CODE-053 (the real binary, a scripted model, the host process
+/// alone, over an idle host of 146-148 MB), one call of 30 million characters cost the host 3.0, 4.0
+/// or 5.1 bytes a character from run to run (2.9-3.0 bytes of it live, the rest blocks of 30 MB the
+/// allocator kept), so a limit's worth of strings is 100-170 MB. Data made of many small values
+/// weighs more, by [`ARGUMENT_COMMA_WEIGHT`] and [`ARGUMENT_CONTAINER_WEIGHT`].
 pub const MAX_PENDING_ARGUMENT_WEIGHT: usize = 32 * 1024 * 1024;
 /// [CYRUP-DELTA] What each comma in the JSON of a call's arguments adds to its weight (see
 /// [`MAX_PENDING_ARGUMENT_WEIGHT`]): an array element or an object member is a value of its own to
-/// the host. Measured on a debug build, one call with 2 million integers took the host 654 MB (330
-/// bytes for each, which weighs 55 here) and one with a million short strings 447 MB (450 bytes for
-/// each, 58 here), so a limit's worth of either is 200 to 260 MB.
+/// the host. Measured as that limit is, with the weights at zero: one call with 2 million integers
+/// took the host 444 MB (222 bytes for each, which weighs 55 here) and one with a million short
+/// strings 329 MB (329 bytes for each, 55 here), so a limit's worth of either is 134 to 201 MB.
+///
+/// Before CODE-053 removed the extra copies from the pipeline the same calls took 654 and 447 MB and a
+/// character 6.8 bytes, and the weights were calibrated to a limit's worth of 200 to 260 MB. A
+/// character's cost fell further than a small value's, so the weight that would make each value
+/// cost what its weight in characters costs is now 48 for an integer and 75 for a short string, at
+/// 4 bytes a character. The weight is kept: a limit's worth of every shape costs less than it did,
+/// and no more than about 1.2 times the dearest run of a limit's worth of characters.
 pub const ARGUMENT_COMMA_WEIGHT: usize = 48;
 /// [CYRUP-DELTA] What each array and object in the JSON of a call's arguments adds to its weight
-/// (see [`MAX_PENDING_ARGUMENT_WEIGHT`]). A small object costs the host a map besides its members: one
-/// call with 250 thousand `{ a: n }` took it 589 MB (2.4 KB each, 316 here) and two with a million
-/// each 3.2 GB, so a limit's worth is 170 to 250 MB.
+/// (see [`MAX_PENDING_ARGUMENT_WEIGHT`]). A small object costs the host a map besides its members:
+/// measured as that limit is, one call with 250 thousand `{ a: n }` took it 488 MB (1953 bytes
+/// each, 316 here), so a limit's worth is 207 MB. It took 589 MB before CODE-053 (2.4 KB each),
+/// when a limit's worth was 170 to 250 MB; the weight that would match 4 bytes a character is now
+/// 428, and it is kept at 256 for the reason [`ARGUMENT_COMMA_WEIGHT`] is kept.
 pub const ARGUMENT_CONTAINER_WEIGHT: usize = 256;
 /// [CYRUP-DELTA] Largest image `image()` accepts, decoded. Providers reject an image over about
 /// 5 MB, and an image block that was saved to the conversation is sent again with every later turn.

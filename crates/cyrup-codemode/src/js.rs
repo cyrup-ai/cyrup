@@ -100,27 +100,58 @@ pub fn number_to_string(value: f64) -> String {
 /// [`own_keys`] order.
 #[must_use]
 pub fn json_stringify(value: &Value) -> String {
+    let mut text = Vec::new();
+    // Writing to a `Vec` cannot fail, and every piece written is UTF-8.
+    let _ = json_stringify_to(value, &mut text);
+    String::from_utf8(text).unwrap_or_default()
+}
+
+/// [`json_stringify`] written to `out` piece by piece, as the text is produced: nothing the size of
+/// the whole text is built, and an `out` that fails (one that has read all it wants) stops the walk.
+/// A string is handed over in runs of UTF-8 between its escapes, each a whole number of characters.
+///
+/// # Errors
+///
+/// Whatever `out` returns.
+pub fn json_stringify_to(value: &Value, out: &mut impl std::io::Write) -> std::io::Result<()> {
     match value {
-        Value::Null => "null".to_owned(),
-        Value::Bool(flag) => flag.to_string(),
-        Value::Number(number) => number
-            .as_f64()
-            .map_or_else(|| "null".to_owned(), number_to_string),
-        Value::String(text) => serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned()),
+        Value::Null => out.write_all(b"null"),
+        Value::Bool(flag) => out.write_all(if *flag { b"true" } else { b"false" }),
+        Value::Number(number) => {
+            let text = number
+                .as_f64()
+                .map_or_else(|| "null".to_owned(), number_to_string);
+            out.write_all(text.as_bytes())
+        }
+        Value::String(text) => {
+            serde_json::to_writer(&mut *out, text).map_err(std::io::Error::other)
+        }
         Value::Array(items) => {
-            let items: Vec<String> = items.iter().map(json_stringify).collect();
-            format!("[{}]", items.join(","))
+            out.write_all(b"[")?;
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.write_all(b",")?;
+                }
+                json_stringify_to(item, out)?;
+            }
+            out.write_all(b"]")
         }
         Value::Object(map) => {
-            let members: Vec<String> = own_keys(map)
-                .into_iter()
-                .filter_map(|key| {
-                    let member = map.get(key)?;
-                    let key = serde_json::to_string(key).ok()?;
-                    Some(format!("{key}:{}", json_stringify(member)))
-                })
-                .collect();
-            format!("{{{}}}", members.join(","))
+            out.write_all(b"{")?;
+            let mut first = true;
+            for key in own_keys(map) {
+                let Some(member) = map.get(key) else {
+                    continue;
+                };
+                if !first {
+                    out.write_all(b",")?;
+                }
+                first = false;
+                serde_json::to_writer(&mut *out, key).map_err(std::io::Error::other)?;
+                out.write_all(b":")?;
+                json_stringify_to(member, out)?;
+            }
+            out.write_all(b"}")
         }
     }
 }
