@@ -510,14 +510,17 @@ fn first_prompt_title(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     text.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|entry| entry["type"] == "message" && entry["message"]["role"] == "user")
+        .filter(|entry| {
+            entry.get("type").and_then(Value::as_str) == Some("message")
+                && entry.pointer("/message/role").and_then(Value::as_str) == Some("user")
+        })
         .find_map(|entry| {
-            let joined = match &entry["message"]["content"] {
-                Value::String(text) => text.clone(),
-                Value::Array(blocks) => blocks
+            let joined = match entry.pointer("/message/content") {
+                Some(Value::String(text)) => text.clone(),
+                Some(Value::Array(blocks)) => blocks
                     .iter()
-                    .filter(|b| b["type"] == "text")
-                    .filter_map(|b| b["text"].as_str())
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(Value::as_str))
                     .collect::<Vec<_>>()
                     .join(" "),
                 _ => String::new(),

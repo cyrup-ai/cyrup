@@ -1539,24 +1539,16 @@ mod tests {
         ContentBlock::Text(TextContent::new(s))
     }
 
-    // ---- ACP-276 … ACP-281 ---------------------------------------------------------------------
-
-    /// ACP-276 / ACP-277 — `test/unit/prompt-to-pi-message.test.ts`'s first case, byte-for-byte.
-    /// Text concatenates with no separator and no trimming; a resource link contributes
-    /// `\n[Context] <uri>` from the raw uri alone.
-
-    fn text_block(t: &str) -> ContentBlock {
-        ContentBlock::Text(TextContent::new(t))
-    }
+    // ---- ACP-299 -------------------------------------------------------------------------------
 
     /// ACP-299 — text blocks joined with a space, whitespace runs collapsed, trimmed.
     #[test]
     fn acp299_a_prompt_titles_from_its_text_normalised() {
         assert_eq!(
-            prompt_to_session_title(&[text_block("  Fix\n\nthe   bug  "), text_block("now")]),
+            prompt_to_session_title(&[text("  Fix\n\nthe   bug  "), text("now")]),
             Some("Fix the bug now".to_string())
         );
-        assert_eq!(prompt_to_session_title(&[text_block(" \n\t ")]), None);
+        assert_eq!(prompt_to_session_title(&[text(" \n\t ")]), None);
         assert_eq!(prompt_to_session_title(&[]), None);
     }
 
@@ -1566,11 +1558,16 @@ mod tests {
     fn acp299_an_astral_prompt_clips_to_eighty_characters() {
         let prompt = format!("\u{1F600}{}", "a".repeat(80));
         assert_eq!(prompt.chars().count(), 81);
-        let title = prompt_to_session_title(&[text_block(&prompt)]).unwrap();
+        let title = prompt_to_session_title(&[text(&prompt)]).unwrap();
         assert_eq!(title.chars().count(), 80);
         assert!(title.starts_with('\u{1F600}'));
     }
 
+    // ---- ACP-276 … ACP-281 ---------------------------------------------------------------------
+
+    /// ACP-276 / ACP-277 — `test/unit/prompt-to-pi-message.test.ts`'s first case, byte-for-byte.
+    /// Text concatenates with no separator and no trimming; a resource link contributes
+    /// `\n[Context] <uri>` from the raw uri alone.
     #[test]
     fn text_and_resource_links_concatenate_exactly_as_upstream() {
         let (message, images) = prompt_to_user_input(&[
