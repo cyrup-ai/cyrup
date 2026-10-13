@@ -752,10 +752,11 @@ async fn run() -> anyhow::Result<i32> {
         // pi marks the scoped-`--models` resolution separately (`time("resolveModelScope")`,
         // main.ts:842); in cyrup that work happens inside `session_launch::apply_post_build`.
         timings::time("resolveModelScope", timings::TimingLabel::Main);
-        // SEAM-033 — announce NOW, after `--name`/`--models`, which is where pi's interactive host
-        // does it (its own `bindExtensions` inside `InteractiveMode`, the sibling of
-        // print-mode.ts:73 / rpc-mode.ts:319). Idempotent per session.
-        session.bind_extensions().await;
+        // SEAM-033 — the session is announced after `--name`/`--models`, which is where pi's
+        // interactive host does it (its own `bindExtensions` inside `InteractiveMode`, the sibling
+        // of print-mode.ts:73 / rpc-mode.ts:319). SEAM-164 — not here but in `run_interactive`
+        // (`App::announce_session`), once the TUI's effect drain is attached, so the state a
+        // `session_start` handler sets reaches the footer.
         // EXT-027 — the interactive host's startup catalog refresh (`interactive-mode.ts:1115-1126`
         // `run()`, `void refreshModelCatalogs(modelRuntime, signal)`), for the providers extensions
         // registered. Detached, offline-gated, and (as pi's `run()` is) after the extensions are
@@ -799,6 +800,9 @@ async fn run() -> anyhow::Result<i32> {
         // It comes after the `readPipedStdin` / `prepareInitialMessage` marks, as pi's does
         // (main.ts:885/:888), so the benchmark table carries every `main` row (AGENT-027).
         if timings::startup_benchmark_enabled() {
+            // The benchmark never reaches `run_interactive`, where the session is announced
+            // (SEAM-164), so it is announced here, where it always was for this path.
+            session.bind_extensions().await;
             interactive::run_interactive_benchmark().await?;
             timings::time("interactiveMode.init", timings::TimingLabel::Main);
             timings::print_timings();

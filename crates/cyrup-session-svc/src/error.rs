@@ -16,6 +16,12 @@ pub enum SessionServiceError {
     #[error("agent: {0}")]
     Agent(#[from] cyrup_agent::AgentError),
 
+    /// SEAM-165 — a `prompt` deferred past `agent_settled` did not complete: it failed when it ran,
+    /// or it never ran because an action deferred ahead of it failed (which ends the deferred
+    /// actions, as pi's throw leaves its `for`) or the session went away first.
+    #[error("prompt deferred past agent_settled: {0}")]
+    DeferredPromptDropped(String),
+
     #[error("session: {0}")]
     Session(#[from] cyrup_session::SessionError),
 

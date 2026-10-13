@@ -67,7 +67,12 @@ impl App<InlineBackend<TuiStdout>> {
         // mode already installs this (`crates/cyrup-modes/src/rpc.rs`'s `run_rpc`); without the same
         // install here every fire-and-forget extension UI call vanished in the DEFAULT mode. Also
         // re-installed on session swap below, for the same reason `ui_tx` is.
-        let (ui_effect_tx, mut ui_effect_rx) = tokio::sync::mpsc::unbounded_channel::<UiEffect>();
+        // SEAM-164 — the channel the composition root may already have attached and announced
+        // through ([`App::ui_effect_sender`]); a fresh one otherwise.
+        let (ui_effect_tx, mut ui_effect_rx) = self
+            .early_effects
+            .take()
+            .unwrap_or_else(tokio::sync::mpsc::unbounded_channel::<UiEffect>);
         // The THIRD extension seam (TUI-S02): the contained-fault listener Pi's interactive mode
         // passes as `bindExtensions({ … onError })` (`interactive-mode.ts:1700-1701`). Every guest
         // handler fault the dispatcher contains + skips — or contains and turns into a BLOCK — is
@@ -102,6 +107,12 @@ impl App<InlineBackend<TuiStdout>> {
         // session swap below, for the same reason `ui_tx` is.
         let (theme_switch_tx, mut theme_switch_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::theme_access::ThemeSwitch>();
+        // SEAM-164 — announce with the effect drain attached, as pi's interactive host binds the
+        // mode's `uiContext` before `bindExtensions` emits `session_start`
+        // (`bindCurrentSessionExtensions`, `interactive-mode.ts:1971-1975` @f1b2e77f5). The
+        // composition root has normally announced already (`App::announce_session`), which makes
+        // this a no-op; it covers an embedder that did not. See [`App::announce_with_effects`].
+        Self::announce_with_effects(&session, ui_effect_tx.clone()).await;
         Self::install_ui_sinks(
             &session.services().host_services,
             ui_tx.clone(),

@@ -464,6 +464,16 @@ impl AgentSessionRuntime {
         };
         {
             let current = self.session().await;
+            // SEAM-164 — the replacement speaks through the mode's effect drain from its first
+            // moment. The mode rebinds onto the new session only after the generation bump below,
+            // which is after the announcement, so without this a status or title the new
+            // session's `session_start` handlers set was dropped: the replacement's host services
+            // had no drain yet. pi's `rebindSession` binds the mode's `uiContext` before
+            // `bindExtensions` emits `session_start` (`rpc-mode.ts:317-320` @f1b2e77f5). The mode
+            // re-attaching the same drain on its rebind is a no-op.
+            if let Some(drain) = current.services().host_services.attached_ui_effect_sink() {
+                next.services().host_services.set_ui_effect_sink(drain);
+            }
             // Pi `teardownCurrent` (agent-session-runtime.ts:167-177): abort+settle, emit
             // `session_shutdown`, run the host's `beforeSessionInvalidate`, THEN invalidate. cyrup's
             // `dispose_with` carries the middle two and fires the hook at pi's exact position (after

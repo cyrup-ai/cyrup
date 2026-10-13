@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionRuntime, BashOptions, Content, EntryId,
-    EventStream, ForkPosition, InputSource, NotifyKind, PromptAccepted, PromptOptions, UiEffect,
-    UiKind, UiReply, UiRequest, UserInput,
+    EventStream, ForkPosition, InputSource, NotifyKind, PromptAccepted, PromptOptions, PromptReply,
+    UiEffect, UiKind, UiReply, UiRequest, UserInput,
 };
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -423,15 +423,7 @@ where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
-    // SEAM-033 — pi's RPC host announces the session ITSELF, from `rpc-mode.ts:319`, not from
-    // `createAgentSessionRuntime` (which never emits `session_start`,
-    // `agent-session-runtime.ts:414-432`). The distinction is load-bearing: `main.ts` applies
-    // `--name` (`:650`) and the scoped `--models` (`:742-750`) BETWEEN building the session and
-    // running the mode, so announcing at construction time showed every `session_start` handler a
-    // session with no display name and the pre-scope model. Idempotent per session
-    // (`AgentSession::emit_session_start` latches), so a host that already announced is unaffected.
-    runtime.session().await.bind_extensions().await;
-
+    // The session is announced by `rpc_driver`, once its effect drain is attached (SEAM-164).
     let (out, out_rx) = mpsc::unbounded_channel::<RpcOut>();
     let mut pump = std::pin::pin!(write_pump(writer, out_rx));
     // Set only when the pump finished FIRST, which can only mean a write error (it otherwise runs
@@ -507,7 +499,6 @@ where
     // Installed on the active session's `LiveHostServices` (re-installed on every rebind, since a
     // replacement brings a fresh backend). `pending` mirrors Pi's `pendingExtensionRequests`.
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiRequest>();
-    session.services().host_services.set_ui_sink(ui_tx.clone());
     let mut pending: HashMap<String, PendingUi> = HashMap::new();
 
     // The fire-and-forget extension-effect drain: a loaded guest's `ui.{notify,set-status,set-widget,
@@ -520,6 +511,28 @@ where
         .services()
         .host_services
         .set_ui_effect_sink(ui_effect_tx.clone());
+
+    // SEAM-033 — pi's RPC host announces the session ITSELF, from `rpc-mode.ts:319`, not from
+    // `createAgentSessionRuntime` (which never emits `session_start`,
+    // `agent-session-runtime.ts:414-432`). The distinction is load-bearing: `main.ts` applies
+    // `--name` (`:650`) and the scoped `--models` (`:742-750`) BETWEEN building the session and
+    // running the mode, so announcing at construction time showed every `session_start` handler a
+    // session with no display name and the pre-scope model. Idempotent per session
+    // (`AgentSession::emit_session_start` latches), so a host that already announced is unaffected.
+    //
+    // SEAM-164 — AFTER the effect drain above, as pi binds the mode's `uiContext` in
+    // `rebindSession` before `bindExtensions` emits `session_start` (`rpc-mode.ts:317-320`
+    // @f1b2e77f5): a status, widget, title or editor text a `session_start` handler sets once is
+    // queued on the drain and relayed when the loop below runs, instead of being dropped because
+    // no drain existed yet.
+    //
+    // [CYRUP-DELTA] — and BEFORE the dialog sink below. A dialog (`confirm`, `select`, …) is
+    // answered by this loop, which is not running while the announcement is awaited; with the sink
+    // attached first, a `session_start` handler that opened one would wait on a loop that cannot
+    // start until it returns. Without the sink it gets the dialog's default at once, as it did
+    // before this change. pi's handler would get a real dialog, answered once its loop runs.
+    session.bind_extensions().await;
+    session.services().host_services.set_ui_sink(ui_tx.clone());
 
     // The contained-extension-fault sink (Pi `bindExtensions({ onError })`, rpc-mode.ts:347-349):
     // every guest handler fault the dispatcher contains + skips (R-08-036) is surfaced to the client
@@ -591,7 +604,10 @@ where
     // while the agent streams via `events`) stay INLINE: they own the `in_flight` flag, and running
     // them inline keeps that flag set before the event stream is next polled (no set-true / observe-
     // `agent_end` reordering race that a drain-time set would introduce).
-    let mut dispatches = FuturesUnordered::new();
+    // Boxed: besides `dispatch_owned`, it holds the answer of a `prompt` deferred past
+    // `agent_settled` (SEAM-165; see [`RunControl::Later`]).
+    let mut dispatches: FuturesUnordered<futures::future::BoxFuture<'_, Dispatched>> =
+        FuturesUnordered::new();
 
     // SEAM-158: the run-control command (`prompt`/`steer`/`follow_up`) in progress, on a TASK of
     // its own. Its preparation runs the `before_agent_start` chain, and a handler there may open a
@@ -607,7 +623,7 @@ where
     // `inline_backlog` and is serviced in order afterwards, as it was when the loop simply blocked —
     // so a `clear_queue` after a `steer`, or a command after an extension's session swap, sees the
     // state that command left.
-    let mut inline: Option<tokio::task::JoinHandle<(Dispatched, bool)>> = None;
+    let mut inline: Option<tokio::task::JoinHandle<(RunControl, bool)>> = None;
     let mut inline_backlog: VecDeque<String> = VecDeque::new();
 
     loop {
@@ -666,7 +682,7 @@ where
                             // queued behind it. The response is written when the future completes,
                             // in the `select_next_some` arm below; any resulting replacement is
                             // picked up by the generation arm.
-                            dispatches.push(dispatch_owned(runtime, Arc::clone(&session), line));
+                            dispatches.push(dispatch_owned(runtime, Arc::clone(&session), line).boxed());
                         }
                     }
                     None => {
@@ -701,10 +717,27 @@ where
                 inline = None;
                 // A panicked dispatch has no response to write; the line is lost as it would have
                 // been had the panic unwound through the inline await.
-                if let Ok((dispatched, started_run)) = joined {
+                if let Ok((answer, started_run)) = joined {
                     // The flag the inline arm used to set through `&mut in_flight`; only ever set.
                     in_flight |= started_run;
-                    let _ = out.send(RpcOut::Response(dispatched.response));
+                    match answer {
+                        RunControl::Answer(response) => {
+                            let _ = out.send(RpcOut::Response(response));
+                        }
+                        // SEAM-165 — a `prompt` deferred past `agent_settled` is answered when
+                        // it runs, from the concurrent set, so the loop (and the lines waiting
+                        // behind this command) is not held while the settle's handlers run.
+                        RunControl::Later(answer) => {
+                            dispatches.push(
+                                async move {
+                                    Dispatched {
+                                        response: answer.await,
+                                    }
+                                }
+                                .boxed(),
+                            );
+                        }
+                    }
                 }
                 // Pi's post-command `await checkShutdownRequested()` (rpc-mode.ts:786).
                 shutdown_checkpoint = true;
@@ -812,7 +845,7 @@ where
                     line,
                 )));
             } else {
-                dispatches.push(dispatch_owned(runtime, Arc::clone(&session), line));
+                dispatches.push(dispatch_owned(runtime, Arc::clone(&session), line).boxed());
             }
         }
 
@@ -958,22 +991,32 @@ async fn dispatch(
 /// (the three arms never touch it), and reports whether it set the `in_flight` latch instead of
 /// writing through the loop's borrow. See `rpc_driver`'s `inline` for why it must not run on the
 /// loop's task.
-async fn dispatch_run_control(session: Arc<AgentSession>, line: String) -> (Dispatched, bool) {
+async fn dispatch_run_control(session: Arc<AgentSession>, line: String) -> (RunControl, bool) {
     let mut started_run = false;
-    let response = match parse_command(&line) {
+    let answer = match parse_command(&line) {
         Ok((cmd, raw_id)) => {
             match handle_run_control(&session, cmd, raw_id, &mut started_run).await {
-                Ok(response) => response,
+                Ok(answer) => answer,
                 // Unreachable through `is_inline_command`, which admits only the three run-control
                 // types; answered rather than assumed.
-                Err((_, raw_id)) => {
-                    RpcResponse::err("unknown", raw_id, "not a run-control command".to_string())
-                }
+                Err((_, raw_id)) => RunControl::Answer(RpcResponse::err(
+                    "unknown",
+                    raw_id,
+                    "not a run-control command".to_string(),
+                )),
             }
         }
-        Err(response) => *response,
+        Err(response) => RunControl::Answer(*response),
     };
-    (Dispatched { response }, started_run)
+    (answer, started_run)
+}
+
+/// What a run-control command answers (SEAM-165): its response now, or — for a `prompt` deferred
+/// past `agent_settled` — the response once the deferred prompt has run, which pi's host writes
+/// from the deferred `preflightResult` (`rpc-mode.ts:394-414` @f1b2e77f5).
+enum RunControl {
+    Answer(RpcResponse),
+    Later(futures::future::BoxFuture<'static, RpcResponse>),
 }
 
 /// Steps (1)-(3) of [`dispatch`]: parse, recover the id, deserialize. `Err` is the error response
@@ -1053,6 +1096,19 @@ fn disposition_data(accepted: PromptAccepted) -> Value {
     })
 }
 
+/// The `prompt` response for `result` — pi `output(success(id, "prompt", { disposition }))` from
+/// `preflightResult` (SEAM-162; `rpc-mode.ts:394-414`, the `output` at :405), or `error(id,
+/// "prompt", message)` from its `.catch`.
+fn prompt_response(
+    id: Option<Value>,
+    result: Result<PromptAccepted, cyrup_session_svc::SessionServiceError>,
+) -> RpcResponse {
+    match result {
+        Ok(accepted) => RpcResponse::ok("prompt", id, Some(disposition_data(accepted))),
+        Err(e) => RpcResponse::err("prompt", id, e.to_string()),
+    }
+}
+
 /// The run-control arms of [`handle`] (`prompt`/`steer`/`follow_up`) — split out so SEAM-158's
 /// [`dispatch_run_control`] can run them without a runtime. `Err` hands back any other command,
 /// with its id, untouched.
@@ -1061,7 +1117,7 @@ async fn handle_run_control(
     cmd: SessionCommand,
     raw_id: Option<Value>,
     in_flight: &mut bool,
-) -> Result<RpcResponse, (SessionCommand, Option<Value>)> {
+) -> Result<RunControl, (SessionCommand, Option<Value>)> {
     Ok(match cmd {
         SessionCommand::Prompt {
             message,
@@ -1070,19 +1126,30 @@ async fn handle_run_control(
         } => {
             let id = raw_id.clone();
             let input = user_input(message, images);
+            // SEAM-165 — `prompt_with_answer`, so a prompt deferred past `agent_settled` is
+            // answered with what it really did (or its error) when it runs, as pi's deferred
+            // `preflightResult` writes the response then. This arm runs on a task of its own
+            // (SEAM-158), so waiting here holds up neither the loop nor the settle.
             match session
-                .prompt_with(input, PromptOptions { streaming_behavior })
+                .prompt_or_defer(input, PromptOptions { streaming_behavior })
                 .await
             {
-                Ok(accepted) => {
-                    if !matches!(accepted, PromptAccepted::Handled) {
+                PromptReply::Now(result) => {
+                    if matches!(&result, Ok(accepted) if !matches!(accepted, PromptAccepted::Handled))
+                    {
                         *in_flight = true;
                     }
-                    // SEAM-162 — pi `output(success(id, "prompt", { disposition }))` from
-                    // `preflightResult` (rpc-mode.ts:394-414, the `output` at :405).
-                    RpcResponse::ok("prompt", id, Some(disposition_data(accepted)))
+                    RunControl::Answer(prompt_response(id, result))
                 }
-                Err(e) => RpcResponse::err("prompt", id, e.to_string()),
+                // SEAM-165 — deferred past `agent_settled`: answered when it runs. The latch is set
+                // now, as it was when this answered `started` at once; the settle in progress clears
+                // it, as before.
+                PromptReply::Deferred(answered) => {
+                    *in_flight = true;
+                    RunControl::Later(
+                        async move { prompt_response(id, answered.answer().await) }.boxed(),
+                    )
+                }
             }
         }
         SessionCommand::Steer { message, images } => {
@@ -1090,9 +1157,13 @@ async fn handle_run_control(
             match session.steer(user_input(message, images)).await {
                 Ok(accepted) => {
                     latch_if_running(session, in_flight);
-                    RpcResponse::ok("steer", id, Some(disposition_data(accepted)))
+                    RunControl::Answer(RpcResponse::ok(
+                        "steer",
+                        id,
+                        Some(disposition_data(accepted)),
+                    ))
                 }
-                Err(e) => RpcResponse::err("steer", id, e.to_string()),
+                Err(e) => RunControl::Answer(RpcResponse::err("steer", id, e.to_string())),
             }
         }
         SessionCommand::FollowUp { message, images } => {
@@ -1100,9 +1171,13 @@ async fn handle_run_control(
             match session.follow_up(user_input(message, images)).await {
                 Ok(accepted) => {
                     latch_if_running(session, in_flight);
-                    RpcResponse::ok("follow_up", id, Some(disposition_data(accepted)))
+                    RunControl::Answer(RpcResponse::ok(
+                        "follow_up",
+                        id,
+                        Some(disposition_data(accepted)),
+                    ))
                 }
-                Err(e) => RpcResponse::err("follow_up", id, e.to_string()),
+                Err(e) => RunControl::Answer(RpcResponse::err("follow_up", id, e.to_string())),
             }
         }
         other => return Err((other, raw_id)),
@@ -1128,7 +1203,10 @@ async fn handle(
         | SessionCommand::Steer { .. }
         | SessionCommand::FollowUp { .. }) => {
             match handle_run_control(session, cmd, raw_id, in_flight).await {
-                Ok(response) => response,
+                Ok(RunControl::Answer(response)) => response,
+                // Only `dispatch`'s own callers reach a run-control command here (the loop runs
+                // them through `dispatch_run_control`), so waiting for the answer holds up nothing.
+                Ok(RunControl::Later(answer)) => answer.await,
                 Err((_, raw_id)) => RpcResponse::err("unknown", raw_id, "unreachable".to_string()),
             }
         }
