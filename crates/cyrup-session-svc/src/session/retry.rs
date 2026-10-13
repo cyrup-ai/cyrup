@@ -76,7 +76,7 @@ impl AgentSession {
             self.model_for_message(message)
                 .map(|m| m.context_window)
                 .unwrap_or_else(|| {
-                    Self::lock(&self.compaction_model)
+                    self.current_model()
                         .as_ref()
                         .map_or(0, |m| m.context_window)
                 }),

@@ -111,6 +111,48 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     parts.join(": ")
 }
 
+/// The inputs the session's composed registry is a function of — the keys of its snapshot
+/// ([`RegistrySnapshot`], CFG-020) — read in the one order that is consistent.
+pub(super) struct RegistryKey {
+    provider: Arc<dyn Provider>,
+    guest_gen: u64,
+    overlay: Option<Arc<CatalogOverlay>>,
+    virtual_gen: u64,
+}
+
+impl RegistryKey {
+    /// The guest generation FIRST: reading it composes the guest registrations over a moved overlay
+    /// (PROV-165) and rebuilds the installed built-in over it (SEAM-168, both
+    /// `GuestProviderRegistry::revalidate`), which may replace the installed provider, so the
+    /// installed provider and the overlay read after it are the ones that pass saw (or newer, which
+    /// the next read's key catches). Key FOUR is the virtual-model registry's own counter: a
+    /// `register_virtual_model` changes none of the other three.
+    pub(super) fn read(swap: &crate::ProviderSwap, services: &crate::AgentSessionServices) -> Self {
+        let guest_gen = services.guest_providers.generation();
+        let provider = swap.current();
+        let overlay = services.catalog_overlay.load();
+        let virtual_gen = services.virtual_models.generation();
+        Self {
+            provider,
+            guest_gen,
+            overlay,
+            virtual_gen,
+        }
+    }
+
+    /// Whether `other` names exactly these inputs (held `Arc`s, so no address is reused).
+    fn same(&self, other: &Self) -> bool {
+        self.guest_gen == other.guest_gen
+            && self.virtual_gen == other.virtual_gen
+            && std::ptr::addr_eq(Arc::as_ptr(&self.provider), Arc::as_ptr(&other.provider))
+            && match (self.overlay.as_ref(), other.overlay.as_ref()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
 impl AgentSession {
     /// Switch the active model by pattern (`provider/id[:level]`), updating the agent, the
     /// compaction model, and recording a model-change entry (R-11-014 `set_model`).
@@ -186,6 +228,15 @@ impl AgentSession {
             .provider(model.provider.as_str())
         {
             self.provider.store(guest);
+        } else if self.provider.resolves_builtins()
+            && self
+                .services
+                .guest_providers
+                .install_builtin(model.provider.as_str())
+        {
+            // SEAM-168 — the swap's resolver resolves the session's own built-ins, so the session
+            // builds the provider itself, over the overlay the slot holds now, and keeps it current
+            // as the overlay moves (`GuestProviderRegistry::follow_installed_builtin`).
         } else {
             self.provider
                 .resolve_and_store(model.provider.as_str())
@@ -525,23 +576,134 @@ impl AgentSession {
         self.full_model_registry().as_ref().clone()
     }
 
+    /// The session's CURRENT model row — pi's `this.model` (`agent.state.model`) — as the registry
+    /// has it now. EVERY reader of the current model's row goes through here: compaction and
+    /// branch summaries, the context window and limits, the thinking clamp and the supported
+    /// levels, the attribution headers, the retry window and virtual routing's selection.
+    ///
+    /// SEAM-167 — pi re-reads its current model from the runtime after each of the five provider
+    /// actions (`_refreshCurrentModelFromRegistry`, `core/agent-session.ts:3346-3357`, wired
+    /// `:3470-3490` @f1b2e77f5): `getModel(provider, id)`, stored when found and different. Here
+    /// the row is re-read whenever the registry's inputs moved since the row was last taken
+    /// ([`RegistryKey`]): every provider action moves one (the guest generation, or the virtual
+    /// registry's), so this covers pi's five; and so does an overlay reload, which pi does not
+    /// re-read after — `[CYRUP-DELTA]`, because here the REQUEST follows a reload (the agent loop
+    /// resolves its row from the installed provider, which follows the overlay, SEAM-168), and the
+    /// row the limits and compaction read must be the row the request carries. A reader that finds
+    /// nothing moved pays the key read and one comparison.
+    ///
+    /// The host services' mirrored row (an extension's `ctx.model`) is refreshed by the same
+    /// re-read, and eagerly after each provider action ([`Self::refresh_current_model`] from the
+    /// registry's listener, bound in [`AgentSession::into_shared`]), as pi's is.
+    pub(super) fn current_model(&self) -> Option<Model> {
+        let key = RegistryKey::read(&self.provider, &self.services);
+        let fresh = Self::lock(&self.current_model_key)
+            .as_ref()
+            .is_some_and(|taken| taken.same(&key));
+        if !fresh {
+            self.rederive_current_model(key);
+        }
+        Self::lock(&self.compaction_model).clone()
+    }
+
+    /// Re-read the current model's row now — what the registry's provider-action listener calls
+    /// (pi `_refreshCurrentModelFromRegistry`, after each of the five provider actions).
+    pub(crate) fn refresh_current_model(&self) {
+        let _ = self.current_model();
+    }
+
+    /// Take the current model's row from the registry composed for `key` (or newer) when it is
+    /// found there and differs (pi `if (!refreshedModel || refreshedModel === currentModel)
+    /// return`), and push it to every copy of it the session keeps.
+    ///
+    /// Written only if the selection is still the one read: a `/model` or `setModel` that lands
+    /// in between owns the row (and recorded its own key).
+    fn rederive_current_model(&self, key: RegistryKey) {
+        let Some(current) = Self::lock(&self.compaction_model).clone() else {
+            *Self::lock(&self.current_model_key) = Some(key);
+            return;
+        };
+        let refreshed = self
+            .full_model_registry()
+            .iter()
+            .find(|m| m.provider == current.provider && m.id == current.id)
+            .filter(|row| **row != current)
+            .cloned();
+        {
+            let mut selection = Self::lock(&self.compaction_model);
+            if selection.as_ref() != Some(&current) {
+                return;
+            }
+            if let Some(row) = refreshed.as_ref() {
+                *selection = Some(row.clone());
+            }
+            *Self::lock(&self.current_model_key) = Some(key);
+        }
+        if let Some(row) = refreshed {
+            self.push_current_row(&row);
+        }
+    }
+
+    /// Push a re-read current-model row to the copies of it the session keeps beside
+    /// `compaction_model`: the selection's `ModelRef` (its `api`), the agent's model and header
+    /// overlay, the host services' mirror (`ctx.model`, the standalone completion, the context
+    /// usage) and `read`'s image capability and resize profile. The provider and id are unchanged
+    /// by definition, so the transcript records no model change and no `model_select` fires (pi's
+    /// re-read emits nothing either).
+    fn push_current_row(&self, row: &Model) {
+        use cyrup_ext::host::HostServices as _;
+        use futures::FutureExt as _;
+        let model_ref = ModelRef {
+            provider: row.provider.clone(),
+            api: Some(row.api.clone()),
+            model: row.id.clone(),
+        };
+        {
+            let mut selection = Self::lock(&self.model);
+            if selection
+                .as_ref()
+                .is_some_and(|m| m.provider == row.provider && m.model == row.id)
+            {
+                *selection = Some(model_ref.clone());
+            }
+        }
+        // `Agent::set_model` / `set_headers` are `async` by signature only: each body is one
+        // `std::sync::Mutex` write with no `.await`, so the first poll completes it. Called from a
+        // synchronous reader, they are driven to completion here.
+        let _ = self.agent.set_model(Some(model_ref.clone())).now_or_never();
+        let _ = self
+            .agent
+            .set_headers(self.attribution_headers(row))
+            .now_or_never();
+        let level = self.services.host_services.thinking_level();
+        self.services
+            .host_services
+            .update_model(model_ref, row.clone(), level);
+        self.read_model_vision.set(row.supports_image_input());
+        self.read_model_resize.set(row.image_resize_profile());
+    }
+
+    /// Record that the current model was just set to `model` (`/model`, `setModel`, a cycle), so
+    /// it is not re-read until the registry's inputs move again.
+    fn select_current_model(&self, model: Model) {
+        let key = RegistryKey::read(&self.provider, &self.services);
+        let mut selection = Self::lock(&self.compaction_model);
+        *selection = Some(model);
+        *Self::lock(&self.current_model_key) = Some(key);
+    }
+
     /// The FULL multi-provider model registry, deduped by `provider/id`: the session's own installed
     /// provider + guest-registered providers + the compiled-in built-in catalogs, with
     /// `<agent_dir>/models.json` composed over the whole union LAST — Pi's single composed registry
     /// (`ModelRuntime.rebuildProviders`, model-runtime.ts:225-231). This is the resolution /
     /// enumeration source that spans providers, independent of which single provider is installed.
     pub(super) fn full_model_registry(&self) -> Arc<Vec<Model>> {
-        // The guest generation FIRST: reading it composes the guest registrations over a moved
-        // overlay (PROV-165, `GuestProviderRegistry::revalidate`), which may replace the installed
-        // provider, so the installed provider and the overlay read after it are the ones that
-        // re-composition saw (or newer, which the next read's key catches).
-        let guest_gen = self.services.guest_providers.generation();
-        let provider = self.provider.current();
-        let overlay = self.services.catalog_overlay.load();
-        // Key FOUR — the virtual-model registry's own counter. A `register_virtual_model` changes
-        // none of the other three keys, so without this the composed catalog served before the
-        // first registration is served forever (see `model_runtime`'s module docs).
-        let virtual_gen = self.services.virtual_models.generation();
+        let RegistryKey {
+            provider,
+            guest_gen,
+            overlay,
+            virtual_gen,
+        } = RegistryKey::read(&self.provider, &self.services);
 
         // HIT: the same installed provider, the same guest generation and the same overlay compose
         // to the same registry, so hand back the `Arc` (pi reads `this.snapshot.all`, a field).
@@ -578,86 +740,21 @@ impl AgentSession {
     /// Compose the registry from scratch — the body [`Self::full_model_registry`] used to be, run
     /// once per invalidation instead of once per read. Pure: same inputs, same output, no
     /// session-state mutation.
+    ///
+    /// The physical layers are [`compose_physical_registry`], shared with the catalog an
+    /// extension's `registerVirtualModel` is checked against (SEAM-169), so the two can never
+    /// disagree about what is physical.
     fn compose_model_registry(
         &self,
         current: &Arc<dyn Provider>,
         overlay: Option<&Arc<CatalogOverlay>>,
     ) -> Vec<Model> {
-        // --- BASE layer, in Pi's `recomposeProvider` precedence (model-runtime.ts:201) ---
-        // `base = nativeExtensionProviders.get(id) ?? builtins.get(id)`: a registered provider
-        // shadows the compiled-in catalog, and the compiled-in catalog fills in the rest. The
-        // session's own installed provider comes first because it also carries the offline faux
-        // models and any custom-id model that is not a registry entry.
-        //
-        // PROV-162 — a guest-registered id is the COMPOSED provider pi lists: the registration over
-        // its base, already through the base's `models.json` layer (the guest registry composes
-        // over the session's composed base). So its rows REPLACE every other row of that id — the
-        // installed provider's and the compiled-in ones alike — rather than joining them first-wins:
-        // `registerProvider(id, { baseUrl })` lists the base's models at the new URL, and a
-        // registration with `models` lists only its own (pi `applyExtension`,
-        // `provider-composer.ts:345-350` @f1b2e77f5).
-        let guest = self.services.guest_providers.providers();
-        let guest_owned = |m: &Model| {
-            guest
-                .iter()
-                .any(|(id, _)| id.as_str() == m.provider.as_str())
-        };
-        let mut base: Vec<Model> = current
-            .models()
-            .iter()
-            .filter(|m| !guest_owned(m))
-            .cloned()
-            .collect();
-        // Guest-registered providers (Pi folds `registerProvider` models into the same `ModelRegistry`
-        // that `find`/`getAvailable`/`setModel` read, model-registry.ts:917-940).
-        for m in guest.iter().flat_map(|(_, p)| p.models().to_vec()) {
-            if !base
-                .iter()
-                .any(|e| e.provider == m.provider && e.id == m.id)
-            {
-                base.push(m);
-            }
-        }
-        for m in cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
-            credentials: None,
-            auth_context: None,
-            // The LIVE pi.dev overlay (DRIFT-007 + XAI_3), read by the CALLER and passed in so the
-            // composition is provably the one the cache key names. Still no disk and no network on
-            // this SYNC path, and a mid-session refresh still reaches it — installing a fresh
-            // overlay replaces the slot's `Arc`, which is exactly what misses the cache.
-            catalog_overlay: overlay.cloned(),
-        })
-        .get_models(None)
-        {
-            if !guest_owned(&m)
-                && !base
-                    .iter()
-                    .any(|e| e.provider == m.provider && e.id == m.id)
-            {
-                base.push(m);
-            }
-        }
-        // --- TOP layer: `<agent_dir>/models.json` (CFG-002) ---
-        // Pi composes LAST and REPLACES the provider in the collection
-        // (`this.models.setProvider(composeModelProvider(...))`, model-runtime.ts:215), so the
-        // overlay reaches EVERY consumer — including the provider the session is currently running
-        // on, which is the whole point of a `baseUrl` / `compat` / `modelOverrides` block ("point my
-        // provider at a proxy", "raise contextWindow on the model I'm using"). Composing over the
-        // union rather than over the compiled-in catalogs alone is what keeps the current provider's
-        // uncomposed entries from shadowing their composed counterparts. Composition errors were
-        // already reported at startup (`StartupDiagnostics::models`); here a rejected provider block
-        // simply keeps its built-ins.
-        //
-        // A guest-owned id is NOT composed again: its rows already carry its base's `models.json`
-        // layer UNDER the registration (pi's layer order, built-in → `models.json` → extension,
-        // `provider-composer.ts:556-560`), and re-applying the block here would put a `models.json`
-        // `baseUrl` back over the registration's (PROV-162). The rule lives in one place, shared
-        // with the builder's step 3b (SEAM-166).
-        let model_config = self
-            .services
-            .guest_providers
-            .without_guest_blocks(&self.services.model_config);
-        let (composed, _errors) = model_config.compose(&base);
+        let mut composed = compose_physical_registry(
+            current,
+            &self.services.guest_providers,
+            overlay,
+            &self.services.model_config,
+        );
         // --- VIRTUAL layer, applied LAST (pi `recomposeProvider`, model-runtime.ts:171-178) ---
         // pi composes the provider — which is where `models.json` lands — and only THEN wraps the
         // result with `withVirtualModels`, so the virtual rows sit on top of everything above.
@@ -669,7 +766,6 @@ impl AgentSession {
         // (`virtual-models.ts:218`). `apply_to_catalog` removes the colliding row and inserts the
         // virtual one after that provider's last row, which also reproduces pi's observed listing
         // order (physical rows, then virtual rows in registration order).
-        let mut composed = composed;
         self.services.virtual_models.apply_to_catalog(&mut composed);
         composed
     }
@@ -952,7 +1048,7 @@ impl AgentSession {
     /// [`cyrup_agent::Agent::set_headers`] overlay in place.
     pub(super) fn headers_for_model_ref(&self, m: &ModelRef) -> Option<cyrup_provider::HeaderMap> {
         let matches = |c: &Model| c.provider == m.provider && c.id == m.model;
-        let current = Self::lock(&self.compaction_model).clone();
+        let current = self.current_model();
         if let Some(cur) = current.as_ref().filter(|c| matches(c)) {
             return self.attribution_headers(cur);
         }
@@ -1058,7 +1154,7 @@ impl AgentSession {
             // `setModel` seam, and `apply_model_change` is the `/model` one.
             self.read_model_resize.set(m.image_resize_profile());
             self.read_model_vision.set(m.supports_image_input());
-            *Self::lock(&self.compaction_model) = Some(m);
+            self.select_current_model(m);
         }
         self.manager
             .lock()
@@ -1236,7 +1332,7 @@ impl AgentSession {
         };
         self.agent.set_model(Some(model_ref.clone())).await;
         *Self::lock(&self.model) = Some(model_ref.clone());
-        *Self::lock(&self.compaction_model) = Some(next.clone());
+        self.select_current_model(next.clone());
         self.services
             .host_services
             .update_model(model_ref, next.clone(), None);
@@ -1309,4 +1405,111 @@ impl AgentSession {
         self.emit_model_select(next, previous, source).await;
         Ok(new_level)
     }
+}
+
+/// The PHYSICAL layers of the session's composed registry — the installed provider, the guest
+/// registrations, the compiled-in catalogs over the pi.dev `overlay`, and `models.json` over the
+/// union — deduped by `provider/id`. Everything [`AgentSession::full_model_registry`] lists but
+/// the virtual rows.
+///
+/// Shared by the session's registry and by the catalog an extension's `registerVirtualModel` is
+/// checked against ([`crate::virtual_models::LiveVirtualCatalog`], SEAM-169): one spelling of what
+/// is physical.
+///
+/// **The dedupe is first-wins, in this order, and these are the rows that depend on it**
+/// (SEAM-168, enumerated):
+///
+/// 1. the INSTALLED provider's rows win over the compiled-in rows of the same `provider/id`. When
+///    the slot holds the session's own built-in that is no precedence at all: the provider is
+///    rebuilt over the overlay the slot holds before it is read
+///    (`GuestProviderRegistry::follow_installed_builtin`), so its rows ARE the compiled-in rows
+///    over this `overlay`. When it holds an embedder's provider (injected, or resolved by a
+///    resolver that does not declare `resolves_builtins`) its own rows win, which is pi's
+///    native-provider precedence (`nativeExtensionProviders.get(id) ?? builtins.get(id)`,
+///    `core/model-runtime.ts:302` @f1b2e77f5). It also carries the rows no catalog has: the
+///    offline faux models and a custom-id model;
+/// 2. a GUEST-registered id is not first-wins at all: its rows replace every other row of the id
+///    (PROV-162), the installed provider's included;
+/// 3. the compiled-in rows fill in every other `provider/id`;
+/// 4. `models.json` then composes over the union (not over a guest id, SEAM-166), and the virtual
+///    layer the caller applies REPLACES a colliding row rather than joining first-wins.
+pub(crate) fn compose_physical_registry(
+    current: &Arc<dyn Provider>,
+    guest_registry: &crate::GuestProviderRegistry,
+    overlay: Option<&Arc<CatalogOverlay>>,
+    model_config: &cyrup_config::ModelFile,
+) -> Vec<Model> {
+    // --- BASE layer, in Pi's `recomposeProvider` precedence (model-runtime.ts:201) ---
+    // `base = nativeExtensionProviders.get(id) ?? builtins.get(id)`: a registered provider
+    // shadows the compiled-in catalog, and the compiled-in catalog fills in the rest. The
+    // session's own installed provider comes first because it also carries the offline faux
+    // models and any custom-id model that is not a registry entry.
+    //
+    // PROV-162 — a guest-registered id is the COMPOSED provider pi lists: the registration over
+    // its base, already through the base's `models.json` layer (the guest registry composes
+    // over the session's composed base). So its rows REPLACE every other row of that id — the
+    // installed provider's and the compiled-in ones alike — rather than joining them first-wins:
+    // `registerProvider(id, { baseUrl })` lists the base's models at the new URL, and a
+    // registration with `models` lists only its own (pi `applyExtension`,
+    // `provider-composer.ts:345-350` @f1b2e77f5).
+    let guest = guest_registry.providers();
+    let guest_owned = |m: &Model| {
+        guest
+            .iter()
+            .any(|(id, _)| id.as_str() == m.provider.as_str())
+    };
+    let mut base: Vec<Model> = current
+        .models()
+        .iter()
+        .filter(|m| !guest_owned(m))
+        .cloned()
+        .collect();
+    // Guest-registered providers (Pi folds `registerProvider` models into the same `ModelRegistry`
+    // that `find`/`getAvailable`/`setModel` read, model-registry.ts:917-940).
+    for m in guest.iter().flat_map(|(_, p)| p.models().to_vec()) {
+        if !base
+            .iter()
+            .any(|e| e.provider == m.provider && e.id == m.id)
+        {
+            base.push(m);
+        }
+    }
+    for m in cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
+        credentials: None,
+        auth_context: None,
+        // The LIVE pi.dev overlay (DRIFT-007 + XAI_3), read by the CALLER and passed in so the
+        // composition is provably the one the cache key names. Still no disk and no network on
+        // this SYNC path, and a mid-session refresh still reaches it — installing a fresh
+        // overlay replaces the slot's `Arc`, which is exactly what misses the cache.
+        catalog_overlay: overlay.cloned(),
+    })
+    .get_models(None)
+    {
+        if !guest_owned(&m)
+            && !base
+                .iter()
+                .any(|e| e.provider == m.provider && e.id == m.id)
+        {
+            base.push(m);
+        }
+    }
+    // --- TOP layer: `<agent_dir>/models.json` (CFG-002) ---
+    // Pi composes LAST and REPLACES the provider in the collection
+    // (`this.models.setProvider(composeModelProvider(...))`, model-runtime.ts:215), so the
+    // overlay reaches EVERY consumer — including the provider the session is currently running
+    // on, which is the whole point of a `baseUrl` / `compat` / `modelOverrides` block ("point my
+    // provider at a proxy", "raise contextWindow on the model I'm using"). Composing over the
+    // union rather than over the compiled-in catalogs alone is what keeps the current provider's
+    // uncomposed entries from shadowing their composed counterparts. Composition errors were
+    // already reported at startup (`StartupDiagnostics::models`); here a rejected provider block
+    // simply keeps its built-ins.
+    //
+    // A guest-owned id is NOT composed again: its rows already carry its base's `models.json`
+    // layer UNDER the registration (pi's layer order, built-in → `models.json` → extension,
+    // `provider-composer.ts:556-560`), and re-applying the block here would put a `models.json`
+    // `baseUrl` back over the registration's (PROV-162). The rule lives in one place, shared
+    // with the builder's step 3b (SEAM-166).
+    let model_config = guest_registry.without_guest_blocks(model_config);
+    let (composed, _errors) = model_config.compose(&base);
+    composed
 }

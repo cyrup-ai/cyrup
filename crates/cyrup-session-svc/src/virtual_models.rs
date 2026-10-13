@@ -11,9 +11,9 @@
 //!
 //! Once an [`crate::AgentSession`] exists, `AgentSession::register_virtual_model` supplies its own,
 //! richer catalog (`session/virtual_models.rs`'s `SessionVirtualCatalog`, which can answer
-//! `has_configured_auth` from the live credential store). [`StartupVirtualCatalog`] is what the
-//! BUILDER has instead, at the point where pi has already drained its queue: after the extensions
-//! load and before the selection is restored.
+//! `has_configured_auth` from the live credential store). An EXTENSION's registration goes through
+//! the registry sink instead, at the bind flush and after it, and is checked against
+//! [`LiveVirtualCatalog`]: the same physical registry, composed at the check (SEAM-169).
 
 use std::sync::{Arc, Weak};
 
@@ -22,24 +22,108 @@ use cyrup_provider::{Model, VirtualModelCatalog, VirtualModelListener, is_virtua
 
 use crate::guest_providers::GuestProviderRegistry;
 
-/// The catalog the builder's bind-time flush validates virtual-model registrations against — pi's
-/// `modelRuntime` at `agent-session-services.ts:182-194`, which by then holds every provider's
-/// catalog.
+/// SEAM-169 — the catalog an EXTENSION's `registerVirtualModel` (the registry sink's path, at the
+/// bind-time flush and for every registration after it) is validated against: the session's
+/// physical registry AS IT IS AT THE CHECK. pi checks against its live runtime,
+/// `this.models.getModel(providerId, id)` (`core/model-runtime.ts:960` @f1b2e77f5), so a physical
+/// id that only the pi.dev overlay lists is a conflict there and must be here.
 ///
-/// Built from the same three sources `AgentSession::compose_model_registry` unions — the session's
-/// installed provider, the guest-registered providers, and the compiled-in defaults — then composed
-/// through `models.json`, so a physical id the user declared there is seen by the conflict check
-/// too.
+/// It composes [`crate::session::compose_physical_registry`] — the same function, over the same
+/// inputs, as the session's own registry — from the installed provider (the slot once one is
+/// bound, which follows the overlay; before that the provider the session is being built with),
+/// the guest registrations, the overlay the slot holds now and `models.json`. Composed once per
+/// check and never kept; checks are rare (a registration). Never the virtual layer: the registry
+/// calls this while holding its own lock, which that layer reads.
+///
+/// [`StartupVirtualCatalog`] was this catalog until SEAM-169: a list composed ONCE at build, with
+/// no overlay.
+pub(crate) struct LiveVirtualCatalog {
+    guest: Weak<GuestProviderRegistry>,
+    building: Arc<dyn cyrup_provider::Provider>,
+    overlay: Arc<cyrup_provider::CatalogOverlaySlot>,
+    model_config: Arc<cyrup_config::ModelFile>,
+}
+
+impl LiveVirtualCatalog {
+    pub(crate) fn new(
+        guest: &Arc<GuestProviderRegistry>,
+        building: Arc<dyn cyrup_provider::Provider>,
+        overlay: Arc<cyrup_provider::CatalogOverlaySlot>,
+        model_config: Arc<cyrup_config::ModelFile>,
+    ) -> Self {
+        Self {
+            guest: Arc::downgrade(guest),
+            building,
+            overlay,
+            model_config,
+        }
+    }
+
+    /// The physical registry now.
+    fn now(&self) -> Vec<Model> {
+        let Some(guest) = self.guest.upgrade() else {
+            return Vec::new();
+        };
+        let current = guest
+            .installed_provider()
+            .unwrap_or_else(|| Arc::clone(&self.building));
+        crate::session::compose_physical_registry(
+            &current,
+            &guest,
+            self.overlay.load().as_ref(),
+            &self.model_config,
+        )
+    }
+}
+
+impl VirtualModelCatalog for LiveVirtualCatalog {
+    fn get_model(&self, provider: &str, model_id: &str) -> Option<Model> {
+        self.now()
+            .into_iter()
+            .find(|m| m.provider.as_str() == provider && m.id.as_str() == model_id)
+    }
+
+    fn models(&self) -> Vec<Model> {
+        self.now()
+    }
+
+    /// Always `false`, and that is not a stub.
+    ///
+    /// The registry reads this ONLY to suppress the virtual-only marking
+    /// (`model-runtime.ts:962-968`: `if (!recomposeProvider(id) && !configuredProviders.has(id))`),
+    /// and the first conjunct — [`Self::has_physical_provider`] — already decides every case that
+    /// matters. A provider id with physical models is never marked whatever this answers; a
+    /// provider id with none is a virtual-only provider, which is exactly what the marking is for.
+    /// The only state this loses is "a provider with no models but with a stored credential", where
+    /// the marking is redundant rather than wrong, since the provider is configured either way.
+    /// `SessionVirtualCatalog` (`AgentSession::register_virtual_model`) does answer it.
+    fn has_configured_auth(&self, _provider: &str) -> bool {
+        false
+    }
+
+    fn has_physical_provider(&self, provider: &str) -> bool {
+        self.now()
+            .iter()
+            .any(|m| m.provider.as_str() == provider && !is_virtual_model(m))
+    }
+}
+
+/// A FIXED catalog — a list taken once. Until SEAM-169 this was what the builder attached for the
+/// extensions' virtual-model check (composed at build, with no overlay); that check now reads
+/// [`LiveVirtualCatalog`]. Kept for tests that need a catalog of exactly the rows they give.
+#[cfg(test)]
 pub(crate) struct StartupVirtualCatalog {
     models: Vec<Model>,
 }
 
+#[cfg(test)]
 impl StartupVirtualCatalog {
     pub(crate) fn new(models: Vec<Model>) -> Self {
         Self { models }
     }
 }
 
+#[cfg(test)]
 impl VirtualModelCatalog for StartupVirtualCatalog {
     fn get_model(&self, provider: &str, model_id: &str) -> Option<Model> {
         self.models
@@ -52,19 +136,6 @@ impl VirtualModelCatalog for StartupVirtualCatalog {
         self.models.clone()
     }
 
-    /// Always `false`, and that is not a stub.
-    ///
-    /// The registry reads this ONLY to suppress the virtual-only marking
-    /// (`model-runtime.ts:962-968`: `if (!recomposeProvider(id) && !configuredProviders.has(id))`),
-    /// and the first conjunct — [`Self::has_physical_provider`] — already decides every case that
-    /// matters. A provider id with physical models is never marked whatever this answers; a
-    /// provider id with none is a virtual-only provider, which is exactly what the marking is for.
-    /// The only state this loses is "a provider with no models but with a stored credential", where
-    /// the marking is redundant rather than wrong, since the provider is configured either way.
-    ///
-    /// Answering it properly would need the live credential store the builder has not yet handed to
-    /// a session; `SessionVirtualCatalog` does answer it, for every registration made after the
-    /// session opens.
     fn has_configured_auth(&self, _provider: &str) -> bool {
         false
     }

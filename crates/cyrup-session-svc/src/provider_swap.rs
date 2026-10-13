@@ -25,6 +25,34 @@ use crate::cache_warmer::{CacheWarmRequest, CacheWarmer, ProviderWarmStream};
 pub trait ProviderResolver: Send + Sync {
     /// Resolve the provider that owns `provider_id`, with its credentials installed.
     fn resolve(&self, provider_id: &str) -> Result<Arc<dyn Provider>, String>;
+
+    /// SEAM-168 — whether what this resolver resolves, and the provider the session was BUILT
+    /// with, are the session's own built-ins: the provider a built-in or `models.json` id gets from
+    /// the session's composition of the compiled-in catalogs, the pi.dev catalog overlay and
+    /// `models.json` (pi's one provider per id, the `withRemoteCatalog`-wrapped built-in,
+    /// `core/model-runtime.ts:228-233` @f1b2e77f5). The binary's resolver is
+    /// (`BuiltinProviderResolver` over `select_provider`), and its launch provider is
+    /// `select_provider`'s.
+    ///
+    /// When `true`, the session builds such a provider ITSELF and rebuilds it whenever the overlay
+    /// changes ([`crate::GuestProviderRegistry`]), so the installed provider's rows are the rows
+    /// the overlay publishes now. When `false` (the default — an embedder's or a test's resolver),
+    /// what it resolves and the injected provider are the embedder's own and are never replaced:
+    /// pi's native-provider precedence, whose rows are the provider's own.
+    fn resolves_builtins(&self) -> bool {
+        false
+    }
+}
+
+/// SEAM-168 — what the installed slot asks, before it answers [`ProviderSwap::current`], to
+/// bring what it holds up to date with the session's catalog overlay: the session's
+/// [`crate::GuestProviderRegistry`], bound by
+/// [`crate::GuestProviderRegistry::follow_installed`].
+pub(crate) trait InstalledFollower: Send + Sync {
+    /// Re-derive whatever the slot holds that was made over an overlay the slot no longer holds.
+    /// Must never read the slot through [`ProviderSwap::current`] (it reads
+    /// [`ProviderSwap::current_raw`]).
+    fn follow_overlay(&self);
 }
 
 /// The swappable stream source shared between the [`crate::AgentSession`] and its agent loop.
@@ -68,6 +96,10 @@ pub struct ProviderSwap {
     /// this swap as its `StreamFn` — a strong handle would be a cycle and would keep a disposed
     /// session's agent alive. A gone agent answers "not current", which also covers teardown.
     agent: OnceLock<std::sync::Weak<Agent>>,
+    /// SEAM-168 — the session's provider registry, asked to bring the slot up to date with the
+    /// catalog overlay before every [`Self::current`]. `Weak`: the registry holds this swap
+    /// weakly too, and neither must keep the other alive.
+    follower: OnceLock<std::sync::Weak<dyn InstalledFollower>>,
 }
 
 impl ProviderSwap {
@@ -78,6 +110,7 @@ impl ProviderSwap {
             resolver,
             warming: OnceLock::new(),
             agent: OnceLock::new(),
+            follower: OnceLock::new(),
         }
     }
 
@@ -184,7 +217,24 @@ impl ProviderSwap {
     }
 
     /// The currently-installed provider (cheap `Arc` clone). Poison-safe (no panic).
+    ///
+    /// SEAM-168 — every reader gets the provider AS THE CATALOG OVERLAY IS NOW: the bound
+    /// [`InstalledFollower`] first rebuilds a provider the session made over an overlay the slot
+    /// no longer holds (and re-composes a guest registration over a moved base, PROV-165). When
+    /// nothing moved that costs a few uncontended lock reads and pointer comparisons. This is the
+    /// ONE read every consumer of the slot goes through — the agent loop's per-request resolution
+    /// ([`StreamFn::stream`]), the session's catalog and auth reads, the host services' model
+    /// calls — so none of them can observe a provider built over a stale overlay.
     pub fn current(&self) -> Arc<dyn Provider> {
+        if let Some(follower) = self.follower.get().and_then(std::sync::Weak::upgrade) {
+            follower.follow_overlay();
+        }
+        self.current_raw()
+    }
+
+    /// The installed provider exactly as it is, with no follow-up — for the registry that does the
+    /// following ([`InstalledFollower`]), which must not re-enter itself.
+    pub(crate) fn current_raw(&self) -> Arc<dyn Provider> {
         match self.inner.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -202,6 +252,20 @@ impl ProviderSwap {
     /// Whether a swap resolver is wired (cross-provider selects are only possible when it is).
     pub fn has_resolver(&self) -> bool {
         self.resolver.is_some()
+    }
+
+    /// Whether the wired resolver declares that it resolves the session's own built-ins
+    /// ([`ProviderResolver::resolves_builtins`]); `false` with none wired.
+    pub fn resolves_builtins(&self) -> bool {
+        self.resolver
+            .as_ref()
+            .is_some_and(|resolver| resolver.resolves_builtins())
+    }
+
+    /// Bind the registry that keeps the slot up to date with the catalog overlay (SEAM-168). Once;
+    /// a second call is ignored.
+    pub(crate) fn attach_follower(&self, follower: std::sync::Weak<dyn InstalledFollower>) {
+        let _ = self.follower.set(follower);
     }
 
     /// The provider owning `provider_id` — the current one when it is that provider, else a fresh one

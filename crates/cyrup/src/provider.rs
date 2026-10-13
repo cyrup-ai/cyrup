@@ -551,6 +551,16 @@ impl cyrup_session_svc::ProviderResolver for BuiltinProviderResolver {
         )
         .map_err(|e| e.to_string())
     }
+
+    /// SEAM-168 — `select_provider` is the composition of the built-ins, the pi.dev overlay and
+    /// `models.json` over the session's credentials, the same one the session composes itself; so
+    /// is the launch provider `main` hands the session (`select_launch_provider`). The session
+    /// therefore builds these itself and rebuilds them when the overlay moves, as pi's one provider
+    /// per id reads its remote catalog live (`core/model-runtime.ts:228-233` @f1b2e77f5). Without
+    /// this the provider a session streams through was the overlay as it stood at selection.
+    fn resolves_builtins(&self) -> bool {
+        true
+    }
 }
 
 /// The provider id a model pattern addresses, if it carries an explicit `provider/...` prefix.
@@ -945,6 +955,20 @@ mod tests {
         )
         .expect("openai built-in");
         assert_eq!(openai.id().as_str(), "openai");
+    }
+
+    /// SEAM-168 — the binary's resolver tells the session that what it resolves (and the launch
+    /// provider) are the built-ins the session composes itself, so the session keeps them current
+    /// with the pi.dev overlay. With `false` the installed provider stayed the overlay as it stood
+    /// at selection (`cyrup-session-svc tests::live_registry`).
+    #[test]
+    fn the_builtin_resolver_resolves_the_sessions_builtins() {
+        use cyrup_session_svc::ProviderResolver;
+        let resolver = BuiltinProviderResolver::new(
+            Arc::new(ModelFile::default()),
+            Arc::new(InMemoryCredentialStore::new()),
+        );
+        assert!(resolver.resolves_builtins());
     }
 
     #[test]

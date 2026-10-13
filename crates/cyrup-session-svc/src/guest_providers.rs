@@ -123,6 +123,49 @@ pub struct GuestProviderRegistry {
     /// Stamps each landed registration, so a re-composition of an id writes only while the
     /// registration it composed is still the id's ([`Composition::stamp`]).
     next_stamp: AtomicU64,
+    /// SEAM-168 — when the installed slot holds the session's OWN built-in for a non-guest id: the
+    /// id, the provider that was made and the overlay it was made over. Every read rebuilds it
+    /// when the overlay moved ([`Self::follow_installed_builtin`]); a slot that no longer holds
+    /// `made` voids it. Written with `providers` held (lock order: providers -> this -> the swap).
+    installed_builtin: Mutex<Option<InstalledBuiltin>>,
+    /// SEAM-167 — told after each provider action lands (pi re-reads its current model after each
+    /// of the five, `core/agent-session.ts:3470-3490` @f1b2e77f5). Called with no lock of this
+    /// registry held.
+    action_listener: Mutex<Option<ProviderActionListener>>,
+}
+
+/// What [`GuestProviderRegistry::on_provider_action`] installs (SEAM-167).
+pub(crate) type ProviderActionListener = Arc<dyn Fn() + Send + Sync>;
+
+/// The overlay a provider in the installed slot was made over (SEAM-168).
+#[derive(Clone)]
+enum MadeOver {
+    /// Made outside the session (the binary's launch provider): rebuilt on the next read.
+    Unknown,
+    /// Made by the session over this overlay.
+    Overlay(Option<Arc<cyrup_provider::CatalogOverlay>>),
+}
+
+impl MadeOver {
+    fn is(&self, now: Option<&Arc<cyrup_provider::CatalogOverlay>>) -> bool {
+        match self {
+            Self::Unknown => false,
+            Self::Overlay(over) => same_overlay(over.as_ref(), now),
+        }
+    }
+}
+
+/// The installed slot's provider when it is the session's own built-in (SEAM-168).
+struct InstalledBuiltin {
+    id: String,
+    made: Arc<dyn Provider>,
+    over: MadeOver,
+}
+
+/// Whether two provider handles are the same provider (by address; the vtable half of a `dyn`
+/// pointer is not an identity).
+fn same_provider(a: &Arc<dyn Provider>, b: &Arc<dyn Provider>) -> bool {
+    std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
 }
 
 /// Resolves the base provider a registration under `id` composes over, from the catalog overlay
@@ -181,8 +224,10 @@ struct VirtualModelSink {
     catalog: Arc<dyn cyrup_provider::VirtualModelCatalog>,
 }
 
-/// The attached snapshot with the LIVE guest-provider catalog layered over it, so a provider
-/// registered after the session was built still answers as physical.
+/// The attached catalog with the LIVE guest-provider catalog layered over it: a guest-registered
+/// id answers from its provider alone. (Since SEAM-169 the attached catalog is itself composed at
+/// the check, guest rows included, so this layer changes no answer the production catalog gives;
+/// it is what a fixed test catalog is layered under.)
 struct LiveGuestCatalog<'a> {
     guest: &'a GuestProviderRegistry,
     snapshot: &'a dyn cyrup_provider::VirtualModelCatalog,
@@ -248,6 +293,8 @@ impl GuestProviderRegistry {
             catalog_overlay: Mutex::default(),
             composed: Mutex::default(),
             next_stamp: AtomicU64::default(),
+            installed_builtin: Mutex::default(),
+            action_listener: Mutex::default(),
         })
     }
 
@@ -289,6 +336,12 @@ impl GuestProviderRegistry {
     /// per-read resolve would produce". The re-composition writes through
     /// [`Self::compose_and_write`], so through the one gate ([`Self::lock_unless_stale`]), and
     /// bumps the generation, which is what the session's composed-registry snapshot keys on.
+    ///
+    /// SEAM-168 — the same contract for the installed slot when it holds the session's OWN
+    /// built-in for a non-guest id ([`Self::follow_installed_builtin`]): pi's provider for such an
+    /// id is the `withRemoteCatalog`-wrapped built-in, whose rows read the overlay on every call
+    /// (`core/model-runtime.ts:228-233` @f1b2e77f5), so the provider is rebuilt over the overlay
+    /// the slot holds now before anything reads it.
     fn revalidate(&self) {
         let Some(slot) = poison_safe(&self.catalog_overlay).clone() else {
             return;
@@ -301,6 +354,141 @@ impl GuestProviderRegistry {
             .collect();
         for (registration, stamp) in moved {
             let _ = self.compose_and_write(&registration, ComposeCause::Recompose { stamp });
+        }
+        self.follow_installed_builtin(now.as_ref());
+    }
+
+    /// SEAM-168 — rebuild the installed built-in over `now` when it was made over another overlay.
+    ///
+    /// The rebuild is the base resolver's answer for the id (the session's composition of the
+    /// compiled-in catalog, `now` and `models.json` over the session's credentials — what a fresh
+    /// `select_provider` would hand back), made OUTSIDE every lock. It is stored only if, under
+    /// the provider map's lock (the lock every writer of the slot holds), the slot still holds the
+    /// provider the record names and no guest has registered the id since: a writer that got there
+    /// first wins, and a slot something else replaced voids the record.
+    fn follow_installed_builtin(&self, now: Option<&Arc<cyrup_provider::CatalogOverlay>>) {
+        let (id, made) = {
+            let record = poison_safe(&self.installed_builtin);
+            match record.as_ref() {
+                Some(record) if !record.over.is(now) => {
+                    (record.id.clone(), Arc::clone(&record.made))
+                }
+                _ => return,
+            }
+        };
+        let Some(swap) = self.installed_swap() else {
+            return;
+        };
+        let rebuilt = self.base_provider(&id, now);
+        let providers = self.lock();
+        let mut record = poison_safe(&self.installed_builtin);
+        let still_ours = record
+            .as_ref()
+            .is_some_and(|r| same_provider(&r.made, &made))
+            && same_provider(&swap.current_raw(), &made)
+            && !providers.contains_key(&id);
+        if !still_ours {
+            if record
+                .as_ref()
+                .is_some_and(|r| same_provider(&r.made, &made))
+            {
+                *record = None;
+            }
+            return;
+        }
+        match rebuilt {
+            Some(provider) => {
+                swap.store(Arc::clone(&provider));
+                *record = Some(InstalledBuiltin {
+                    id,
+                    made: provider,
+                    over: MadeOver::Overlay(now.cloned()),
+                });
+            }
+            // No built-in or `models.json` provider owns the id (a faux, an unconfigured
+            // placeholder): the overlay can never reach it, so there is nothing to follow.
+            None => *record = None,
+        }
+    }
+
+    /// The session's installed-provider slot, if one is bound and alive.
+    fn installed_swap(&self) -> Option<Arc<ProviderSwap>> {
+        poison_safe(&self.installed)
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    /// The provider the installed slot holds now, brought up to date with the overlay first; `None`
+    /// before a slot is bound. What the extensions' virtual-model check reads as the session's own
+    /// provider (SEAM-169).
+    pub(crate) fn installed_provider(&self) -> Option<Arc<dyn Provider>> {
+        self.installed_swap().map(|swap| swap.current())
+    }
+
+    /// SEAM-168 — record that the installed slot holds the session's built-in for its id, made
+    /// OUTSIDE the session (the binary's launch provider, `select_provider` over the overlay it
+    /// read then), and bring it up to date at once: the overlay it was made over is not known, so
+    /// it is rebuilt over the one the slot holds. A no-op for a guest-registered id (its provider
+    /// is the composition, PROV-165) and for an id no built-in owns.
+    pub(crate) fn adopt_installed_builtin(&self) {
+        let Some(swap) = self.installed_swap() else {
+            return;
+        };
+        {
+            let providers = self.lock();
+            let made = swap.current_raw();
+            let id = made.id().as_str().to_string();
+            if providers.contains_key(&id) {
+                return;
+            }
+            *poison_safe(&self.installed_builtin) = Some(InstalledBuiltin {
+                id,
+                made,
+                over: MadeOver::Unknown,
+            });
+        }
+        self.revalidate();
+    }
+
+    /// SEAM-168 — install the session's own built-in for `id` (a cross-provider `/model` select of
+    /// a non-guest id, when the swap's resolver resolves the built-ins): made over the overlay the
+    /// slot holds now and recorded, so it follows the next overlay. `false` when no built-in or
+    /// `models.json` provider owns the id; the caller then asks the swap's resolver.
+    pub(crate) fn install_builtin(&self, id: &str) -> bool {
+        let Some(swap) = self.installed_swap() else {
+            return false;
+        };
+        let over = self.overlay_now();
+        let Some(provider) = self.base_provider(id, over.as_ref()) else {
+            return false;
+        };
+        let providers = self.lock();
+        if providers.contains_key(id) {
+            // A guest registered the id meanwhile: its provider is the id's.
+            swap.store(Arc::clone(providers.get(id).unwrap_or(&provider)));
+            return true;
+        }
+        swap.store(Arc::clone(&provider));
+        *poison_safe(&self.installed_builtin) = Some(InstalledBuiltin {
+            id: id.to_string(),
+            made: provider,
+            over: MadeOver::Overlay(over),
+        });
+        true
+    }
+
+    /// SEAM-167 — call `listener` after each provider action lands: a registration, a live
+    /// registration, an unregistration, a virtual model's registration or removal. Replaces any
+    /// listener installed before.
+    pub(crate) fn on_provider_action(&self, listener: ProviderActionListener) {
+        *poison_safe(&self.action_listener) = Some(listener);
+    }
+
+    /// Tell the listener a provider action landed (no lock of this registry is held here).
+    fn provider_action_landed(&self) {
+        let listener = poison_safe(&self.action_listener).clone();
+        if let Some(listener) = listener {
+            listener();
         }
     }
 
@@ -355,9 +543,14 @@ impl GuestProviderRegistry {
     /// `baseUrl` over the built-in the session started on) would otherwise leave the session
     /// streaming the uncomposed built-in. pi has one registry; the composed provider is the only
     /// one under the id.
+    ///
+    /// SEAM-168 — the slot also asks this registry, before every read, to bring what it holds up
+    /// to date with the catalog overlay ([`crate::provider_swap::InstalledFollower`]).
     pub fn follow_installed(&self, swap: &Arc<ProviderSwap>) {
         *poison_safe(&self.installed) = Some(Arc::downgrade(swap));
-        let registered = self.provider(swap.current().id().as_str());
+        let follower: Weak<dyn crate::provider_swap::InstalledFollower> = self.this.clone();
+        swap.attach_follower(follower);
+        let registered = self.provider(swap.current_raw().id().as_str());
         if let Some(provider) = registered {
             swap.store(provider);
         }
@@ -446,6 +639,50 @@ impl GuestProviderRegistry {
         }
     }
 
+    /// PROV-167 — `native` with the session's `models.json` block for `id` composed over it. pi's
+    /// `composeProvider` takes the native extension's provider as the BASE of the config layer
+    /// (`base = nativeExtensionProviders.get(id) ?? builtins.get(id)`, then
+    /// `composeModelProvider(id, base, config, extension)`, `core/model-runtime.ts:301-310`
+    /// @f1b2e77f5), so a `baseUrl` / `modelOverrides` block for a native's id applies over its
+    /// rows. (A JSON `registerProvider` under the id never composes over the native: pi deletes the
+    /// native first, `:925`, and so does the hub.) The same composer `models.json` uses for the
+    /// built-ins (`ModelFile::compose_providers`), over a collection holding only the native. A
+    /// block it rejects leaves the native, as pi's `catch` returns `base` (`:312-315`).
+    ///
+    /// Re-run on every live registration, so a native's catalog publication (which re-registers)
+    /// is composed again. The listing does not apply the block a second time: a guest id's block
+    /// is stripped there ([`Self::without_guest_blocks`]).
+    fn with_models_json_over_native(
+        &self,
+        id: &str,
+        native: Arc<dyn Provider>,
+    ) -> Arc<dyn Provider> {
+        let block = poison_safe(&self.model_config)
+            .as_ref()
+            .and_then(|file| file.providers.get(id).cloned());
+        let Some(block) = block else {
+            return native;
+        };
+        let file = cyrup_config::ModelFile {
+            providers: std::iter::once((id.to_string(), block)).collect(),
+        };
+        let mut models =
+            cyrup_provider::create_models(cyrup_provider::CreateModelsOptions::default());
+        models.set_provider(Arc::clone(&native));
+        let (store, ctx) = self.refresh.auth();
+        let errors = file.compose_providers(
+            &mut models,
+            store,
+            Arc::new(cyrup_provider::builtin_registry()),
+            Some(ctx),
+        );
+        if let Some(message) = errors.first() {
+            tracing::warn!(provider = id, "{message}");
+            return native;
+        }
+        models.get_provider(id).unwrap_or(native)
+    }
+
     /// The overlay the base is resolved with now (`None` when no slot is attached).
     fn overlay_now(&self) -> Option<Arc<cyrup_provider::CatalogOverlay>> {
         poison_safe(&self.catalog_overlay)
@@ -493,10 +730,8 @@ impl GuestProviderRegistry {
 
     /// The id the bound installed-provider slot currently holds, if one is bound.
     fn installed_id(&self) -> Option<String> {
-        poison_safe(&self.installed)
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .map(|swap| swap.current().id().as_str().to_string())
+        self.installed_swap()
+            .map(|swap| swap.current_raw().id().as_str().to_string())
     }
 
     /// Realize `reg` and write it: composed over the id's base when one owns the id (PROV-162),
@@ -568,7 +803,7 @@ impl GuestProviderRegistry {
                 providers.remove(&reg.id);
                 records.remove(&reg.id);
                 poison_safe(&self.keyless_composed).remove(&reg.id);
-                self.replace_installed(&reg.id, &base);
+                self.replace_installed(&reg.id, &base, Some(over));
                 self.generation.fetch_add(1, Ordering::Relaxed);
                 return ProviderWrite::Landed;
             }
@@ -587,20 +822,33 @@ impl GuestProviderRegistry {
                 keyless_composed.remove(&reg.id);
             }
         }
-        self.replace_installed(&reg.id, &provider);
+        self.replace_installed(&reg.id, &provider, None);
         self.generation.fetch_add(1, Ordering::Relaxed);
         ProviderWrite::Landed
     }
 
-    /// Store `provider` into the bound installed-provider slot when that holds the same id.
-    fn replace_installed(&self, id: &str, provider: &Arc<dyn Provider>) {
-        let swap = poison_safe(&self.installed)
-            .as_ref()
-            .and_then(Weak::upgrade);
-        if let Some(swap) = swap
-            && swap.current().id().as_str() == id
+    /// Store `provider` into the bound installed-provider slot when that holds the same id. Every
+    /// caller holds the provider map's lock.
+    ///
+    /// SEAM-168 — `base_over` says what is stored: `None` a guest's provider (a composition or a
+    /// live provider, which [`Self::revalidate`] keeps current through its own record), `Some` the
+    /// id's BASE handed back by an unregistration or a failed composition, made over that overlay
+    /// — the session's built-in, recorded so it follows the next overlay too.
+    fn replace_installed(
+        &self,
+        id: &str,
+        provider: &Arc<dyn Provider>,
+        base_over: Option<Option<Arc<cyrup_provider::CatalogOverlay>>>,
+    ) {
+        if let Some(swap) = self.installed_swap()
+            && swap.current_raw().id().as_str() == id
         {
             swap.store(Arc::clone(provider));
+            *poison_safe(&self.installed_builtin) = base_over.map(|over| InstalledBuiltin {
+                id: id.to_string(),
+                made: Arc::clone(provider),
+                over: MadeOver::Overlay(over),
+            });
         }
     }
 
@@ -1550,13 +1798,26 @@ impl ProviderRefresher for GuestProviderRegistry {
     }
 }
 
+impl crate::provider_swap::InstalledFollower for GuestProviderRegistry {
+    fn follow_overlay(&self) {
+        self.revalidate();
+    }
+}
+
 impl ModelRegistrySink for GuestProviderRegistry {
     fn upsert_provider(&self, reg: &ProviderRegistration) -> ProviderWrite {
         // Full replacement for this provider id (Pi "replaces all models", model-registry.ts:919).
-        self.compose_and_write(reg, ComposeCause::Registration)
+        let write = self.compose_and_write(reg, ComposeCause::Registration);
+        if write.landed() {
+            self.provider_action_landed();
+        }
+        write
     }
 
     fn upsert_live_provider(&self, id: &str, provider: Arc<dyn Provider>) -> ProviderWrite {
+        // PROV-167 — the session's `models.json` block for the id, composed over the native's
+        // provider (composed BEFORE the gate: no lock is held across provider code).
+        let provider = self.with_models_json_over_native(id, provider);
         // A native's own provider, stored as given — no `ConfigProvider` is rebuilt. Replacing the
         // id swaps the `Arc` (Pi "replaces all models", model-registry.ts:919), and the bump is what
         // makes `full_model_registry()` recompose so the replacement's catalog is what `/model` lists.
@@ -1581,7 +1842,7 @@ impl ModelRegistrySink for GuestProviderRegistry {
             } else {
                 None
             };
-            self.replace_installed(id, &provider);
+            self.replace_installed(id, &provider, None);
             self.generation.fetch_add(1, Ordering::Relaxed);
             late_restore
         };
@@ -1590,6 +1851,7 @@ impl ModelRegistrySink for GuestProviderRegistry {
         if let Some(restore) = late_restore {
             restore.spawn();
         }
+        self.provider_action_landed();
         ProviderWrite::Landed
     }
 
@@ -1602,7 +1864,11 @@ impl ModelRegistrySink for GuestProviderRegistry {
         let base = self
             .installed_id()
             .is_some_and(|installed| installed == id)
-            .then(|| self.base_provider(id, self.overlay_now().as_ref()))
+            .then(|| {
+                let over = self.overlay_now();
+                self.base_provider(id, over.as_ref())
+                    .map(|base| (base, over))
+            })
             .flatten();
         let restore = {
             // Same single hold as the upserts (SEAM-145): a stale publication's removal is
@@ -1614,8 +1880,8 @@ impl ModelRegistrySink for GuestProviderRegistry {
             providers.remove(id);
             poison_safe(&self.keyless_composed).remove(id);
             poison_safe(&self.composed).remove(id);
-            if let Some(base) = &base {
-                self.replace_installed(id, base);
+            if let Some((base, over)) = base {
+                self.replace_installed(id, &base, Some(over));
             }
             // SEAM-144: begun under the same hold, so a registration that follows supersedes
             // this restore, never the reverse.
@@ -1626,6 +1892,7 @@ impl ModelRegistrySink for GuestProviderRegistry {
         if let Some(restore) = restore {
             restore.spawn();
         }
+        self.provider_action_landed();
         ProviderWrite::Landed
     }
 
@@ -1654,30 +1921,38 @@ impl ModelRegistrySink for GuestProviderRegistry {
         // the catalog under it. Holding this `Mutex` across that call would nest two locks on a
         // path an extension can drive from a background task.
         //
-        // The attached catalog is a SNAPSHOT taken when the session was built; the live guest
-        // catalog is layered over it so a provider registered after that — by a later extension or
-        // a `LateRegistrar` — is still seen as physical. What the snapshot deliberately does NOT
-        // pick up is a physical model a later catalog REFRESH adds, and that is upstream's
-        // behaviour, not a shortfall: "If a catalog refresh later adds a physical model with the
-        // same ID, the virtual model hides it" (`docs/virtual-models.md`) — a later arrival is
-        // hidden, never a conflict.
+        // SEAM-169 — the attached catalog is the session's physical registry composed AT THIS
+        // CHECK (`virtual_models::LiveVirtualCatalog`), overlay included: pi checks against its
+        // live runtime (`this.models.getModel(providerId, id)`, `core/model-runtime.ts:960`
+        // @f1b2e77f5), so a physical id only a reloaded pi.dev catalog lists is a conflict. (A
+        // catalog refresh AFTER the registration is upstream's other case: "If a catalog refresh
+        // later adds a physical model with the same ID, the virtual model hides it",
+        // `docs/virtual-models.md` — a later arrival is hidden, never a conflict.) The live guest
+        // layer over it answers a guest-registered id from its provider alone, as before.
         let catalog = LiveGuestCatalog {
             guest: self,
             snapshot: sink.catalog.as_ref(),
         };
-        sink.registry
+        let registered = sink
+            .registry
             .register(definition.clone(), &catalog)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
+        if registered.is_ok() {
+            self.provider_action_landed();
+        }
+        registered
     }
 
     fn remove_virtual_model(&self, provider: &str, id: &str) {
         let registry = poison_safe(&self.virtual_models)
             .as_ref()
             .map(|s| Arc::clone(&s.registry));
-        if let Some(registry) = registry {
-            // `false` is pi's no-op arm (`model-runtime.ts:977`): an absent pair recomposes nothing
-            // and fires no refresh. `unregister` enforces that itself.
-            registry.unregister(provider, id);
+        // `false` is pi's no-op arm (`model-runtime.ts:977`): an absent pair recomposes nothing
+        // and fires no refresh. `unregister` enforces that itself.
+        if let Some(registry) = registry
+            && registry.unregister(provider, id)
+        {
+            self.provider_action_landed();
         }
     }
 }

@@ -999,7 +999,8 @@ impl AgentSession {
         // first turn of a modelless first run (SEAM-075): the answer is the `/login` → `/model`
         // instruction, surfaced as an error on the turn, never a process exit.
         {
-            let model = Self::lock(&self.compaction_model)
+            let model = self
+                .current_model()
                 .clone()
                 .ok_or(SessionServiceError::NoModelSelected)?;
             // PROV-037 — pi's refusal is a THREE-branch decision, not one
