@@ -433,7 +433,14 @@ pub fn build_factory(
     let builtins = BuiltinSelection::resolve(&mut config, &settings_store, dirs);
     // The resolver's providers read the SAME store `/login` writes through (`.auth` below).
     let credentials = cyrup_config::login::runtime_credentials(auth_store.clone());
+    // SEAM-170 — every session this factory builds reads and refreshes THE process catalog
+    // overlay slot, the one the background refresh, `cyrup update --models` and the provider
+    // resolver below read. Without it each session got a private slot loaded at build that nothing
+    // reloaded, so a model the background refresh found was never listed.
+    let catalog =
+        crate::provider::model_catalog_service(dirs, config.app_mode, config.model_network_enabled);
     let mut builder = SessionFactory::new(provider, config)
+        .model_catalog_service(catalog)
         .settings_store(settings_store)
         .auth(auth_store)
         .trust_store(crate::prelaunch::trust_store_for(dirs));

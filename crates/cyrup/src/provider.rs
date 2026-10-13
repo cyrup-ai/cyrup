@@ -317,27 +317,42 @@ pub async fn refresh_model_catalogs_with(
     Ok(())
 }
 
-/// The shared catalog service handed to `SessionBuilder` (XAI_3). The network posture is resolved
-/// HERE because `cyrup-session-svc` deliberately has no `NetworkPolicy`
-/// (`session-svc/src/builder.rs:1277-1279`) — the same threading rule `install_missing_packages`
-/// already follows.
+/// The shared catalog service every session the binary builds is handed (XAI_3), through
+/// [`crate::session_launch::build_factory`] — its ONE caller.
+///
+/// **SEAM-170.** This had no caller: `build_factory` never wired a service, so the builder took
+/// its no-service arm and gave each session a PRIVATE overlay slot loaded from disk at build, which
+/// nothing ever reloaded — while the background refresh ([`spawn_model_catalog_refresh_with`]),
+/// `cyrup update --models` and the binary's per-call resolves ([`select_provider`], so the swap
+/// resolver an EXT-086 model call reaches) read THIS process's slot. pi has one runtime whose
+/// remote catalog every reader shares (`withRemoteCatalog`, `core/model-runtime.ts:228-233`
+/// @f1b2e77f5), so a model the background refresh found is listed and streamed at once. Handing
+/// every session this service makes [`CATALOG_OVERLAY`] the session's
+/// `AgentSessionServices::catalog_overlay`: one slot, every reader.
+///
+/// The network posture is the session's own `model_network_enabled` (pi `modelNetworkEnabled`,
+/// the bin's `!(--offline || CYRUP_OFFLINE)`, which is exactly
+/// [`NetworkPolicy::allow_model_catalog_refresh`]) gated on the mode
+/// ([`mode_refreshes_catalogs`]). `cyrup-session-svc` deliberately has no `NetworkPolicy`
+/// (`session-svc/src/builder.rs`), so it is resolved here.
 ///
 /// It takes NO provider list: the credential-gated set is resolved per call by the session
 /// (FINDING 4), so a `/login` during the session is picked up without rebuilding this. An offline
 /// run gets a `CACHE_ONLY` service — `/model` still reloads the persisted overlay from disk and
 /// reports a clean result, and never issues a request.
 ///
-/// Shares THIS process's `CATALOG_OVERLAY` slot — not a fresh one — so a session built with this
-/// service observes exactly the same installs [`restore_model_catalog`],
-/// [`spawn_model_catalog_refresh_with`] and [`refresh_model_catalogs_with`] make, and its own
-/// `/model` refresh is in turn visible to `active_catalog_overlay()` for the rest of this process.
+/// The slot is not reloaded per build: [`restore_model_catalog`] restores it from disk once, before
+/// the first session exists (pi's cache-only `refresh({ allowNetwork: false })` at runtime
+/// creation), and every install after that — the background refresh, `/model`, a post-`/login`
+/// refresh — reloads the same store into the same slot, so a cwd-switch or fork rebuild already
+/// holds the newest overlay this process has seen.
 pub fn model_catalog_service(
     dirs: &cyrup_config::ConfigDirs,
-    policy: NetworkPolicy,
     mode: cyrup_config::trust::AppMode,
+    model_network_enabled: bool,
 ) -> Arc<ModelCatalogService> {
     let catalog = remote_catalog(dirs);
-    let options = if mode_refreshes_catalogs(mode) && policy.allow_model_catalog_refresh() {
+    let options = if mode_refreshes_catalogs(mode) && model_network_enabled {
         RefreshOptions::network()
     } else {
         RefreshOptions::CACHE_ONLY
@@ -347,6 +362,12 @@ pub fn model_catalog_service(
             .with_overlay_providers(all_provider_ids())
             .with_options(options),
     )
+}
+
+/// The process's catalog overlay slot, for the tests that prove a session reads it (SEAM-170).
+#[cfg(test)]
+pub(crate) fn process_catalog_overlay() -> Arc<CatalogOverlaySlot> {
+    Arc::clone(&CATALOG_OVERLAY)
 }
 
 /// The composed registry (built-ins + `models.json`) over an optional runtime `--api-key`
@@ -439,7 +460,15 @@ pub fn all_available_models(models_json: &ModelFile) -> Vec<cyrup_provider::Mode
 /// `hasConfiguredAuth`, `model-resolver.ts:633-648`), so the listing and the launch answer "which
 /// provider can I actually use?" identically. The per-provider `filterModels` narrowing has no cyrup
 /// counterpart yet and is a no-op here.
-pub fn available_models(
+///
+/// **Test-only since SEAM-135.** `--list-models` now lists the BUILT session's registry
+/// (`actions.rs`, `AgentSession::configured_model_catalog`), which sees extension-registered
+/// providers this cannot; this function's one remaining caller is the regression test that pins
+/// the two listings equal for a stored-credential provider (`tests/list_models_session.rs`). It is
+/// compiled for tests only so no production path can drift back onto the narrower registry
+/// (found caller-less in production by the SEAM-170 enumeration).
+#[cfg(test)]
+pub(crate) fn available_models(
     models_json: &ModelFile,
     has_configured_auth: &dyn Fn(&cyrup_provider::Model) -> bool,
 ) -> Vec<cyrup_provider::Model> {

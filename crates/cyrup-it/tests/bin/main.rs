@@ -87,6 +87,9 @@ mod acp_session;
 /// made in-process.
 mod acp_transport;
 mod auth_credential_print;
+/// SEAM-170: the binary's own background catalog refresh reaches the running session's `/model`
+/// and its stream (through a loopback proxy that holds the `pi.dev` tunnel; no network).
+mod catalog_refresh_reaches_the_session;
 /// The codemode tool on the wire: the request a provider receives and the tool result the next
 /// request carries, from the real binary against an in-process fake OpenAI server. Unix only: it
 /// signals and inspects real processes (`/proc`, `kill`).

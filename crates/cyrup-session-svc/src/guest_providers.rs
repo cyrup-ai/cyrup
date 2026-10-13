@@ -155,6 +155,27 @@ impl MadeOver {
     }
 }
 
+/// SEAM-171 — where the provider in the session's installed slot came from, which decides what the
+/// session lists for its id (`crate::session::compose_physical_registry`).
+///
+/// pi composes one provider per id from `base = nativeExtensionProviders.get(id) ??
+/// builtins.get(id)` (`core/model-runtime.ts:302` @f1b2e77f5), so whose provider holds the slot
+/// is whose rows the id has:
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstalledProvenance {
+    /// A guest registration (JSON or live) under the id: its rows replace every other row of the
+    /// id (PROV-162).
+    Guest,
+    /// The session's OWN built-in ([`InstalledBuiltin`], SEAM-168): the compiled-in rows over the
+    /// overlay the slot holds, `models.json` over them — the same rows the compiled-in catalog
+    /// lists for the id.
+    SessionBuiltin,
+    /// An embedder's provider — injected at build, or returned by a resolver that does not
+    /// resolve the built-ins — never replaced (round 4). pi's native provider: its rows ARE the
+    /// id's rows, and the compiled-in rows of the id are not listed beside them.
+    Embedder,
+}
+
 /// The installed slot's provider when it is the session's own built-in (SEAM-168).
 struct InstalledBuiltin {
     id: String,
@@ -423,6 +444,30 @@ impl GuestProviderRegistry {
     /// provider (SEAM-169).
     pub(crate) fn installed_provider(&self) -> Option<Arc<dyn Provider>> {
         self.installed_swap().map(|swap| swap.current())
+    }
+
+    /// SEAM-171 — the provenance of `provider`, the provider the installed slot holds (read through
+    /// [`ProviderSwap::current`], so already brought up to date with the overlay): a guest's when
+    /// a registration owns its id, the session's own built-in when the [`InstalledBuiltin`] record
+    /// names it, otherwise an embedder's.
+    ///
+    /// A provider the session made for an id no built-in owns (a faux, the unconfigured
+    /// placeholder) has no record and answers `Embedder`; nothing compiled-in shares such an id,
+    /// so the answer lists the same rows either way.
+    pub(crate) fn provenance_of(&self, provider: &Arc<dyn Provider>) -> InstalledProvenance {
+        let providers = self.lock();
+        if providers.contains_key(provider.id().as_str()) {
+            return InstalledProvenance::Guest;
+        }
+        let record = poison_safe(&self.installed_builtin);
+        if record
+            .as_ref()
+            .is_some_and(|r| same_provider(&r.made, provider))
+        {
+            InstalledProvenance::SessionBuiltin
+        } else {
+            InstalledProvenance::Embedder
+        }
     }
 
     /// SEAM-168 — record that the installed slot holds the session's built-in for its id, made

@@ -30,5 +30,6 @@ mod install_package_dir;
 mod list_models_session;
 mod model_scope_announce;
 mod models_json_resolution;
+mod session_catalog_slot;
 mod stored_credentials;
 mod theme_boot_no_persist;

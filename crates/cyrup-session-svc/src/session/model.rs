@@ -1416,21 +1416,28 @@ impl AgentSession {
 /// checked against ([`crate::virtual_models::LiveVirtualCatalog`], SEAM-169): one spelling of what
 /// is physical.
 ///
+/// **What the installed provider's id lists depends on where the provider came from** (SEAM-171,
+/// [`crate::guest_providers::InstalledProvenance`]) — pi's one provider per id, `base =
+/// nativeExtensionProviders.get(id) ?? builtins.get(id)` (`core/model-runtime.ts:302` @f1b2e77f5):
+///
+/// | provenance | the id's rows |
+/// |---|---|
+/// | guest | the registration's alone (PROV-162; rule 2 below) |
+/// | the session's own built-in | the provider's rows, which ARE the compiled-in rows over this `overlay` (it is rebuilt over the overlay before it is read, `follow_installed_builtin`), plus any the provider alone carries |
+/// | an embedder's | the provider's rows alone: the compiled-in rows of the id are NOT filled in, since selecting one would stream the provider's first row |
+///
 /// **The dedupe is first-wins, in this order, and these are the rows that depend on it**
 /// (SEAM-168, enumerated):
 ///
 /// 1. the INSTALLED provider's rows win over the compiled-in rows of the same `provider/id`. When
-///    the slot holds the session's own built-in that is no precedence at all: the provider is
-///    rebuilt over the overlay the slot holds before it is read
-///    (`GuestProviderRegistry::follow_installed_builtin`), so its rows ARE the compiled-in rows
-///    over this `overlay`. When it holds an embedder's provider (injected, or resolved by a
-///    resolver that does not declare `resolves_builtins`) its own rows win, which is pi's
-///    native-provider precedence (`nativeExtensionProviders.get(id) ?? builtins.get(id)`,
-///    `core/model-runtime.ts:302` @f1b2e77f5). It also carries the rows no catalog has: the
-///    offline faux models and a custom-id model;
+///    the slot holds the session's own built-in that is no precedence at all (the rows are the
+///    same rows). When it holds an embedder's provider the compiled-in rows of its id are not
+///    there to lose to it (the table above). It also carries the rows no catalog has: the offline
+///    faux models and a custom-id model;
 /// 2. a GUEST-registered id is not first-wins at all: its rows replace every other row of the id
 ///    (PROV-162), the installed provider's included;
-/// 3. the compiled-in rows fill in every other `provider/id`;
+/// 3. the compiled-in rows fill in every other `provider/id` — every id but a guest's and an
+///    embedder's;
 /// 4. `models.json` then composes over the union (not over a guest id, SEAM-166), and the virtual
 ///    layer the caller applies REPLACES a colliding row rather than joining first-wins.
 pub(crate) fn compose_physical_registry(
@@ -1458,6 +1465,12 @@ pub(crate) fn compose_physical_registry(
             .iter()
             .any(|(id, _)| id.as_str() == m.provider.as_str())
     };
+    // SEAM-171 — an embedder's provider is its id's provider on its own terms: the compiled-in
+    // rows of that id are not its rows, and `ProviderStreamFn` would stream its first row for one.
+    let native_id = (guest_registry.provenance_of(current)
+        == crate::guest_providers::InstalledProvenance::Embedder)
+        .then(|| current.id().clone());
+    let embedder_owned = |m: &Model| native_id.as_ref() == Some(&m.provider);
     let mut base: Vec<Model> = current
         .models()
         .iter()
@@ -1486,6 +1499,7 @@ pub(crate) fn compose_physical_registry(
     .get_models(None)
     {
         if !guest_owned(&m)
+            && !embedder_owned(&m)
             && !base
                 .iter()
                 .any(|e| e.provider == m.provider && e.id == m.id)

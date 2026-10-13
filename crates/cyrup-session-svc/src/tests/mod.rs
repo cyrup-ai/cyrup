@@ -48,6 +48,7 @@ mod inject_message_display;
 mod inject_pump_live_run;
 mod inject_pump_redrain;
 mod install_noop;
+mod installed_provenance;
 mod integration;
 mod late_seams;
 mod live_provider_auth;
