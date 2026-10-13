@@ -195,10 +195,8 @@ async fn an_embedders_provider_under_a_fresh_id_lists_its_rows() {
 /// composed (`with_models_json_over_native` runs for live registrations, PROV-167), so the added
 /// row is listed and streams the provider's first row.
 ///
-/// Pinned, not fixed: `#[ignore]`d so the suite stays green; run it with `--run-ignored only`.
-/// RED at this round's HEAD (`embedder-only` streamed for `json-added`).
+/// Un-ignored as round 6 opens: RED at `a07a0e34` (`embedder-only` streamed for `json-added`).
 #[tokio::test]
-#[ignore = "SEAM-173: open — an embedder's provider is not composed with models.json"]
 async fn a_models_json_model_under_an_embedders_id_streams_as_itself() {
     let fx = fixture();
     std::fs::write(
