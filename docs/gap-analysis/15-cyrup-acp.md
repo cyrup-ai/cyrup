@@ -114,7 +114,7 @@ print/json, and everything below the front-end is the `AgentSession` those three
 > **Filed (4, all low; §6, *Items filed 2026-10-09*):** `ACP-299` (auto-title from the first prompt, `c94b3db`),
 > `ACP-300` (publish the stored title on load / restore, `1c89fd5`), `ACP-301` (listing fallback normalisation,
 > `1c89fd5`), and `ACP-302` (the v0.0.34 context-usage `usage_update` lead from the 2026-09-24 post-tag block
-> above, never filed once v0.0.34 was tagged; both sides re-read by this pass). **Next free id: `ACP-303`.**
+> above, never filed once v0.0.34 was tagged; both sides re-read by this pass). **Next free id: `ACP-304`** (2026-10-13, `SEAM-164`'s closure filed `ACP-303`).
 >
 > **Read in scope and deliberately NOT filed:** `c94b3db`'s other halves (forwarding pi renames as
 > `session_info_update` exists through `config_pump` → `rename_update`, `sessions.rs:1239-1261`; the `/name` single
@@ -3038,6 +3038,7 @@ unanswered), `ACP-294` (low, partial) and `ACP-296` (low, pin test absent). **Tw
 | ~~low~~ **CLOSED 2026-10-13** | ACP-300 | `session/load` (and the prompt-path restore) never publishes the stored session's title, so a reopened thread loses its name in the client — **Filed 2026-10-09 from the pi v1.1.0 drift triage**, see body below | S | 4d | verified |
 | ~~low~~ **CLOSED 2026-10-13** | ACP-301 | `session/list`'s fallback title is not whitespace-normalised, and a whitespace-only first user message yields `title: null` instead of the next message — **Filed 2026-10-09 from the pi v1.1.0 drift triage**, see body below | S | 4d | verified |
 | ~~low~~ **CLOSED 2026-10-13** | ACP-302 | No `usage_update` after `session/new`, after `session/load` or on a model change, so the client's context meter is empty until the first settle and shows the old window size after a model switch — **Filed 2026-10-09 from the pi v1.1.0 drift triage**, see body below | S | 4b | verified |
+| low | ACP-303 | An ACP session is never announced to its extensions: no `session_start` for `session/new` or `session/load` — filed 2026-10-13 closing `SEAM-164`, see body below | S | 4b | read |
 
 
 ### Items filed 2026-09-24 (pass 2)
@@ -3126,6 +3127,20 @@ low; re-derive the open count from the table before quoting it.
 **Verify** — Component tests: `session/new` emits one `usage_update` (with `size` = the model's context window) after the response and before `available_commands_update`; `session/load` likewise; a `model` `set_config_option` to a model with a different window emits a `usage_update` with the new `size`; a session whose stats have no `context_usage` emits none.
 
 **Notes** — Filed by this triage from the mcp-acp lane's flag (outside its `v0.0.34..04d0a15` window but never filed); both sides read by this pass.
+
+**ACP-303 — An ACP session is never announced to its extensions: no `session_start` for `session/new` or `session/load`.**
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Area** 4b · **Confidence** read (static; not measured) · **Filed** 2026-10-13, closing `SEAM-164`
+
+**upstream** — pi-acp drives `pi --mode rpc`, whose `runRpcMode` binds `uiContext` and then `bindExtensions` emits `session_start` for the session it serves (`rpc-mode.ts:317-320` @f1b2e77f5), so every ACP session is announced.
+
+**cyrup** — `crates/cyrup/src/acp_host.rs` builds each runtime with `AgentSessionRuntime::create_unannounced_at` (SEAM-033), and nothing in `cyrup-acp` or `acp_host.rs` calls `bind_extensions` (`grep -rn "bind_extensions" crates/cyrup-acp/src crates/cyrup/src/acp_host.rs` finds only the doc comment at `cyrup-acp/src/sessions.rs:150`, which says ACP announces after `initialize`). Replacements made inside an ACP session are announced by the runtime (`install_inner`); the initial session is not.
+
+**Impact** — Extensions that do their setup in `session_start` (the permission gate's per-cwd policy, subagents' background-run reset, intercom, MCP server start-up notices) never run it for the first session of an ACP thread.
+
+**Fix** — In the ACP host, attach the session's sinks (`SessionSinks::install`) and then call `bind_extensions` once per built runtime, before it serves its first request; effect drain first, as `SEAM-164` does for RPC and the TUI.
+
+**Verify** — A component test with a native extension that records `session_start`: `session/new` and `session/load` each record it once, and a status it sets there reaches the client.
 
 > **CLOSED 2026-10-13 — `ACP-299`, `ACP-300`, `ACP-301` and `ACP-302` together** (on `claude/compassionate-cray-46f1tv` off `main` @ `7aadfdd7`; upstream cited at `04d0a15` and v0.0.34 as the rows do). They share one normaliser and one ordered follow-up, as the rows said.
 >

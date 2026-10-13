@@ -64,9 +64,9 @@ class AreaCounts(unittest.TestCase):
 
     def test_area_15_skips_the_rerating_table(self):
         # The `id | from | to | why` table above the items is severity changes,
-        # not items; only the 156-row `sev | id | ...` table is read.
+        # not items; only the 157-row `sev | id | ...` table is read.
         items = census.parse_area_15(os.path.join(LEDGER, census.AREA_15[1]))
-        self.assertEqual(len(items), 156)
+        self.assertEqual(len(items), 157)
         ids = {i["id"] for i in items}
         self.assertIn("ACP-299", ids)
 

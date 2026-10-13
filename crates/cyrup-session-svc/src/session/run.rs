@@ -49,14 +49,23 @@ pub(crate) enum DeferredSettled {
         input: UserInput,
         stream: tokio::sync::mpsc::Sender<AgentSessionEvent>,
     },
-    /// `prompt(text, options)` reached through [`AgentSession::prompt_with`].
+    /// `prompt(text, options)` reached through [`AgentSession::prompt_with`] or
+    /// [`AgentSession::prompt_or_defer`]. `answer` is the latter's one-shot (pi's
+    /// `preflightResult` callback, which the deferred call carries in its `options`): the
+    /// deferred prompt's real disposition, or its error, is sent there when it runs.
     Prompt {
         input: UserInput,
         options: PromptOptions,
+        answer: Option<PromptAnswer>,
     },
     /// `sendMessage(…, {triggerTurn: true})`'s `_runAgentPrompt(appMessage)` (`:1956-1958`).
     Run(Vec<AgentMessage>),
 }
+
+/// Where a deferred prompt's outcome is sent (SEAM-165). Dropped unsent when the prompt never runs,
+/// which [`crate::PromptAnswered::answer`] reports as [`SessionServiceError::DeferredPromptDropped`].
+pub(crate) type PromptAnswer =
+    tokio::sync::oneshot::Sender<Result<PromptAccepted, SessionServiceError>>;
 
 /// The disposition of the `input` extension event (Pi `InputEventResult.action`, runner.ts:1100).
 /// A `transform` outcome rewrites the in-flight [`UserInput`] in place (via `EventPatch::Input`) and
@@ -197,10 +206,52 @@ impl AgentSession {
             self.defer_settled(DeferredSettled::Prompt {
                 input: input.into(),
                 options,
+                answer: None,
             });
             return Ok(PromptAccepted::Started);
         }
-        match self.prepare(input.into(), options).await? {
+        self.prompt_now(input.into(), options).await
+    }
+
+    /// [`Self::prompt_with`], answered with what the prompt REALLY did even when it is deferred past
+    /// `agent_settled` (SEAM-165): pi defers the whole call, its `preflightResult` callback
+    /// included (`agent-session.ts:1969-1971` @f1b2e77f5), so its RPC host writes the response when
+    /// the deferred prompt runs — `handled`, `queued` or `started` — instead of a `started` written
+    /// before anything happened.
+    ///
+    /// Returns at once either way, as pi's `prompt()` does: a deferred prompt yields a
+    /// [`crate::PromptAnswered`] the caller awaits where nothing it must keep serving is held up
+    /// (the RPC loop writes the response from its concurrent-command set). [`Self::prompt_with`]
+    /// keeps answering `Started` for a deferred prompt, for every caller that does not need more.
+    ///
+    /// [CYRUP-DELTA] A deferred prompt that fails, or never runs because an action deferred ahead
+    /// of it failed, is answered with the error. pi answers neither: its deferred `prompt()` has
+    /// already resolved, so its RPC `.catch` never sees the later throw and no response is ever
+    /// written. A client left waiting for a response that never comes is the worse outcome.
+    pub async fn prompt_or_defer(
+        &self,
+        input: impl Into<UserInput>,
+        options: PromptOptions,
+    ) -> crate::PromptReply {
+        if self.is_emitting_settled() {
+            let (answer, answered) = tokio::sync::oneshot::channel();
+            self.defer_settled(DeferredSettled::Prompt {
+                input: input.into(),
+                options,
+                answer: Some(answer),
+            });
+            return crate::PromptReply::Deferred(crate::PromptAnswered(answered));
+        }
+        crate::PromptReply::Now(self.prompt_now(input.into(), options).await)
+    }
+
+    /// [`Self::prompt_with`]'s body once it is not deferred.
+    async fn prompt_now(
+        &self,
+        input: UserInput,
+        options: PromptOptions,
+    ) -> Result<PromptAccepted, SessionServiceError> {
+        match self.prepare(input, options).await? {
             Prepared::Handled => Ok(PromptAccepted::Handled),
             // SEAM-121 — pi's `prompt` calls the PRIVATE `_queueFollowUp`/`_queueSteer` here
             // (agent-session.ts:1661-1663 @v0.87.1), never the public `followUp`/`steer`:
@@ -608,10 +659,25 @@ impl AgentSession {
                 DeferredSettled::PromptRun { input, stream } => {
                     self.run_deferred_prompt(input, stream).await
                 }
-                DeferredSettled::Prompt { input, options } => {
-                    Box::pin(self.prompt_with(input, options))
-                        .await
+                DeferredSettled::Prompt {
+                    input,
+                    options,
+                    answer,
+                } => {
+                    let result = Box::pin(self.prompt_now(input, options)).await;
+                    let started = result
+                        .as_ref()
                         .map(|accepted| matches!(accepted, PromptAccepted::Started))
+                        .map_err(ToString::to_string);
+                    match answer {
+                        // SEAM-165 — the caller is answered with the real outcome. Its error is
+                        // logged here too, because it also ends the deferred actions.
+                        Some(answer) => {
+                            let _ = answer.send(result);
+                        }
+                        None => drop(result),
+                    }
+                    started.map_err(SessionServiceError::DeferredPromptDropped)
                 }
                 DeferredSettled::Run(messages) => self.spawn_run(messages).await.map(|()| true),
             };

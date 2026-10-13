@@ -251,6 +251,15 @@ pub type UiEffectSink = UnboundedSender<UiEffect>;
 /// How many notices are kept for a mode that has not attached its effect drain yet.
 const MAX_EARLY_NOTICES: usize = 32;
 
+/// The notice that follows the kept early notices when more were said (SEAM-163).
+fn dropped_notices_message(dropped: usize) -> String {
+    let noun = if dropped == 1 { "notice" } else { "notices" };
+    format!(
+        "{dropped} more extension {noun} from before the session's interface attached were not \
+         kept; the first {MAX_EARLY_NOTICES} are shown above"
+    )
+}
+
 /// Whether a session run in `mode` ever attaches an effect drain (SEAM-160): the interactive TUI
 /// (`cyrup-tui` `install_ui_sinks`), `--mode rpc` (`cyrup-modes` `run_rpc` and its rebind) and ACP
 /// (`cyrup-acp` `SessionSinks::install`) do; `-p` (`run_print`) and `--mode json` (`run_json`) never
@@ -282,6 +291,9 @@ fn mode_attaches_effect_drain(mode: AppMode) -> bool {
 struct EffectDrain {
     sink: Option<UiEffectSink>,
     early_notices: Vec<UiEffect>,
+    /// SEAM-163 — notices said past [`MAX_EARLY_NOTICES`] before the drain attached. Not kept, but
+    /// counted, so the drain is told how many it is missing rather than nothing.
+    dropped_notices: usize,
     /// The mode has declared it will never attach a drain; nothing is held.
     never_attached: bool,
 }
@@ -1557,12 +1569,31 @@ impl LiveHostServices {
     ///
     /// The notices said before this call (see [`EffectDrain`]) are delivered first, in the order they
     /// were said.
+    ///
+    /// SEAM-163 — when more notices were said than [`MAX_EARLY_NOTICES`] keeps, one further notice
+    /// follows them saying how many were not kept. The cap stays: it is what bounds a session whose
+    /// mode declared a drain and never attached one (an embedder), and losing notices past it is
+    /// the price of that bound. Losing them in silence is not: a user whose fortieth MCP server
+    /// failed would otherwise see thirty-two failures and believe the rest connected.
     pub fn set_ui_effect_sink(&self, sink: UiEffectSink) {
         let mut drain = Self::lock(&self.ui_effect_sink);
         for notice in drain.early_notices.drain(..) {
             let _ = sink.send(notice);
         }
+        let dropped = std::mem::take(&mut drain.dropped_notices);
+        if dropped > 0 {
+            let _ = sink.send(UiEffect::Notify {
+                message: dropped_notices_message(dropped),
+                kind: NotifyKind::Warning,
+            });
+        }
         drain.sink = Some(sink);
+    }
+
+    /// The drain this session's effects go to, if one is attached — for a session that replaces
+    /// this one and must be able to speak before its mode rebinds (SEAM-164).
+    pub fn attached_ui_effect_sink(&self) -> Option<UiEffectSink> {
+        Self::lock(&self.ui_effect_sink).sink.clone()
     }
 
     /// Attach the mode's interactive-overlay renderer (see [`OverlaySink`]/[`Self::overlay_sink`]).
@@ -1599,11 +1630,12 @@ impl LiveHostServices {
         let mut drain = Self::lock(&self.ui_effect_sink);
         if let Some(sink) = drain.sink.as_ref() {
             let _ = sink.send(effect);
-        } else if matches!(effect, UiEffect::Notify { .. })
-            && !drain.never_attached
-            && drain.early_notices.len() < MAX_EARLY_NOTICES
-        {
-            drain.early_notices.push(effect);
+        } else if matches!(effect, UiEffect::Notify { .. }) && !drain.never_attached {
+            if drain.early_notices.len() < MAX_EARLY_NOTICES {
+                drain.early_notices.push(effect);
+            } else {
+                drain.dropped_notices = drain.dropped_notices.saturating_add(1);
+            }
         }
     }
 
@@ -5013,8 +5045,8 @@ mod tests {
     }
 
     /// The notices held for a mode that has not attached its drain yet are bounded: the oldest are
-    /// kept, and a session that says more drops the rest instead of growing for as long as it runs
-    /// (whether that silent drop is right is `SEAM-163`).
+    /// kept, and a session that says more drops the rest instead of growing for as long as it runs —
+    /// but not in silence (`SEAM-163`): one further notice says how many were not kept.
     #[test]
     fn the_notices_held_for_an_unattached_mode_are_bounded() {
         let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
@@ -5028,8 +5060,13 @@ mod tests {
         while let Ok(UiEffect::Notify { message, .. }) = rx.try_recv() {
             held.push(message);
         }
-        assert_eq!(held.len(), MAX_EARLY_NOTICES);
+        assert_eq!(held.len(), MAX_EARLY_NOTICES + 1);
         assert_eq!(held.first().map(String::as_str), Some("notice 0"));
+        assert_eq!(
+            held.get(MAX_EARLY_NOTICES - 1).map(String::as_str),
+            Some("notice 31")
+        );
+        assert_eq!(held.last(), Some(&dropped_notices_message(10)));
     }
 
     /// SEAM-160 — a session whose mode never attaches an effect drain (`-p`, `--mode json`) holds

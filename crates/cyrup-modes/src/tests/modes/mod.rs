@@ -16,6 +16,7 @@
 
 pub(super) use super::support;
 
+mod announce_window;
 mod headless_early_notices;
 mod json_mode;
 mod print_mode;

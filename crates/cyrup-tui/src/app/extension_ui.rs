@@ -160,6 +160,45 @@ impl<B: Backend> App<B> {
         });
     }
 
+    /// Announce `session` with this app's effect channel already attached, before the run loop
+    /// starts (SEAM-164): the composition root's call, made where it used to announce.
+    pub async fn announce_session(&mut self, session: &cyrup_session_svc::AgentSession) {
+        let effects = self.ui_effect_sender();
+        Self::announce_with_effects(session, effects).await;
+    }
+
+    /// The sending half of this app's extension-effect channel, made on first ask; the run loop
+    /// drains the same channel (SEAM-164). For the composition root, which announces the session
+    /// before the run loop starts: see [`Self::announce_with_effects`].
+    pub fn ui_effect_sender(&mut self) -> cyrup_session_svc::UiEffectSink {
+        self.early_effects
+            .get_or_insert_with(tokio::sync::mpsc::unbounded_channel)
+            .0
+            .clone()
+    }
+
+    /// Attach `effects` as the session's effect drain, then announce the session to its extensions
+    /// (SEAM-164).
+    ///
+    /// The order is the point. A `session_start` handler that sets a status, a widget, the title,
+    /// the editor text or the working indicator does it once; said before a drain is attached, it
+    /// was dropped (only notices are held), and the footer never showed it. pi binds the mode's
+    /// `uiContext` before `bindExtensions` emits `session_start` (`interactive-mode.ts:1971-1975`
+    /// @f1b2e77f5).
+    ///
+    /// [CYRUP-DELTA] — the dialog sink is attached after the announcement, by
+    /// [`Self::install_ui_sinks`]: a dialog is answered by the run loop, which has not started yet,
+    /// so a `session_start` handler that opened one gets its default at once rather than waiting
+    /// on a loop that cannot start until it returns. Idempotent per session, so a host that already
+    /// announced (a test, an embedder) is unaffected.
+    pub async fn announce_with_effects(
+        session: &cyrup_session_svc::AgentSession,
+        effects: cyrup_session_svc::UiEffectSink,
+    ) {
+        session.services().host_services.set_ui_effect_sink(effects);
+        session.bind_extensions().await;
+    }
+
     /// Bind BOTH extension-UI seams of a session's host services to this run loop — the single place
     /// [`App::run`] and its session-swap arm attach the TUI, mirroring `cyrup-modes`' `run_rpc` /
     /// `rebind_session`, which install the same pair for RPC mode.

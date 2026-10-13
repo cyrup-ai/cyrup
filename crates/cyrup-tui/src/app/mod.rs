@@ -480,4 +480,12 @@ pub struct App<B: Backend> {
     /// The previous inline frame's rows, kept only while the frame dump is on (pi's
     /// `previousLines`, the second array every dump carries).
     debug_previous_lines: Vec<String>,
+    /// SEAM-164 — the extension-effect channel, made on first ask ([`App::ui_effect_sender`]) so
+    /// the composition root can attach its sending half and announce the session BEFORE the run
+    /// loop exists (the initial prompt is sent before it), and the run loop then drains the same
+    /// channel. `None` once the run loop has taken it, or if nobody asked.
+    early_effects: Option<(
+        tokio::sync::mpsc::UnboundedSender<cyrup_session_svc::UiEffect>,
+        tokio::sync::mpsc::UnboundedReceiver<cyrup_session_svc::UiEffect>,
+    )>,
 }

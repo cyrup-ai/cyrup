@@ -80,8 +80,8 @@ pub use cyrup_provider::CatalogRefreshResult;
 pub use cyrup_provider::StreamEvent;
 pub use error::SessionServiceError;
 pub use event::{
-    AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptOptions, StreamingBehavior,
-    SummarizationRetrySource, UserInput,
+    AgentSessionEvent, DeliverAs, InputSource, PromptAccepted, PromptAnswered, PromptOptions,
+    PromptReply, StreamingBehavior, SummarizationRetrySource, UserInput,
 };
 pub use export::{
     CssColor, ExportBackdrops, ExportState, ExportTheme, ExportTool, ParseColorError,

@@ -255,6 +255,11 @@ pub async fn run_interactive(
     .context("writing the model scope line")?;
 
     let mut app = App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
+    // SEAM-033 / SEAM-164 — announce the session now: after `--name`/`--models` (applied before
+    // this function), before the boot transcript and the initial prompt, and with the app's effect
+    // drain attached, so a status or title a `session_start` handler sets is queued for the run
+    // loop rather than dropped. The run loop drains the same channel.
+    app.announce_session(&session).await;
 
     // ADR-0005 §B-14 — select the renderer before anything paints. The flag wins when supplied,
     // otherwise the `tuiMode` setting (§A-3), which since v1.0.0 degrades to `fullscreen` rather

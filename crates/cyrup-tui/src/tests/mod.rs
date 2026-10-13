@@ -35,6 +35,7 @@
 //! scrape helper.
 
 mod alt_screen;
+mod announce_window;
 mod app_global_actions;
 mod assembled_render;
 mod auth_selector;

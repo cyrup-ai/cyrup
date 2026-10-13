@@ -80,6 +80,44 @@ pub enum PromptAccepted {
     Handled,
 }
 
+/// What [`crate::AgentSession::prompt_or_defer`] answers (SEAM-165): the prompt's outcome now, or —
+/// when it was submitted while `agent_settled` handlers run, and so deferred until they finish — a
+/// handle that yields it then. pi defers the whole call, its `preflightResult` callback included
+/// (`agent-session.ts:1969-1971` @f1b2e77f5), and its RPC host writes the response from that
+/// callback, when the deferred prompt runs.
+#[derive(Debug)]
+pub enum PromptReply {
+    /// Not deferred: the outcome, as [`crate::AgentSession::prompt_with`] returns it.
+    Now(Result<PromptAccepted, crate::SessionServiceError>),
+    /// Deferred past `agent_settled`; [`PromptAnswered::answer`] yields the outcome when it runs.
+    Deferred(PromptAnswered),
+}
+
+/// The outcome of a prompt deferred past `agent_settled`, delivered when it runs (SEAM-165).
+#[derive(Debug)]
+pub struct PromptAnswered(
+    pub(crate) tokio::sync::oneshot::Receiver<Result<PromptAccepted, crate::SessionServiceError>>,
+);
+
+impl PromptAnswered {
+    /// Wait for the deferred prompt to run and yield what it did, or its error.
+    ///
+    /// Await it where the settle does not wait on you: an `agent_settled` handler that awaited this
+    /// would wait for an action that runs only after it returns.
+    ///
+    /// # Errors
+    ///
+    /// The prompt's own preflight error, or [`crate::SessionServiceError::DeferredPromptDropped`]
+    /// when it never ran (an action deferred ahead of it failed, or the session went away).
+    pub async fn answer(self) -> Result<PromptAccepted, crate::SessionServiceError> {
+        self.0.await.unwrap_or_else(|_| {
+            Err(crate::SessionServiceError::DeferredPromptDropped(
+                "not run, because a submission deferred ahead of it failed".to_string(),
+            ))
+        })
+    }
+}
+
 /// Per-call prompt options (Pi `PromptOptions`, agent-session.ts:200-212). `streaming_behavior`
 /// selects the queue (steer/follow-up) when the agent is already streaming; without it a prompt
 /// submitted while streaming is rejected (Pi throws at agent-session.ts:1044).
