@@ -172,7 +172,10 @@ pub(crate) enum InstalledProvenance {
     SessionBuiltin,
     /// An embedder's provider — injected at build, or returned by a resolver that does not
     /// resolve the built-ins — never replaced (round 4). pi's native provider: its rows ARE the
-    /// id's rows, and the compiled-in rows of the id are not listed beside them.
+    /// id's rows, and the compiled-in rows of the id are not listed beside them. It reaches the
+    /// slot with the session's `models.json` block for its id composed over it (SEAM-173), so
+    /// the provider here is pi's `composeModelProvider(id, native, config)`; with no block, the
+    /// provider as given.
     Embedder,
 }
 
@@ -591,13 +594,29 @@ impl GuestProviderRegistry {
     ///
     /// SEAM-168 — the slot also asks this registry, before every read, to bring what it holds up
     /// to date with the catalog overlay ([`crate::provider_swap::InstalledFollower`]).
+    ///
+    /// SEAM-173 — otherwise the slot holds the provider the session was BUILT with. When the swap's
+    /// resolver does not resolve the built-ins that is an embedder's provider, and it is composed
+    /// here with the session's `models.json` block for its id, by the composer a live registration
+    /// goes through ([`Self::with_models_json_over_native`], PROV-167): pi's native provider is
+    /// the `base` the config layer composes over (`core/model-runtime.ts:301-315` @f1b2e77f5), so
+    /// a `models.json` model under its id streams as itself and an override reaches the provider
+    /// that streams. The session's own launch provider (a resolver that does) is
+    /// `select_provider`'s, composed over `models.json` already; the provider a resolver returns
+    /// later is composed in [`ProviderSwap`] (the same composer).
     pub fn follow_installed(&self, swap: &Arc<ProviderSwap>) {
         *poison_safe(&self.installed) = Some(Arc::downgrade(swap));
         let follower: Weak<dyn crate::provider_swap::InstalledFollower> = self.this.clone();
         swap.attach_follower(follower);
-        let registered = self.provider(swap.current_raw().id().as_str());
-        if let Some(provider) = registered {
+        let built_with = swap.current_raw();
+        let id = built_with.id().as_str().to_string();
+        if let Some(provider) = self.provider(&id) {
             swap.store(provider);
+        } else if !swap.resolves_builtins() {
+            let composed = self.with_models_json_over_native(&id, Arc::clone(&built_with));
+            if !same_provider(&composed, &built_with) {
+                swap.store(composed);
+            }
         }
     }
 
@@ -1846,6 +1865,11 @@ impl ProviderRefresher for GuestProviderRegistry {
 impl crate::provider_swap::InstalledFollower for GuestProviderRegistry {
     fn follow_overlay(&self) {
         self.revalidate();
+    }
+
+    fn compose_native(&self, provider: Arc<dyn Provider>) -> Arc<dyn Provider> {
+        let id = provider.id().as_str().to_string();
+        self.with_models_json_over_native(&id, provider)
     }
 }
 

@@ -53,6 +53,14 @@ pub(crate) trait InstalledFollower: Send + Sync {
     /// Must never read the slot through [`ProviderSwap::current`] (it reads
     /// [`ProviderSwap::current_raw`]).
     fn follow_overlay(&self);
+
+    /// SEAM-173 — `provider`, an EMBEDDER's provider arriving at the slot (one the swap's resolver
+    /// returned, when that resolver does not resolve the built-ins), with the session's
+    /// `models.json` block for its id composed over it: pi's `composeProvider(id)` takes `base =
+    /// nativeExtensionProviders.get(id) ?? builtins.get(id)` and composes the config layer over
+    /// THAT (`core/model-runtime.ts:301-315` @f1b2e77f5), so the provider that streams carries the
+    /// block's rows. The one composer PROV-167's live registrations use.
+    fn compose_native(&self, provider: Arc<dyn Provider>) -> Arc<dyn Provider>;
 }
 
 /// The swappable stream source shared between the [`crate::AgentSession`] and its agent loop.
@@ -284,7 +292,7 @@ impl ProviderSwap {
         let resolver = self.resolver.as_ref().ok_or_else(|| {
             format!("cannot reach provider '{provider_id}': no provider resolver is configured for this session")
         })?;
-        resolver.resolve(provider_id)
+        self.resolved(resolver, provider_id)
     }
 
     /// Resolve the provider owning `provider_id` (installing its credentials) and install it as the
@@ -295,9 +303,31 @@ impl ProviderSwap {
                 "cannot switch to provider '{provider_id}': no provider resolver is configured for this session"
             )
         })?;
-        let provider = resolver.resolve(provider_id)?;
+        let provider = self.resolved(resolver, provider_id)?;
         self.store(provider.clone());
         Ok(provider)
+    }
+
+    /// What `resolver` answers for `provider_id`, as the session has it. SEAM-173 — a resolver
+    /// that does not resolve the built-ins returns an embedder's provider, which arrives here
+    /// uncomposed: the registry composes the session's `models.json` over it
+    /// ([`InstalledFollower::compose_native`]). A resolver that does (the binary's) returns
+    /// `select_provider`'s provider, composed over `models.json` already.
+    fn resolved(
+        &self,
+        resolver: &Arc<dyn ProviderResolver>,
+        provider_id: &str,
+    ) -> Result<Arc<dyn Provider>, String> {
+        let provider = resolver.resolve(provider_id)?;
+        if resolver.resolves_builtins() {
+            return Ok(provider);
+        }
+        Ok(
+            match self.follower.get().and_then(std::sync::Weak::upgrade) {
+                Some(follower) => follower.compose_native(provider),
+                None => provider,
+            },
+        )
     }
 }
 

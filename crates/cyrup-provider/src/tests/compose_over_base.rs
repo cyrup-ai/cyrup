@@ -473,3 +473,161 @@ async fn a_simple_request_on_a_base_api_reaches_the_bases_stream_simple() {
         Some("decode error: simple")
     );
 }
+
+/// A base that carries its auth inside itself (`provider_auth() == None` — an embedder's own
+/// provider, the offline faux) and records the row each request hands it, on either leg.
+struct SelfAuthBase {
+    id: ProviderId,
+    models: Vec<Model>,
+    handed: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl SelfAuthBase {
+    fn answer(&self, leg: &str, model: &Model) -> EventStream<StreamEvent> {
+        self.handed
+            .lock()
+            .unwrap()
+            .push((leg.to_string(), model.name.clone()));
+        let (sink, rx) = crate::api::channel(4);
+        let model = model.clone();
+        tokio::spawn(async move {
+            sink.send(
+                crate::error::ProviderError::Decode("served".to_string()).into_error_event(
+                    model.provider.clone(),
+                    model.id.as_str(),
+                    Some(model.api.clone()),
+                ),
+            )
+            .await;
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for SelfAuthBase {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+    fn models(&self) -> &[Model] {
+        &self.models
+    }
+    fn stream(
+        &self,
+        model: &Model,
+        _context: &Context,
+        _options: &StreamOptions,
+    ) -> EventStream<StreamEvent> {
+        self.answer("stream", model)
+    }
+    fn stream_simple(
+        &self,
+        model: &Model,
+        _context: &Context,
+        _options: &SimpleStreamOptions,
+    ) -> EventStream<StreamEvent> {
+        self.answer("simple", model)
+    }
+}
+
+/// A `models.json`-shaped layer over `base`: the base's row renamed, and `auth` as given.
+fn renaming_layer(auth: AuthLayer) -> ProviderLayer {
+    let mut row = acme_model("acme-wire", "https://acme.example/v1");
+    row.name = "Renamed by the layer".to_string();
+    ProviderLayer {
+        name: None,
+        base_url: None,
+        models: vec![row],
+        image_models: Vec::new(),
+        classifier_models: Vec::new(),
+        auth,
+    }
+}
+
+/// SEAM-173 — a layer that configures NO auth, over a base that encapsulates its own
+/// (`provider_auth() == None`), keeps that encapsulation: the composed provider declares no auth
+/// strategy either, and a base-api request reaches the base — with the LAYER's row — on both legs
+/// and through a `Models` collection, with no credential anywhere. pi has no such base (every
+/// provider carries `auth`); the layer changes the catalog, never what the provider can do.
+///
+/// RED before the fix (`WireProvider::with_auth_from_base` absent): the composed provider wrapped
+/// the base in a configured-key strategy with nothing to resolve, and every request ended
+/// `Provider is not configured: acme` before the base was called.
+#[tokio::test]
+async fn a_keyless_layer_over_a_self_authenticating_base_streams_through_it_unresolved() {
+    let handed = Arc::new(Mutex::new(Vec::new()));
+    let base: Arc<dyn Provider> = Arc::new(SelfAuthBase {
+        id: ProviderId::from("acme"),
+        models: vec![acme_model("acme-wire", "https://acme.example/v1")],
+        handed: handed.clone(),
+    });
+    let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
+    let ctx: Arc<dyn AuthContext> = Arc::new(MapEnv(BTreeMap::new()));
+    let composed = compose_over_base(
+        "acme",
+        Some(base),
+        renaming_layer(AuthLayer::new(Arc::new(LiteralValues))),
+        store.clone(),
+        Arc::new(builtin_registry()),
+        Some(ctx.clone()),
+    )
+    .unwrap();
+    assert!(
+        composed.provider_auth().is_none(),
+        "the composition declares the base's encapsulation"
+    );
+    let model = composed.models()[0].clone();
+
+    let direct =
+        collect_message(composed.stream(&model, &hello(), &StreamOptions::default())).await;
+    let simple =
+        collect_message(composed.stream_simple(&model, &hello(), &SimpleStreamOptions::default()))
+            .await;
+    let mut models = create_models(CreateModelsOptions {
+        credentials: Some(store),
+        auth_context: Some(ctx),
+        catalog_overlay: None,
+    });
+    models.set_provider(Arc::new(composed));
+    let collected = models
+        .complete(&model, &hello(), &StreamOptions::default())
+        .await;
+    for message in [&direct, &simple, &collected] {
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("decode error: served")
+        );
+    }
+    assert_eq!(
+        handed.lock().unwrap().as_slice(),
+        [
+            ("stream".to_string(), "Renamed by the layer".to_string()),
+            ("simple".to_string(), "Renamed by the layer".to_string()),
+            ("stream".to_string(), "Renamed by the layer".to_string()),
+        ]
+    );
+}
+
+/// SEAM-173 GUARD — a layer that DOES configure a key over the same base is composed as before:
+/// its configured-key strategy is the provider's, so the encapsulation rule above is the keyless
+/// case only.
+#[test]
+fn a_keyed_layer_over_a_self_authenticating_base_keeps_its_own_strategy() {
+    let base: Arc<dyn Provider> = Arc::new(SelfAuthBase {
+        id: ProviderId::from("acme"),
+        models: vec![acme_model("acme-wire", "https://acme.example/v1")],
+        handed: Arc::default(),
+    });
+    let mut auth = AuthLayer::new(Arc::new(LiteralValues));
+    auth.api_key = Some("sk-layer".to_string());
+    let composed = compose_over_base(
+        "acme",
+        Some(base),
+        renaming_layer(auth),
+        Arc::new(InMemoryCredentialStore::new()),
+        Arc::new(builtin_registry()),
+        Some(Arc::new(MapEnv(BTreeMap::new()))),
+    )
+    .unwrap();
+    assert!(composed.provider_auth().is_some());
+}
