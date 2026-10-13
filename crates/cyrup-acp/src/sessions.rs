@@ -485,11 +485,60 @@ fn title_of(info: &StoredInfo) -> Option<String> {
     {
         return Some(name.to_string());
     }
-    let first = info.first_message.trim();
-    if first.is_empty() || first == NO_MESSAGES_SENTINEL {
+    if info.first_message.trim() == NO_MESSAGES_SENTINEL {
         return None;
     }
-    Some(info.first_message.chars().take(80).collect())
+    // `ACP-301` — the first user message normalised; a whitespace-only one is skipped for the next.
+    crate::commands::normalize_session_title(&info.first_message)
+        .or_else(|| first_prompt_title(&info.path))
+}
+
+/// The first user message in the session file at `path` that normalises to a title (`ACP-300`,
+/// `ACP-301`; pi-acp `pickFallbackTitleFromHead`, `pi-sessions.ts:233-271` @04d0a15): each user
+/// message's text blocks joined with a space, through [`crate::commands::normalize_session_title`],
+/// in file order, skipping one that leaves nothing.
+///
+/// # [CYRUP-DELTA] — read here, not by `cyrup-session`'s listing
+///
+/// **What differs.** `listing::scan_file` keeps the first user message with any text as
+/// `first_message`, whitespace-only included, which is pi's own listing rule
+/// (`session-manager.ts:849-850` @f1b2e77f5) and what cyrup's TUI picker shows; changing it would
+/// move the TUI off pi to fix the ACP projection. So [`title_of`] falls back to this second read of
+/// the file only when `first_message` normalises to nothing. **What it costs.** One more pass over
+/// that one file, only for a session whose first user message is blank.
+fn first_prompt_title(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["type"] == "message" && entry["message"]["role"] == "user")
+        .find_map(|entry| {
+            let joined = match &entry["message"]["content"] {
+                Value::String(text) => text.clone(),
+                Value::Array(blocks) => blocks
+                    .iter()
+                    .filter(|b| b["type"] == "text")
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => String::new(),
+            };
+            crate::commands::normalize_session_title(&joined)
+        })
+}
+
+/// The title a reopened session publishes (`ACP-300`; pi-acp `readPiSessionTitle`,
+/// `pi-sessions.ts:273-280` @04d0a15): its name when the newest `session_info` names it, else its
+/// first prompt. A cleared name counts as no name and falls through to the first prompt, never to
+/// an older name.
+async fn stored_title(session: &AgentSession) -> Option<String> {
+    if let Some(name) = session
+        .session_name()
+        .await
+        .filter(|name| !name.trim().is_empty())
+    {
+        return Some(name);
+    }
+    first_prompt_title(&session.session_file().await?)
 }
 
 /// `SystemTime` as JS `Date.prototype.toISOString()` — `YYYY-MM-DDTHH:MM:SS.mmmZ` (`ACP-204`).
@@ -1207,7 +1256,11 @@ async fn session_updates_for(
         // `ACP-077` — the whole option set is re-derived, never patched, so the advertised
         // `currentValue` is the session's state read back independently.
         AgentSessionEvent::ModelChanged { .. } => {
-            vec![crate::config_options::config_options_update(session).await]
+            let mut out = vec![crate::config_options::config_options_update(session).await];
+            // `ACP-302` — "a different model can mean a different context window; refresh it
+            // immediately" (pi-acp v0.0.34 `agent.ts:1199`).
+            out.extend(crate::turn::usage_of(session).await);
+            out
         }
         // `ACP-072` / `ACP-077` — both, in this order: `current_mode_update` is what moves the
         // client's mode selector, and the config option carries the same fact for a client that
@@ -1254,7 +1307,7 @@ fn rename_update(
     } else {
         vec![crate::config_options::session_info_update(
             name,
-            now_iso8601_millis(),
+            Some(now_iso8601_millis()),
         )]
     }
 }
@@ -1288,6 +1341,11 @@ pub struct SessionManager {
     /// `std::sync::Mutex`, and the guard is never held across an `.await` — every use is a clone
     /// of the cheap [`TurnHandle`] or a `replace`.
     bound: Mutex<Option<SessionBinding>>,
+    /// `ACP-299` — held by the auto-title and by `/name`, so a `/name` racing the first prompt
+    /// either lands first (and the auto-title keeps it) or lands second (and replaces the derived
+    /// title); never interleaved, where the auto-title reads "no name" and then overwrites the
+    /// user's. Upstream's `titleUpdateQueue` (`session.ts:428-441`) serialises the same two.
+    title_lock: tokio::sync::Mutex<()>,
 }
 
 /// The per-session plumbing [`SessionManager::install`] spawns and [`SessionManager::install`]
@@ -1315,6 +1373,10 @@ pub struct LiveSession {
     pub runtime: Arc<AgentSessionRuntime>,
     /// The cwd it was built for, already checked (`ACP-056`).
     pub cwd: AbsCwd,
+    /// `ACP-299` — this session still takes its title from its first prompt that has text. Set only
+    /// for a `session/new` session (upstream `autoTitle: true`, `session.ts:247` @04d0a15) and
+    /// cleared only once a title is produced, so an image-only first prompt leaves it set.
+    pub title_pending: bool,
 }
 
 impl LiveSession {
@@ -1390,6 +1452,7 @@ impl SessionManager {
             cx: OnceLock::new(),
             client: Arc::new(OnceLock::new()),
             bound: Mutex::new(None),
+            title_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1828,6 +1891,8 @@ impl SessionManager {
             id: id.clone(),
             runtime: Arc::clone(&runtime),
             cwd: cwd.clone(),
+            // A restored or loaded session is never auto-titled (`session.ts:275`).
+            title_pending: false,
         })
         .await;
         self.set_last_cwd(cwd).await;
@@ -1867,12 +1932,23 @@ impl SessionManager {
                              restored"
                         ),
                     })?;
-                    self.build_and_install(
-                        id,
-                        SessionTarget::Resume(stored.file.path().to_path_buf()),
-                        cwd,
-                    )
-                    .await
+                    let runtime = self
+                        .build_and_install(
+                            id,
+                            SessionTarget::Resume(stored.file.path().to_path_buf()),
+                            cwd,
+                        )
+                        .await?;
+                    // `ACP-300` — the build branch only, never the live short-circuit above
+                    // (upstream's `maybeGet` early return): a session that was live has already
+                    // told the client its title. Sent here, before the caller's response or turn.
+                    if let Some(title) = stored_title(&*runtime.session().await).await {
+                        self.wire().notify(
+                            id,
+                            crate::config_options::session_info_update(Some(title), None),
+                        );
+                    }
+                    Ok(runtime)
                 },
             )
             .await
@@ -1967,6 +2043,7 @@ impl SessionManager {
                     id,
                     runtime,
                     cwd: cwd.clone(),
+                    title_pending: true,
                 })
                 .await;
                 self.set_last_cwd(cwd).await;
@@ -2050,8 +2127,12 @@ impl SessionManager {
         //
         // `ACP-081` — a project with nothing to report contributes no chunk at all, rather than
         // upstream's degenerate single-newline one.
-        let mut follow_up = Vec::with_capacity(2);
+        let mut follow_up = Vec::with_capacity(3);
         follow_up.extend(crate::startup::startup_prelude(&session));
+        // `ACP-302` — the context window, now that the client knows the session id, so the meter
+        // is right before the first prompt (pi-acp v0.0.34 `agent.ts:400-406`). Before the command
+        // advertisement, as there.
+        follow_up.extend(crate::turn::usage_of(&session).await);
         follow_up.push(crate::commands::available_commands_update(&session));
         Ok(HandlerOutcome::with_follow_up(
             NewSessionResponse::new(id)
@@ -2139,7 +2220,23 @@ impl SessionManager {
             // call. `merge_commands(Vec::new())` (this line before integration) advertised the
             // built-ins alone, so every prompt template, skill and extension command was missing
             // from the client's palette after a load and present after a new.
-            follow_up: vec![crate::commands::available_commands_update(&session)],
+            //
+            // [CYRUP-DELTA] `ACP-300` — the stored title is published HERE, first in the follow-up,
+            // where upstream publishes it inside `restoreSession`, before the replay and the
+            // response. Moved for `ACP-217`'s reason: Zed ignores notifications for a session id
+            // it does not know yet, and before the `LoadSessionResponse` it may not. What it costs:
+            // a client that renders the title from the replay's first frames sees it one response
+            // later. `ACP-302`'s `usage_update` follows it, which IS upstream's order
+            // (`agent.ts:1088-1093`, after the load and before the commands).
+            follow_up: stored_title(&session)
+                .await
+                .map(|title| crate::config_options::session_info_update(Some(title), None))
+                .into_iter()
+                .chain(crate::turn::usage_of(&session).await)
+                .chain(std::iter::once(crate::commands::available_commands_update(
+                    &session,
+                )))
+                .collect(),
         })
     }
 
@@ -2561,6 +2658,10 @@ impl SessionManager {
             return;
         }
 
+        // `ACP-299` — the first prompt with text names a new session.
+        self.auto_title(&req.session_id, &runtime, &req.prompt)
+            .await;
+
         // 4.
         let Some(turn) = self.turn_for(&req.session_id) else {
             // The slot moved between the restore and this read — only possible if another handler
@@ -2585,6 +2686,75 @@ impl SessionManager {
             // The actor is gone (the session was replaced under this request). Answer rather than
             // drop: a dropped responder is a spinner forever.
             let _ = responder.respond_with_error(Self::unknown_session(&req.session_id).into());
+        }
+    }
+
+    /// Name a `session/new` session from its first prompt that has text (`ACP-299`).
+    ///
+    /// Port of pi-acp `maybeAutoTitle` (`session.ts:455-474` @04d0a15): once per session; a
+    /// session already named (a `/name` before the first prompt, or a name another front-end set)
+    /// keeps and republishes its name; otherwise the derived title is persisted as the session's
+    /// name and published. Failures are swallowed — a title is never worth failing a prompt for.
+    ///
+    /// # [CYRUP-DELTA] — run at prompt admission, not at turn dequeue
+    ///
+    /// **What differs.** Upstream calls this when the turn is dequeued (`session.ts:600`). Here it
+    /// runs when the prompt is admitted, before it is handed to the turn queue. **What it costs.**
+    /// A prompt queued behind a running turn names the session as it is sent rather than when it
+    /// starts. Only a session's first text prompt titles it, and in cyrup's one-live-session ACP
+    /// host that prompt has nothing queued ahead of it, so the two points coincide in practice.
+    ///
+    /// # No double emit
+    ///
+    /// The flag is cleared under the live-slot lock before anything is sent, so two prompts cannot
+    /// both title. `set_session_name` fans out `SessionInfoChanged`, which the config pump would
+    /// turn into a second `session_info_update`; the [`crate::commands::RenameEcho`] claim taken
+    /// before the mutation makes the pump swallow that copy, as `/name` does. No claim is taken when
+    /// the session is already named, because then nothing is set and no event follows.
+    async fn auto_title(
+        &self,
+        id: &SessionId,
+        runtime: &Arc<AgentSessionRuntime>,
+        prompt: &[agent_client_protocol::schema::v1::ContentBlock],
+    ) {
+        // A prompt with no text (an image alone) titles nothing and leaves the flag set.
+        let Some(derived) = crate::commands::prompt_to_session_title(prompt) else {
+            return;
+        };
+        let _title_guard = self.title_lock.lock().await;
+        if !self.take_title_pending(id).await {
+            return;
+        }
+        let session = runtime.session().await;
+        let existing = session
+            .session_name()
+            .await
+            .filter(|name| !name.trim().is_empty());
+        let title = match existing {
+            Some(name) => name,
+            None => {
+                let rename_echo = self.rename_echo_for(id);
+                let claim = rename_echo.claim();
+                if let Err(error) = session.set_session_name(&derived).await {
+                    tracing::debug!(%error, "ACP-299: the derived session title was not saved");
+                    return;
+                }
+                claim.keep();
+                derived
+            }
+        };
+        self.wire().notify(
+            id,
+            crate::config_options::session_info_update(Some(title), Some(now_iso8601_millis())),
+        );
+    }
+
+    /// Clear `id`'s pending-title flag, returning whether it was set (`ACP-299`).
+    async fn take_title_pending(&self, id: &SessionId) -> bool {
+        let mut live = self.live.lock().await;
+        match live.as_mut().filter(|s| s.id == *id) {
+            Some(session) => std::mem::take(&mut session.title_pending),
+            None => false,
         }
     }
 
@@ -2620,6 +2790,11 @@ impl SessionManager {
         };
         let session = runtime.session().await;
         let rename_echo = self.rename_echo_for(session_id);
+        // `ACP-299` — `/name` and the auto-title are serialised; see `title_lock`.
+        let _title_guard = match builtin {
+            crate::commands::Builtin::Name => Some(self.title_lock.lock().await),
+            _ => None,
+        };
         match crate::commands::dispatch(builtin, raw_args, &parsed, &cwd, &session, &rename_echo)
             .await
         {
@@ -3143,8 +3318,10 @@ mod tests {
         }
 
         // And the value the notification actually carries is that string, not a nanosecond one.
-        let update =
-            crate::config_options::session_info_update(Some("n".into()), now_iso8601_millis());
+        let update = crate::config_options::session_info_update(
+            Some("n".into()),
+            Some(now_iso8601_millis()),
+        );
         let json = serde_json::to_value(&update).expect("serialises");
         let wire = json["updatedAt"].as_str().expect("a string");
         assert_eq!(wire.len(), 24, "{wire}");
@@ -3285,6 +3462,52 @@ mod tests {
         );
         assert_eq!(by_id["long-first"], Some("x".repeat(80)));
         assert_eq!(by_id["named"], Some("My session".to_string()));
+    }
+
+    /// ACP-301 — the listing's fallback title is the first message normalised: whitespace runs
+    /// collapsed, trimmed, then clipped, so no newline or leading space reaches the client.
+    #[test]
+    fn acp301_the_fallback_title_is_whitespace_normalised() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = SessionsRoot(tmp.path().to_path_buf());
+        // `user_line` splices its text into JSON verbatim, so a newline must arrive escaped.
+        let escaped = |t: &str| {
+            serde_json::to_string(t)
+                .unwrap()
+                .trim_matches('"')
+                .to_string()
+        };
+        let dir = tmp.path().join("--proj-a--");
+        let long: String = (0..20).map(|n| format!("word{n}\n")).collect();
+        assert!(long.chars().count() >= 100);
+        write_session(
+            &dir,
+            "a.jsonl",
+            "messy",
+            "/proj/a",
+            "2024-01-02T03:04:05.000Z",
+            &[&user_line(
+                &escaped("\n  Fix\tthe\n bug "),
+                1_704_164_645_000,
+            )],
+        );
+        write_session(
+            &dir,
+            "b.jsonl",
+            "long",
+            "/proj/a",
+            "2024-01-02T03:04:06.000Z",
+            &[&user_line(&escaped(&long), 1_704_164_646_000)],
+        );
+        let by_id: std::collections::HashMap<String, Option<String>> = list_rows(&root, None)
+            .iter()
+            .filter_map(to_acp_row)
+            .map(|row| (row.session_id.to_string(), row.title.clone()))
+            .collect();
+        assert_eq!(by_id["messy"].as_deref(), Some("Fix the bug"));
+        let long_title = by_id["long"].clone().unwrap();
+        assert_eq!(long_title.chars().count(), 80);
+        assert!(!long_title.contains('\n'), "{long_title:?}");
     }
 
     /// ACP-228 — a session named and later cleared reports `null`, not the old name. Recorded as a

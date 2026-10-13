@@ -198,7 +198,13 @@ fn the_frame_sequence_is_stable() {
         assert_eq!(
             kinds,
             vec![
+                // `ACP-302` — `session/new`'s context window, then its command advertisement;
+                // `open_session` reads only up to the response, so both arrive in this drain.
+                "usage_update",
                 "available_commands_update",
+                // `ACP-299` — the first prompt names the session, before the turn's own output.
+                "session_info_update",
+                // `ACP-124` — the queue-depth `_meta`, which carries no title.
                 "session_info_update",
                 "tool_call",
                 "tool_call_update:pending",
