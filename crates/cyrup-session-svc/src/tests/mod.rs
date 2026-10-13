@@ -53,6 +53,7 @@ mod late_seams;
 mod live_provider_auth;
 mod live_provider_host_wiring;
 mod live_providers;
+mod live_registry;
 mod mid_run_tool_anchoring;
 mod model_refresh_reaches_live_providers;
 mod model_runtime_snapshot;

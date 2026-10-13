@@ -52,7 +52,7 @@ impl AgentSession {
         let current_model = if user_wants_summary {
             self.summarization_model().await?.map(|(m, _)| m)
         } else {
-            Self::lock(&self.compaction_model).clone()
+            self.current_model()
         };
         let model = match current_model {
             Some(m) => m,

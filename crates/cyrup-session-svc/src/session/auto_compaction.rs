@@ -75,7 +75,8 @@ impl AgentSession {
         let same_model = message_model.is_some();
         let window = match message_model.as_ref() {
             Some(m) => m.context_window,
-            None => Self::lock(&self.compaction_model)
+            None => self
+                .current_model()
                 .as_ref()
                 .map_or(0, |m| m.context_window),
         };
@@ -259,7 +260,7 @@ impl AgentSession {
         // from the `else` arm of `if (extensionCompaction)` (`:3140-3156`). Routing up here made a
         // `direct`-refusing router break an extension-supplied auto-compaction and turned a
         // nothing-to-compact check into a routing failure.
-        if Self::lock(&self.compaction_model).is_none() {
+        if self.current_model().is_none() {
             return Ok(false);
         }
         // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY
@@ -329,7 +330,7 @@ impl AgentSession {
             // A selection cleared since the check above: the compaction started, so it ends the way
             // the `Ok(None)` arm below ends one, with its `compaction_end` and
             // `session_compact_failed`, rather than leaving the `compaction_start` open.
-            let Some(selected) = Self::lock(&self.compaction_model).clone() else {
+            let Some(selected) = self.current_model() else {
                 cancel_slot.clear();
                 self.emit_compaction_failure(reason, false, None, from_extension)
                     .await;
@@ -618,7 +619,7 @@ impl AgentSession {
             return Ok(None);
         }
         let window = {
-            Self::lock(&self.compaction_model)
+            self.current_model()
                 .as_ref()
                 .map_or(0, |m| m.context_window)
         };
@@ -729,7 +730,7 @@ impl AgentSession {
     pub(crate) fn compaction_settings_for_model(
         &self,
     ) -> Result<CompactionSettings, SessionServiceError> {
-        let model = Self::lock(&self.compaction_model).clone();
+        let model = self.current_model();
         let key = model.as_ref().map(|m| (m.provider.as_str(), m.id.as_str()));
         let resolved = self
             .services

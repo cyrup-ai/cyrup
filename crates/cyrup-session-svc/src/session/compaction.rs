@@ -119,7 +119,7 @@ impl AgentSession {
         // supplies") — failed a compaction the extension had already supplied, and turned
         // "nothing to compact" into a routing failure. The route now happens below, in the one arm
         // that makes a model call.
-        if Self::lock(&self.compaction_model).is_none() {
+        if self.current_model().is_none() {
             cancel_slot.clear();
             let err = SessionServiceError::NoModelSelected;
             self.emit_compaction_failure(
@@ -250,7 +250,7 @@ impl AgentSession {
             // ends the compaction the way every other refusal here does — with a failing
             // `compaction_end` and its `session_compact_failed` — rather than out of the function
             // with the `compaction_start` left open.
-            let Some(selected) = Self::lock(&self.compaction_model).clone() else {
+            let Some(selected) = self.current_model() else {
                 cancel_slot.clear();
                 let err = SessionServiceError::NoModelSelected;
                 self.emit_compaction_failure(

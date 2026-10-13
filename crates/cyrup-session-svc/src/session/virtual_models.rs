@@ -204,7 +204,7 @@ impl AgentSession {
         if self.selection_is_virtual() {
             return self.physical_model(message.provider.as_str(), message.model.as_str());
         }
-        let selection = Self::lock(&self.compaction_model).clone();
+        let selection = self.current_model();
         selection
             .filter(|m| m.provider == message.provider && m.id.as_str() == message.model.as_str())
     }
@@ -268,7 +268,7 @@ impl AgentSession {
         if let Some(routed) = self.routed_model().await {
             return Some(routed.model);
         }
-        Self::lock(&self.compaction_model).clone()
+        self.current_model()
     }
 
     /// Take and clear the stashed failed response — pi's first two statements in the
@@ -534,7 +534,7 @@ impl AgentSession {
     pub(crate) async fn summarization_model(
         &self,
     ) -> Result<Option<(Model, ModelThinkingLevel)>, SessionServiceError> {
-        let Some(selected) = ({ Self::lock(&self.compaction_model).clone() }) else {
+        let Some(selected) = ({ self.current_model() }) else {
             return Ok(None);
         };
         let level = self.thinking_level().await;

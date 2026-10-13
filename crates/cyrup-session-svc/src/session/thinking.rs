@@ -28,7 +28,7 @@ impl AgentSession {
         // This used to return a five-rung list against a citation (`agent-session.ts:297
         // THINKING_LEVELS`) that does not exist at 0.84.3; with no model resolved yet that silently
         // hid `xhigh`/`max` from `/thinking` and from the picker.
-        let Some(model) = ({ Self::lock(&self.compaction_model).clone() }) else {
+        let Some(model) = ({ self.current_model() }) else {
             return cyrup_provider::EXTENDED_THINKING_LEVELS.to_vec();
         };
         cyrup_provider::get_supported_thinking_levels(&model)
@@ -38,9 +38,7 @@ impl AgentSession {
     /// agent-session.ts:1729-1731).
     pub fn supports_thinking(&self) -> bool {
         // Pi `return !!this.model?.reasoning;` (agent-session.ts:1730) — false with no model.
-        Self::lock(&self.compaction_model)
-            .as_ref()
-            .is_some_and(|m| m.reasoning)
+        self.current_model().as_ref().is_some_and(|m| m.reasoning)
     }
 
     /// Set the thinking level, clamping to the model's capabilities, persisting a
@@ -51,7 +49,7 @@ impl AgentSession {
         &self,
         level: ModelThinkingLevel,
     ) -> Result<ModelThinkingLevel, SessionServiceError> {
-        let model = { Self::lock(&self.compaction_model).clone() };
+        let model = { self.current_model() };
         // Pi `_clampThinkingLevel`: `return this.model ? clampThinkingLevel(this.model, level)
         // : "off";` (agent-session.ts:1608-1610) — a modelless session clamps everything to off.
         let effective = match model.as_ref() {

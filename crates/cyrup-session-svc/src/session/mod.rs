@@ -35,6 +35,7 @@ mod lifecycle;
 mod model;
 #[cfg(test)]
 pub(crate) use model::LIVE_AUTH_CHECK_TIMEOUT;
+pub(crate) use model::compose_physical_registry;
 mod model_calls;
 pub(crate) mod model_runtime;
 mod nested;
@@ -194,8 +195,15 @@ pub struct AgentSession {
     /// starts in so the TUI can offer `/login` and then `/model` (SEAM-075).
     model: Mutex<Option<ModelRef>>,
     /// The resolved summarization/compaction model (kept in lockstep with `model`); `None` in the
-    /// same modelless state.
+    /// same modelless state. pi's `this.model`.
+    ///
+    /// READ ONLY THROUGH [`Self::current_model`] (SEAM-167), which re-reads the row from the
+    /// registry when the registry's inputs moved since it was taken; written by the selection
+    /// paths through `select_current_model` and by that re-read.
     compaction_model: Mutex<Option<cyrup_provider::Model>>,
+    /// The registry inputs `compaction_model`'s row was taken at (SEAM-167, see
+    /// [`Self::current_model`]).
+    current_model_key: Mutex<Option<model::RegistryKey>>,
     /// The LIVE base system prompt — the value a run falls back to when no `before_agent_start`
     /// handler replaced it (Pi `private _baseSystemPrompt`, agent-session.ts:371).
     ///
@@ -519,6 +527,10 @@ impl AgentSession {
             services,
             model: Mutex::new(model),
             compaction_model: Mutex::new(compaction_model),
+            // No key: the first read takes the starting row from the registry (pi resolves its
+            // starting model against the runtime), which matters when the builder rebuilt the
+            // launch provider over the session's overlay (SEAM-168).
+            current_model_key: Mutex::new(None),
             base_prompt: Mutex::new(base_prompt),
             run_prompt_options: Mutex::new(None),
             branch_summary_settings: extras.branch_summary_settings,
@@ -664,6 +676,26 @@ impl AgentSession {
                         Ok(text)
                     }
                     None => cyrup_ext::render_system_prompt_options(options),
+                }));
+        }
+        // SEAM-167: pi re-reads its current model from the runtime right after each of the five
+        // provider actions (`_refreshCurrentModelFromRegistry`, `core/agent-session.ts:3470-3490`
+        // @f1b2e77f5), so an extension's `ctx.model` answers the new row at once. The session's
+        // own readers re-read lazily (`current_model`); this keeps the host services' mirror as
+        // eager as pi's. Weak, so the registry never keeps the session alive; a session dropped by
+        // this very upgrade is released on another thread, never inside the registration that
+        // fired the listener.
+        {
+            let weak = Arc::downgrade(&arc);
+            arc.services
+                .guest_providers
+                .on_provider_action(Arc::new(move || {
+                    if let Some(session) = weak.upgrade() {
+                        session.refresh_current_model();
+                        if Arc::strong_count(&session) == 1 {
+                            std::thread::spawn(move || drop(session));
+                        }
+                    }
                 }));
         }
         // EXT-078: this session dispatches `turn_end` itself, as pi's boundary.

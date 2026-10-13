@@ -1869,9 +1869,17 @@ impl SessionBuilder {
         // composition was resolved with and composes again on any read that finds the slot holding
         // another (pi's composed `getAllModels` reads its base on every call,
         // `provider-composer.ts:555-575`). `model_config` is this session's for its whole life.
+        //
+        // SEAM-168 — the same resolver builds the installed provider of a non-guest built-in id
+        // when the swap's resolver declares it resolves the built-ins (the binary's), and rebuilds
+        // it whenever the overlay moves. So its credential store is the one the binary's
+        // `select_provider` is given — `auth.json` with the runtime `--api-key` overlaid (pi hands
+        // every provider its `RuntimeCredentials`; `compose_codemode_models` reads the same) — or
+        // the rebuilt launch provider would lose a `--api-key`.
         {
             let model_config = Arc::clone(&model_config);
-            let store: Arc<dyn cyrup_provider::CredentialStore> = auth.clone();
+            let store: Arc<dyn cyrup_provider::CredentialStore> =
+                cyrup_config::login::runtime_credentials(auth.clone());
             let ctx: Arc<dyn cyrup_provider::AuthContext> =
                 Arc::new(cyrup_config::login::StoreAuthContext(auth.clone()));
             guest_providers.attach_base_resolver(
@@ -1909,40 +1917,19 @@ impl SessionBuilder {
                 cancel.token().clone(),
             ),
         ));
-        // The catalog the flush validates against. pi drains `pendingVirtualModelRegistrations`
-        // into a `modelRuntime` that already holds every provider's catalog
-        // (`agent-session-services.ts:182-194`), so the physical-conflict check at
-        // `model-runtime.ts:957` sees the whole catalog; this is the builder's equivalent, unioned
-        // from the same three sources `AgentSession::compose_model_registry` uses and then composed
-        // through `models.json`. No network and no disk: `default_models` is compiled in, and
-        // `model_config` was already read at startup.
-        let virtual_flush_catalog: Arc<dyn cyrup_provider::VirtualModelCatalog> = {
-            let mut base: Vec<cyrup_provider::Model> = initial_provider.models().to_vec();
-            for m in guest_providers.models() {
-                if !base
-                    .iter()
-                    .any(|e| e.provider == m.provider && e.id == m.id)
-                {
-                    base.push(m);
-                }
-            }
-            for m in cyrup_provider::default_models(cyrup_provider::CreateModelsOptions {
-                credentials: None,
-                auth_context: None,
-                catalog_overlay: None,
-            })
-            .get_models(None)
-            {
-                if !base
-                    .iter()
-                    .any(|e| e.provider == m.provider && e.id == m.id)
-                {
-                    base.push(m);
-                }
-            }
-            let (composed, _errors) = model_config.compose(&base);
-            Arc::new(crate::virtual_models::StartupVirtualCatalog::new(composed))
-        };
+        // The catalog every extension's `registerVirtualModel` validates against — at the bind
+        // flush below and for every registration after it. pi drains
+        // `pendingVirtualModelRegistrations` into a `modelRuntime` that already holds every
+        // provider's catalog (`agent-session-services.ts:182-194`), and checks each registration
+        // against that LIVE runtime (`model-runtime.ts:960`). SEAM-169: so this is the session's
+        // physical registry composed at each check, overlay included — not a list taken here.
+        let virtual_flush_catalog: Arc<dyn cyrup_provider::VirtualModelCatalog> =
+            Arc::new(crate::virtual_models::LiveVirtualCatalog::new(
+                &guest_providers,
+                Arc::clone(&initial_provider),
+                Arc::clone(&catalog_overlay),
+                Arc::clone(&model_config),
+            ));
         guest_providers.attach_virtual_models(virtual_models.clone(), virtual_flush_catalog);
         // Bind, flushing BOTH queues (pi `bindCore`'s two pending loops, `runner.ts:485-514`). A
         // virtual-model registration the registry refuses becomes a startup diagnostic in pi's own
@@ -2626,6 +2613,12 @@ impl SessionBuilder {
         // refresh) is stored into the slot too, so the session streams through, lists and filters by
         // the replacement and not by the `Arc` it started on.
         guest_providers.follow_installed(&provider_swap);
+        // SEAM-168 — the binary's launch provider is `select_provider`'s built-in, made over the
+        // overlay as it stood then; when the swap's resolver says so, the session takes it over as
+        // its own built-in and keeps it current with the overlay from here on.
+        if provider_swap.resolves_builtins() {
+            guest_providers.adopt_installed_builtin();
+        }
         // Transport selection (Pi `AgentOptions.streamFn`, sdk.ts:301): an embedder-supplied custom
         // `StreamFn` (e.g. `ProxyStreamFn`) becomes THE transport the agent loop streams through;
         // absent one, the provider-backed `ProviderSwap` is used (the default live-swappable path).
