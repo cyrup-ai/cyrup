@@ -137,6 +137,9 @@ impl AcpFailure {
             | E::AlreadyCompacted
             | E::CompactionCancelled
             | E::NoRuntimeHost(_)
+            // SEAM-165: a prompt deferred past `agent_settled` that failed or never ran. Only the
+            // RPC host asks for it (`prompt_or_defer`); internal, never a credential problem.
+            | E::DeferredPromptDropped(_)
             // A virtual-model routing refusal. Declined for `AuthRequired` even though one of its
             // four cases is "the routed model has no credentials": the client selected a model that
             // IS configured, and the remedy is for the ROUTER to pick differently — an Authenticate
