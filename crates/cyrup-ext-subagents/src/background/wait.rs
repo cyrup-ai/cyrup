@@ -9,21 +9,33 @@
 //! single turn: once it ends, nothing is left to receive the notification. `wait` closes that gap
 //! by keeping the turn alive until a tracked run reaches a terminal state.
 //!
-//! # Why blocking here is safe (the two escape hatches)
+//! # Why blocking here is safe (the three escape hatches)
 //!
 //! A blocking primitive with no way out would let one wedged child hang the orchestrator forever.
-//! There are two independent ways this loop always terminates:
+//! There are three independent ways out of this loop, and the first alone guarantees it ends:
 //!
 //! 1. **Timeout** — [`WaitParams::timeout_ms`], defaulting to [`DEFAULT_TIMEOUT_MS`] (30 minutes,
-//!    pi's `DEFAULT_TIMEOUT_MS`). On expiry the wait returns an error result naming the runs still
-//!    in flight. The runs are detached and keep going; only the *waiting* stops.
+//!    pi's `DEFAULT_TIMEOUT_MS`). On expiry the wait returns a NON-error `window_elapsed` result
+//!    naming the runs still in flight ([`WaitVerdict::WindowElapsed`]). The runs are detached and
+//!    keep going; only the *waiting* stops.
 //! 2. **Cancellation** — the host's [`CancelToken`] for this tool call (pi's `AbortSignal`). The
 //!    sleep is a `select!` against [`CancelToken::cancelled`], so aborting the turn wakes the loop
 //!    immediately rather than after the remaining poll interval, and it returns an error result
 //!    naming what was still active. Dropping the future (the host abandoning the call) likewise
 //!    tears everything down — this loop owns no task, no thread and no spawned work.
+//! 3. **The operator talking** (SUBA-192, the `bg_wait` tool only — auto-drain and the other
+//!    [`WaitDeps::for_cwd`] callers carry no token) — [`WaitDeps::user_input`], a token the
+//!    `bg_wait` tool opens per call ([`UserInputWaits`]) and the extension's `input` listener
+//!    cancels when the operator sends a steer or follow-up while the agent is busy (pi
+//!    `wait-tool.ts:31-53`, `subagent-wait.ts:595`,`:794` @ad11b7ab). It is selected in every sleep
+//!    beside the turn's own token, so the message ends the wait at once, and it returns a NON-error
+//!    `user_input` yield ([`WaitVerdict::UserInput`]) listing the work still active — the runs keep
+//!    going. A steer reaches the model on its next request. A follow-up is delivered only once the
+//!    turn ends without tool calls, so a model that calls `bg_wait` again holds it back until that
+//!    wait ends — the same as upstream, whose agent loop also drains follow-ups only at idle. It is
+//!    a SEPARATE token, never a child of the turn's: an abort must stay an abort.
 //!
-//! A third, quieter guarantee: with [`WaitDeps::stop_on_attention`] set (the default, and the
+//! A fourth, quieter guarantee: with [`WaitDeps::stop_on_attention`] set (the default, and the
 //! `bg_wait` tool's own mode), a run that trips the `needs_attention` heuristic ALSO ends the wait, in
 //! either mode. A child that went idle or blocked on a decision would otherwise stall the loop
 //! until the timeout, and the caller is exactly who has to act on it. Auto-drain is the documented
@@ -315,6 +327,18 @@ pub struct WaitDeps {
     /// `None` is the no-executor degradation every other injected seam here has, and it means
     /// exactly what it meant before this field existed: the candidate set is async runs only.
     pub detached_foreground: Option<DetachedForegroundHook>,
+    /// SUBA-192 — pi `deps.userInputSignal` (`subagent-wait.ts:128` @ad11b7ab): cancelled when the
+    /// operator sends a message while this wait is open, which ends it with a non-error
+    /// [`WaitVerdict::UserInput`] yield.
+    ///
+    /// One token PER CALL, opened by the `bg_wait` tool through [`UserInputWaits::open`] — upstream
+    /// creates its `AbortController` inside `execute` (`wait-tool.ts:37-38`), so a message sent
+    /// before the call began never ends it, and one sent to an earlier call never ends a later
+    /// one. `None` — every construction with no `input` listener behind it, auto-drain's two
+    /// included, exactly as upstream's drain passes no `userInputSignal` (`auto-drain.ts:65-80`) —
+    /// leaves the wait as it was before this field existed. Auto-drain must stay that way: it
+    /// re-enters this wait in a loop, and a yield there would spin it until its deadline.
+    pub user_input: Option<CancelToken>,
 }
 
 /// [`WaitDeps::subscribe`]'s payload — pi's `deps.subscribe` closure.
@@ -410,7 +434,22 @@ impl WaitDeps {
             // No executor in hand here, so no remembered-run map to consult — see
             // [`Self::with_detached_foreground`].
             detached_foreground: None,
+            // No `input` listener behind a bare construction — see [`Self::with_user_input`].
+            user_input: None,
         }
+    }
+
+    /// SUBA-192 — attach this call's user-input token ([`UserInputWaits::open`]), so a message the
+    /// operator sends while the wait is open ends it with a non-error `user_input` yield.
+    ///
+    /// Separate from [`Self::for_cwd`] for the reason every executor-owned seam here is: the
+    /// registry the token comes from belongs to the extension's `input` listener, while `for_cwd`
+    /// is reachable from contexts that have no listener at all — auto-drain's two construction
+    /// sites, which must never yield to user input (see [`Self::user_input`]).
+    #[must_use]
+    pub fn with_user_input(mut self, user_input: Option<CancelToken>) -> Self {
+        self.user_input = user_input;
+        self
     }
 
     /// VL-S11b — attach the executor's remembered-foreground-run projection, so this wait's
@@ -506,6 +545,119 @@ impl WaitDeps {
     pub fn with_fail_on_attention(mut self, fail_on_attention: bool) -> Self {
         self.fail_on_attention = fail_on_attention;
         self
+    }
+}
+
+/// SUBA-192 — the open blocking waits a message from the operator must end: pi's
+/// `userInputWaits` set and the `pi.on("input")` listener that aborts it (`wait-tool.ts:31-35`
+/// @ad11b7ab).
+///
+/// The `bg_wait` tool opens one entry per call ([`Self::open`]) and holds it for the call's
+/// lifetime; the extension's `input` handler calls [`Self::on_input`] with every input the host
+/// publishes. One admitted input ends EVERY wait open at that moment, as upstream's loop over the
+/// set does, and nothing is remembered for a wait that opens later.
+///
+/// Executor-owned and shared by clone, like the completion bus: the tool and the event handler
+/// are two different objects that must reach the one set.
+#[derive(Clone, Debug, Default)]
+pub struct UserInputWaits {
+    inner: std::sync::Arc<std::sync::Mutex<UserInputWaitSet>>,
+}
+
+#[derive(Debug, Default)]
+struct UserInputWaitSet {
+    next: u64,
+    open: BTreeMap<u64, CancelToken>,
+}
+
+impl UserInputWaits {
+    fn set(&self) -> std::sync::MutexGuard<'_, UserInputWaitSet> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Open one wait's entry: a FRESH token, registered until the returned guard drops — pi
+    /// `const userInput = new AbortController(); userInputWaits.add(userInput)` … `finally {
+    /// userInputWaits.delete(userInput) }` (`wait-tool.ts:37-38`,`:51-53`).
+    #[must_use]
+    pub fn open(&self) -> UserInputWait {
+        let token = CancelToken::new();
+        let mut set = self.set();
+        let id = set.next;
+        set.next = set.next.wrapping_add(1);
+        set.open.insert(id, token.clone());
+        UserInputWait {
+            waits: self.clone(),
+            id,
+            token,
+        }
+    }
+
+    /// pi's `input` listener (`wait-tool.ts:32-35`): end every open wait when the shared rule
+    /// ([`crate::mid_run_input::admits`]) says this input is the operator talking to a busy agent.
+    /// Returns how many open waits it ended. Synchronous on purpose — it runs inside the host's
+    /// `input` dispatch, which must not wait on anything.
+    pub fn on_input(
+        &self,
+        source: cyrup_ext::InputEventSource,
+        streaming_behavior: Option<cyrup_ext::InputStreamingBehavior>,
+    ) -> usize {
+        if !crate::mid_run_input::admits(source, streaming_behavior) {
+            return 0;
+        }
+        let set = self.set();
+        for token in set.open.values() {
+            token.cancel();
+        }
+        set.open.len()
+    }
+
+    /// How many waits are open right now — what a caller that must not send its input before a
+    /// wait is listening checks first (pi drops input that precedes the call, `wait-tool.ts:37`).
+    #[must_use]
+    pub fn open_count(&self) -> usize {
+        self.set().open.len()
+    }
+}
+
+/// One `bg_wait` call's entry in [`UserInputWaits`]; deregisters itself on drop.
+#[derive(Debug)]
+pub struct UserInputWait {
+    waits: UserInputWaits,
+    id: u64,
+    token: CancelToken,
+}
+
+impl UserInputWait {
+    /// The token to hand the wait ([`WaitDeps::with_user_input`]); cancelled by an admitted input.
+    #[must_use]
+    pub fn token(&self) -> CancelToken {
+        self.token.clone()
+    }
+}
+
+impl Drop for UserInputWait {
+    fn drop(&mut self) {
+        self.waits.set().open.remove(&self.id);
+    }
+}
+
+/// pi `WAIT_YIELD_TEXT.user_input` (`subagent-wait.ts:413` @ad11b7ab), verbatim: the text of the
+/// [`WaitVerdict::UserInput`] yield. The ids it does not name ride `details.wait.activeRunIds`.
+pub const USER_INPUT_YIELD_TEXT: &str = "Wait yielded because the user sent a message. Background \
+                                         work remains active; read the message before waiting \
+                                         again.";
+
+/// The user-input arm of every sleep in this file — pi's `wakeSignal` (`subagent-wait.ts:221-224`
+/// @ad11b7ab), which merges `userInputSignal` into the poll sleep's signal so a message wakes the
+/// loop at once rather than at the next poll. A wait with no token never wakes on this arm. A
+/// cancelled token never blocks, so every loop that sleeps on this arm must check
+/// [`WaitDeps::user_input`] before its next sleep, or it spins.
+async fn user_input_sent(deps: &WaitDeps) {
+    match deps.user_input.as_ref() {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -627,6 +779,8 @@ pub fn active_detached_foreground_runs(
         run.session_id == session_id && run.children.iter().any(|child| child.status == "detached")
     });
     match params.id.as_deref() {
+        // `[CYRUP-DELTA]` every prefix match, with no exact preference and no ambiguity refusal
+        // (pi `subagent-wait.ts:704-708` @ad11b7ab) — `SUBA-237`.
         Some(id) => runs
             .filter(|run| run.run_id == id || run.run_id.starts_with(id))
             .collect(),
@@ -890,6 +1044,18 @@ pub enum WaitVerdict {
         /// moment the window closed, ids only (their states are already in the text).
         active_run_ids: Vec<String>,
     },
+    /// SUBA-192 — the operator sent a message while the wait was open — pi
+    /// `yieldWait("user_input")` (`subagent-wait.ts:595`, `:794` @ad11b7ab), built by
+    /// `yieldResult` (`:416-434`). **Not an error**: upstream's yield never sets `isError`, and an
+    /// operator correcting course is not a failed wait. Like [`Self::WindowElapsed`] it carries the
+    /// work still active, which is what lets the model decide, after reading the message, whether
+    /// to wait again and on what.
+    UserInput {
+        /// pi `yieldForScope` (`:442-458`): the runs this wait began with that are still active
+        /// when the message arrived — initial async runs still queued or running, or remembered
+        /// foreground runs with an initially-detached child still detached.
+        active_run_ids: Vec<String>,
+    },
     /// Projecting the terminal payloads faulted — pi `:709-719`'s catch. Error. This is where
     /// [`super::wait_completions::collect_wait_completions`]' `Err` lands, and the ONLY place it
     /// can: a projection rejection is a reported wait, never a propagated one.
@@ -1000,7 +1166,8 @@ impl WaitOutcome {
             WaitVerdict::Disabled
             | WaitVerdict::NothingToWait
             | WaitVerdict::SubscriptionArmed { .. }
-            | WaitVerdict::WindowElapsed { .. } => false,
+            | WaitVerdict::WindowElapsed { .. }
+            | WaitVerdict::UserInput { .. } => false,
             WaitVerdict::ListingFailed
             | WaitVerdict::AmbiguousId
             | WaitVerdict::Aborted
@@ -1047,6 +1214,20 @@ impl WaitOutcome {
                     // cyrup has no background-work PROVIDER registry at all — the same unported
                     // second disjunct `auto_drain.rs:83-90` documents. Emitting `[]` keeps a pi
                     // consumer's destructuring valid; omitting it would hand it `undefined`.
+                    "activeProviderItems": [],
+                }),
+            );
+        }
+        // pi `yieldResult` (`subagent-wait.ts:416-434` @ad11b7ab): the same block with the reason
+        // swapped and `timedOut: false` — the window did not close, the operator spoke.
+        if let WaitVerdict::UserInput { active_run_ids } = &self.verdict {
+            map.insert(
+                "wait".into(),
+                serde_json::json!({
+                    "reason": "user_input",
+                    "timedOut": false,
+                    "activeRunIds": active_run_ids,
+                    // As for `window_elapsed` above: no provider registry, so always `[]`.
                     "activeProviderItems": [],
                 }),
             );
@@ -1129,11 +1310,22 @@ async fn wait_for_detached_foreground_runs(
 ) -> WaitOutcome {
     let mut last_done: Option<WaitOutcome> = None;
     for run in runs {
-        let outcome =
-            wait_for_detached_foreground_run(run, cancel, deps, started_at, poll_interval, timeout)
-                .await;
-        // pi `:615-624` — an error, an attention yield or an elapsed window ends the whole wait;
-        // only a plain `done` (a `Resolved` with no attention) lets the loop move to the next run.
+        let outcome = wait_for_detached_foreground_run(
+            run,
+            runs,
+            cancel,
+            deps,
+            started_at,
+            poll_interval,
+            timeout,
+        )
+        .await;
+        // pi `:633-634` @ad11b7ab — an error, a `user_input` yield or an elapsed window ends the
+        // whole wait (upstream returns on any `details.wait` other than `window_elapsed`, and
+        // handles `window_elapsed` at `:635-646`); only a plain `done` (a `Resolved` with no
+        // attention) lets the loop move to the next run. `[CYRUP-DELTA]` an attention result also
+        // ends the whole wait here; upstream's `formatForegroundAttention` (`:253-258`) carries no
+        // `details.wait`, so its loop pushes the text and moves on.
         if !matches!(
             outcome.verdict,
             WaitVerdict::Resolved {
@@ -1157,17 +1349,61 @@ async fn wait_for_detached_foreground_runs(
     })
 }
 
-/// pi `waitForDetachedForegroundRun` (`subagent-wait.ts:558-599`) — one run's poll loop, with
-/// upstream's guard order preserved exactly: session changed ▸ run gone ▸ attention ▸ done ▸
-/// progress ▸ abort ▸ window elapsed ▸ sleep.
+/// pi `yieldForScope`'s foreground half (`subagent-wait.ts:446-450` @ad11b7ab): of the remembered
+/// foreground runs this wait began with (`scope`, the snapshot taken at entry), the ones the LIVE
+/// map still holds, for the same session, with a child that was detached at entry and is still
+/// detached.
+fn foreground_runs_still_detached(scope: &[DetachedForegroundRun], deps: &WaitDeps) -> Vec<String> {
+    let current = deps
+        .detached_foreground
+        .as_ref()
+        .map(DetachedForegroundHook::snapshot)
+        .unwrap_or_default();
+    scope
+        .iter()
+        .filter(|initial| {
+            let detached_at_entry: std::collections::BTreeSet<usize> = initial
+                .children
+                .iter()
+                .filter(|child| child.status == "detached")
+                .map(|child| child.index)
+                .collect();
+            current
+                .iter()
+                .find(|now| now.run_id == initial.run_id && now.session_id == initial.session_id)
+                .is_some_and(|now| {
+                    now.children.iter().any(|child| {
+                        detached_at_entry.contains(&child.index) && child.status == "detached"
+                    })
+                })
+        })
+        .map(|run| run.run_id.clone())
+        .collect()
+}
+
+/// pi `waitForDetachedForegroundRun` (`subagent-wait.ts:574-618` @ad11b7ab) — one run's poll
+/// loop, with upstream's guard order preserved exactly: session changed ▸ run gone ▸ user input ▸
+/// attention ▸ done ▸ progress ▸ abort ▸ window elapsed ▸ sleep.
 ///
-/// `[CYRUP-DELTA]` upstream's `deps.hasPendingSupervisorRequest?.()` yield (`:577`) has no cyrup
+/// `scope` is every run the enclosing wait began with (`run` among them): a `user_input` yield
+/// lists the whole wait's still-active work, as upstream's `yieldWait` closes over the initial
+/// scope, not just the run this loop happens to be on.
+///
+/// `[CYRUP-DELTA]` that scope is what [`active_detached_foreground_runs`] selected, and for an id
+/// it selects EVERY prefix match. Upstream prefers an exact match and refuses an ambiguous prefix
+/// (`subagent-wait.ts:704-708` @ad11b7ab), so its id-scoped wait holds one foreground run and its
+/// yield can name only that one (`scopedForeground = [selectedForeground]`, `:738`). Here
+/// `bg_wait({ id: "run-1" })` with `run-1` and `run-10` both detached waits on both, and a
+/// `user_input` yield can name both. Filed as `SUBA-237`; the selection predates SUBA-192.
+///
+/// `[CYRUP-DELTA]` upstream's `deps.hasPendingSupervisorRequest?.()` yield (`:594`) has no cyrup
 /// seam on this path — [`WaitDeps`] carries no supervisor-request probe, and the ask lock that
 /// would answer it lives on the executor above this layer. The ATTENTION guard immediately below
 /// it covers the case that matters here (a detached child parked on `contact_supervisor`), which
 /// is the only way a supervisor request can exist for a run this function is waiting on.
 async fn wait_for_detached_foreground_run(
     run: &DetachedForegroundRun,
+    scope: &[DetachedForegroundRun],
     cancel: &CancelToken,
     deps: &WaitDeps,
     started_at: Instant,
@@ -1217,6 +1453,25 @@ async fn wait_for_detached_foreground_run(
                 WaitVerdict::ForegroundUnreconciled,
             );
         };
+        // SUBA-192 — pi `:595` @ad11b7ab, `if (deps.userInputSignal?.aborted) return
+        // yieldWait("user_input")`: right after "run gone", AHEAD of attention and done (upstream's
+        // order), so a message the operator sent wins even over a child that finished in the same
+        // tick. That child is then out of the yield's `active_run_ids`
+        // ([`foreground_runs_still_detached`]) and out of reach of any later `bg_wait`
+        // ([`active_detached_foreground_runs`] keeps only runs with a still-detached child); its
+        // outcome is read through `subagent({ action: "status", id })`.
+        if deps
+            .user_input
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+        {
+            return WaitOutcome::plain(
+                USER_INPUT_YIELD_TEXT.to_string(),
+                WaitVerdict::UserInput {
+                    active_run_ids: foreground_runs_still_detached(scope, deps),
+                },
+            );
+        }
         let elapsed = started_at.elapsed();
         let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
@@ -1307,12 +1562,14 @@ async fn wait_for_detached_foreground_run(
             );
         }
 
-        // pi `await waitForWake(pollIntervalMs, signal, deps)` (`:598`). `biased` for the reason
-        // the async loop's own sleep states: a cancelled token must win over a ready timer.
+        // pi `await waitForWake(pollIntervalMs, wake, deps)` (`:616` @ad11b7ab, `wake` =
+        // `wakeSignal(signal, deps)`). `biased` for the reason the async loop's own sleep states:
+        // a cancelled token must win over a ready timer.
         let slice = poll_interval.min(timeout.saturating_sub(elapsed));
         tokio::select! {
             biased;
             () = cancel.cancelled() => {}
+            () = user_input_sent(deps) => {}
             () = tokio::time::sleep(slice) => {}
         }
     }
@@ -1576,12 +1833,55 @@ pub async fn wait_for_subagents(
     };
 
     while !done(&pending, &attention) {
+        // SUBA-192 — pi `:794` @ad11b7ab, `if (deps.userInputSignal?.aborted) return
+        // yieldWait("user_input")`: inside the body, so `done` above already had its say — a run
+        // that finished in the same tick as the message resolves the wait normally, which is
+        // upstream's order here (the foreground loop's is the other way round, also upstream's).
+        // AHEAD of the abort check: the two are separate tokens, so an abort alone is still an
+        // abort, and a message plus an abort is the message, as upstream's `:794`-before-`:795`.
+        //
+        // The ids are upstream's `yieldForScope` (`:445`): the runs this wait BEGAN with that are
+        // still active. `pending` is refreshed from an unfiltered listing below, so it can hold a
+        // run a concurrent turn launched mid-wait; that run is not this wait's work.
+        //
+        // `[CYRUP-DELTA]` "still active" is as of the listing this lap already holds — the refresh
+        // after the sleep that woke it, or on the first lap the entry listing — not a listing taken
+        // AT the yield, as upstream's `yieldForScope` takes one (`:444`). It differs only when the
+        // message lands before the first sleep, and then by a run that finished in those few
+        // milliseconds; `done` sees the same listing, so the yield and the done check agree. Upstream's
+        // yield-time listing-error result (`:455-457`) has no counterpart here as a consequence.
+        //
+        // `[CYRUP-DELTA]` upstream's scope also lists the session's remembered foreground runs
+        // still detached (`:446-450`). This loop never holds any: cyrup consults the foreground
+        // half only when no async run was active (the `detached_foreground` branch above), and
+        // that branch's own loop yields with them.
+        if deps
+            .user_input
+            .as_ref()
+            .is_some_and(CancelToken::is_cancelled)
+        {
+            let active_run_ids: Vec<String> = pending
+                .iter()
+                .chain(attention.iter())
+                .map(|run| run_id_of(run).to_string())
+                .filter(|id| initial_ids.contains(id))
+                .collect();
+            return WaitOutcome::plain(
+                USER_INPUT_YIELD_TEXT.to_string(),
+                WaitVerdict::UserInput { active_run_ids },
+            );
+        }
         // pending + attention: upstream's abort/timeout messages name `activeInitialRuns` — the
-        // FULL active∩initial set (`subagent-wait.ts:640-651`). With `stop_on_attention` off (the
-        // drain), the wait can time out while ONLY attention runs remain, and a message built from
-        // `pending` alone would then claim "0 run(s) still active" about a live run. With the flag
-        // on, `attention` is empty at both sites (the `done` short-circuit exits first), so this
-        // changes nothing for the `bg_wait` tool.
+        // FULL active∩initial set (`subagent-wait.ts:787-801` @ad11b7ab). With `stop_on_attention`
+        // off (the drain), the wait can time out while ONLY attention runs remain, and a message
+        // built from `pending` alone would then claim "0 run(s) still active" about a live run.
+        // With the flag on, `attention` is empty at both sites (the `done` short-circuit exits
+        // first), so this changes nothing for the `bg_wait` tool.
+        //
+        // `[CYRUP-DELTA]` unlike the `user_input` yield above, neither site filters by
+        // `initial_ids`: `attention` is filtered at the refresh, `pending` is not, so a run a
+        // concurrent turn launched mid-wait is named here although upstream's `activeInitialRuns`
+        // (`:787`) would drop it. Filed as `SUBA-236`.
         if cancel.is_cancelled() {
             let in_flight: Vec<ActiveRun> =
                 pending.iter().chain(attention.iter()).cloned().collect();
@@ -1598,9 +1898,10 @@ pub async fn wait_for_subagents(
         if elapsed >= timeout {
             let in_flight: Vec<ActiveRun> =
                 pending.iter().chain(attention.iter()).cloned().collect();
-            // pi `activeInitialRuns.map((run) => run.id)` (`:683`). `in_flight` is cyrup's
-            // `activeInitialRuns` — pending ∪ attention, already the set the message's
-            // `n run(s) still active` count comes from — so the ids and the text cannot disagree.
+            // pi `activeInitialRuns.map((run) => run.id)` (`:801` @ad11b7ab). `in_flight` stands in
+            // for upstream's `activeInitialRuns` — pending ∪ attention, the same set the message's
+            // `n run(s) still active` count comes from, so the ids and the text cannot disagree —
+            // but it is NOT filtered to the initial runs (the `[CYRUP-DELTA]` above, `SUBA-236`).
             let active_run_ids: Vec<String> = in_flight
                 .iter()
                 .map(|run| run_id_of(run).to_string())
@@ -1633,6 +1934,11 @@ pub async fn wait_for_subagents(
         // listing, and only notice the cancellation on the next iteration. Upstream cannot express
         // that race at all (JS awaits settle in order), so the bias is what preserves its
         // behaviour — cancellation first, then the event, then the timer.
+        //
+        // SUBA-192 adds a message from the operator as the arm after cancellation, in all three
+        // sleeps here and the foreground loop's — pi's `wakeSignal` (`:221-224` @ad11b7ab), which
+        // merges `userInputSignal` into the signal every one of its sleeps waits on. Without it a
+        // steer would sit out the remaining poll interval.
         let slice = poll_interval.min(timeout - elapsed);
         let mut wake_closed = false;
         match wake.as_mut() {
@@ -1640,6 +1946,7 @@ pub async fn wait_for_subagents(
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {}
+                    () = user_input_sent(deps) => {}
                     // A `Lagged` receiver is a wake-up, not an error: it means MORE completions
                     // landed than the bus buffered, which is the strongest possible signal that
                     // something changed. `Closed` — the watcher was torn down mid-wait — is the one
@@ -1670,6 +1977,7 @@ pub async fn wait_for_subagents(
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {}
+                    () = user_input_sent(deps) => {}
                     () = tokio::time::sleep(slice) => {}
                 }
             }
@@ -1681,6 +1989,7 @@ pub async fn wait_for_subagents(
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {}
+                () = user_input_sent(deps) => {}
                 () = tokio::time::sleep(slice) => {}
             }
         }
@@ -2311,6 +2620,8 @@ mod tests {
                 // VL-S11b — no executor, so no remembered foreground runs; the detach tests below
                 // attach a fake source explicitly.
                 detached_foreground: None,
+                // SUBA-192 — no `input` listener; the user-input tests below attach a token.
+                user_input: None,
             }
         }
 
@@ -2707,6 +3018,420 @@ mod tests {
         assert!(
             err.contains(run_id.as_str()),
             "the still-active run must be named: {err}"
+        );
+    }
+
+    // ---- SUBA-192: a message from the operator ends a blocking wait --------------------------------
+
+    /// pi `subagent-wait.test.ts:688-710` @ad11b7ab ("yields without an error when the user sends
+    /// a message"): a steer sent while a blocking wait sleeps on a running run ends it AT ONCE —
+    /// not at the next 30 s poll, not at the 30 min window — with the non-error `user_input` yield
+    /// naming the run, in upstream's exact text and `details.wait` shape.
+    ///
+    /// The input arrives through [`UserInputWaits::on_input`], the one call the extension's
+    /// `input` handler makes, and the wait's token comes from [`UserInputWaits::open`], as the
+    /// `bg_wait` tool takes it. The 150 ms before it only places the message inside the sleep.
+    ///
+    /// **Gutting mutations this fails on:** drop the user-input arm from the sleep's `select!`
+    /// (the 30 s poll then runs out the 10 s guard); drop the loop's user-input check (the sleep's
+    /// user-input arm then resolves at once on every lap, so the loop re-lists the run tree without
+    /// sleeping; the `tokio::fs` listing is what yields, so the 10 s guard fires); put
+    /// [`WaitVerdict::UserInput`] in `is_error`'s error arm
+    /// (`is_error()` is true); omit its `details.wait` block (the block is absent).
+    #[tokio::test]
+    async fn a_message_from_the_operator_ends_a_blocking_wait_with_a_non_error_user_input_yield() {
+        let fx = Fixture::new();
+        let run_id = RunId::new();
+        fx.write_status(&run_id, RunState::Running, false);
+
+        let waits = UserInputWaits::default();
+        let wait = waits.open();
+        let sender = {
+            let waits = waits.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                waits.on_input(
+                    cyrup_ext::InputEventSource::Interactive,
+                    Some(cyrup_ext::InputStreamingBehavior::Steer),
+                )
+            })
+        };
+        let deps = WaitDeps {
+            // A 30 s poll: if the message did not wake the sleep, the guard below fires first.
+            poll_interval: Duration::from_secs(30),
+            ..fx.deps(true)
+        }
+        .with_user_input(Some(wait.token()));
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps),
+        )
+        .await
+        .expect("the message must end the wait, not the 30 s poll or the 30 min window");
+        assert_eq!(
+            sender.await.expect("sender task"),
+            1,
+            "the steer reached the one open wait"
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the message must wake the sleep at once, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::UserInput {
+                active_run_ids: vec![run_id.as_str().to_string()],
+            }
+        );
+        assert!(
+            !outcome.is_error(),
+            "a user_input yield is not an error result"
+        );
+        assert_eq!(
+            outcome.text,
+            "Wait yielded because the user sent a message. Background work remains active; read \
+             the message before waiting again."
+        );
+        assert_eq!(outcome.text, USER_INPUT_YIELD_TEXT);
+        assert_eq!(
+            outcome.details()["wait"],
+            serde_json::json!({
+                "reason": "user_input",
+                "timedOut": false,
+                "activeRunIds": [run_id.as_str()],
+                "activeProviderItems": [],
+            })
+        );
+        assert!(
+            outcome.completions.is_empty(),
+            "a yield carries no completions"
+        );
+    }
+
+    /// The same steer, on the sleep the `bg_wait` TOOL actually takes: with the completion bus
+    /// attached (`WaitTool::execute` always attaches it), the loop sleeps in the bus arm's
+    /// `select!`, not the no-bus one, and the message must wake that one too.
+    ///
+    /// **Gutting mutation this fails on:** drop the user-input arm from the bus `select!` only —
+    /// the 30 s poll then runs out the 10 s guard.
+    #[tokio::test]
+    async fn a_message_wakes_a_wait_that_also_listens_on_the_completion_bus() {
+        let fx = Fixture::new();
+        let run_id = RunId::new();
+        fx.write_status(&run_id, RunState::Running, false);
+
+        let bus = crate::background::watch::CompletionBus::new();
+        let waits = UserInputWaits::default();
+        let wait = waits.open();
+        let sender = {
+            let waits = waits.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                waits.on_input(
+                    cyrup_ext::InputEventSource::Interactive,
+                    Some(cyrup_ext::InputStreamingBehavior::FollowUp),
+                )
+            })
+        };
+        let deps = WaitDeps {
+            poll_interval: Duration::from_secs(30),
+            completion_bus: Some(bus.clone()),
+            ..fx.deps(true)
+        }
+        .with_user_input(Some(wait.token()));
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps),
+        )
+        .await
+        .expect("the message must wake the bus sleep");
+        assert_eq!(sender.await.expect("sender task"), 1);
+        drop(bus);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::UserInput {
+                active_run_ids: vec![run_id.as_str().to_string()],
+            }
+        );
+        assert!(!outcome.is_error());
+    }
+
+    /// pi `yieldForScope` (`subagent-wait.ts:445` @ad11b7ab) lists the INITIAL runs still active —
+    /// a run a concurrent turn spawned after this wait began is not this wait's work.
+    ///
+    /// **Gutting mutation this fails on:** build the yield's ids from pending ∪ attention without
+    /// the `initial_ids` filter — the late run is then listed too.
+    ///
+    /// `start_paused`: the virtual clock advances only while the wait is idle in its `select!`
+    /// (tokio holds auto-advance off while the listing's blocking reads are in flight), so the
+    /// late run is created after the initial listing, never during it — on any box, however slow.
+    #[tokio::test(start_paused = true)]
+    async fn the_user_input_yield_lists_only_the_runs_the_wait_began_with() {
+        let fx = Fixture::new();
+        let initial = RunId::new();
+        fx.write_status(&initial, RunState::Running, false);
+        let late = RunId::new();
+
+        let waits = UserInputWaits::default();
+        let wait = waits.open();
+        let sender = {
+            let waits = waits.clone();
+            let fx_async = fx.async_root.clone();
+            let fx_results = fx.results_dir.clone();
+            let late = late.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                // A concurrent turn launches a run while the wait sleeps.
+                let paths = RunPaths::for_run(&fx_async, &fx_results, &late);
+                std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
+                let mut status = RunStatus::queued(late.clone(), RunMode::Single, Some(1));
+                status.state = RunState::Running;
+                std::fs::write(
+                    &paths.status,
+                    serde_json::to_string(&status).expect("status serializes"),
+                )
+                .expect("write status.json");
+                waits.on_input(
+                    cyrup_ext::InputEventSource::Rpc,
+                    Some(cyrup_ext::InputStreamingBehavior::FollowUp),
+                )
+            })
+        };
+        let deps = WaitDeps {
+            poll_interval: Duration::from_secs(30),
+            ..fx.deps(true)
+        }
+        .with_user_input(Some(wait.token()));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps),
+        )
+        .await
+        .expect("the message ends the wait");
+        assert_eq!(sender.await.expect("sender task"), 1);
+
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::UserInput {
+                active_run_ids: vec![initial.as_str().to_string()],
+            },
+            "the late run {} is not this wait's work",
+            late.as_str()
+        );
+    }
+
+    /// The other half of the shared rule ([`crate::mid_run_input::admits`]): input an EXTENSION
+    /// sent, and input with no streaming behavior (idle, or a busy submission the host refuses),
+    /// end nothing — and a wait that heard only those still ends the ordinary way, at its window.
+    ///
+    /// **Gutting mutation this fails on:** make [`UserInputWaits::on_input`] cancel every open
+    /// wait without asking the shared rule — the extension's steer then ends the wait as
+    /// `user_input`.
+    #[tokio::test]
+    async fn extension_input_and_idle_input_leave_a_blocking_wait_to_its_window() {
+        let fx = Fixture::new();
+        let run_id = RunId::new();
+        fx.write_status(&run_id, RunState::Running, false);
+
+        let waits = UserInputWaits::default();
+        let wait = waits.open();
+        let sender = {
+            let waits = waits.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let from_an_extension = waits.on_input(
+                    cyrup_ext::InputEventSource::Extension,
+                    Some(cyrup_ext::InputStreamingBehavior::Steer),
+                );
+                let while_idle = waits.on_input(cyrup_ext::InputEventSource::Interactive, None);
+                (from_an_extension, while_idle)
+            })
+        };
+        let deps = fx.deps(true).with_user_input(Some(wait.token()));
+        let outcome = wait_for_subagents(
+            &WaitParams {
+                timeout_ms: Some(400),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &deps,
+        )
+        .await;
+        assert_eq!(
+            sender.await.expect("sender task"),
+            (0, 0),
+            "neither input may reach an open wait"
+        );
+
+        assert!(!outcome.is_error(), "{}", outcome.text);
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::WindowElapsed {
+                active_run_ids: vec![run_id.as_str().to_string()],
+            },
+            "the wait ended at its window, untouched by either input: {}",
+            outcome.text
+        );
+        assert_eq!(outcome.details()["wait"]["reason"], "window_elapsed");
+    }
+
+    /// The control: a wait holding a user-input token that is never cancelled ends exactly as it
+    /// did before SUBA-192, at its window, as the non-error `window_elapsed` result — the new
+    /// path was ADDED beside the window, not substituted for it.
+    ///
+    /// **Gutting mutation this fails on:** treat a present token as a sent message (check
+    /// `deps.user_input.is_some()` instead of `is_cancelled()`) — the wait then yields at once.
+    #[tokio::test]
+    async fn with_no_message_the_window_still_elapses_normally() {
+        let fx = Fixture::new();
+        let run_id = RunId::new();
+        fx.write_status(&run_id, RunState::Running, false);
+
+        let waits = UserInputWaits::default();
+        let wait = waits.open();
+        let deps = fx.deps(true).with_user_input(Some(wait.token()));
+        let started = Instant::now();
+        let outcome = wait_for_subagents(
+            &WaitParams {
+                timeout_ms: Some(400),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &deps,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "it must actually have waited, took {:?}",
+            started.elapsed()
+        );
+        assert!(!outcome.is_error(), "{}", outcome.text);
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::WindowElapsed {
+                active_run_ids: vec![run_id.as_str().to_string()],
+            }
+        );
+        assert!(
+            outcome.text.starts_with("Wait timed out after "),
+            "{}",
+            outcome.text
+        );
+    }
+
+    /// pi `wait-subscriptions.test.ts:140-173` @ad11b7ab, the wait half: a blocking wait on a
+    /// remembered DETACHED FOREGROUND run yields to a steer with that run's id, and not to the
+    /// extension-sourced or idle inputs sent before it.
+    ///
+    /// **Gutting mutations this fails on:** drop the user-input check from the foreground loop —
+    /// the cancelled token keeps the sleep's user-input arm ready, so the loop spins without ever
+    /// returning `Pending` (the 10 s guard is never polled) until the wait's own 6 s window closes,
+    /// and the verdict assertion fails (`WindowElapsed`, not `UserInput`); drop the user-input arm
+    /// from the foreground sleep — the loop then sleeps out the window and only its top-of-loop
+    /// check sees the message, so the yield is right but 6 s late, and the promptness assertion
+    /// fails. The window is 6 s, not the 30 min default, so a failure costs seconds, not minutes of
+    /// spinning; the steer lands at 150 ms.
+    #[tokio::test]
+    async fn a_message_ends_a_wait_on_a_detached_foreground_run_with_its_id() {
+        let fx = Fixture::new();
+        let source = FakeForegroundRuns::default();
+        source.set(vec![foreground_run("run-live", "session-a", "detached")]);
+        let waits = UserInputWaits::default();
+        let wait = waits.open();
+        let mut deps = fx.deps(true).with_user_input(Some(wait.token()));
+        deps.session_id = Some("session-a".to_string());
+        deps.poll_interval = Duration::from_secs(30);
+        deps.detached_foreground = Some(source.hook());
+
+        let sender = {
+            let waits = waits.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let ignored = waits.on_input(
+                    cyrup_ext::InputEventSource::Extension,
+                    Some(cyrup_ext::InputStreamingBehavior::Steer),
+                ) + waits.on_input(cyrup_ext::InputEventSource::Interactive, None);
+                let ended = waits.on_input(
+                    cyrup_ext::InputEventSource::Interactive,
+                    Some(cyrup_ext::InputStreamingBehavior::Steer),
+                );
+                (ignored, ended)
+            })
+        };
+        let params = WaitParams {
+            id: Some("run-live".to_string()),
+            timeout_ms: Some(6_000),
+            ..WaitParams::default()
+        };
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(&params, &CancelToken::new(), &deps),
+        )
+        .await
+        .expect("the steer ends the foreground wait");
+        assert_eq!(sender.await.expect("sender task"), (0, 1));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the message must wake the foreground sleep at once, not at the window: took {:?}",
+            started.elapsed()
+        );
+
+        assert!(!outcome.is_error(), "{}", outcome.text);
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::UserInput {
+                active_run_ids: vec!["run-live".to_string()],
+            }
+        );
+        assert_eq!(outcome.text, USER_INPUT_YIELD_TEXT);
+    }
+
+    /// pi creates the wait's `AbortController` inside `execute` (`wait-tool.ts:37-38`
+    /// @ad11b7ab): input sent while no wait is open ends nothing, and is not remembered for the
+    /// next one; a closed wait leaves the set, so later input cannot reach it.
+    ///
+    /// **Gutting mutations this fails on:** a shared, latched token instead of one per call (`first`
+    /// opens already cancelled if the opening `steer()` latches it, otherwise `third` does after the
+    /// two-wait steer); drop the guard's deregistration (`open_count` stays 2).
+    #[test]
+    fn input_reaches_only_the_waits_open_when_it_arrives() {
+        let waits = UserInputWaits::default();
+        let steer = || {
+            waits.on_input(
+                cyrup_ext::InputEventSource::Interactive,
+                Some(cyrup_ext::InputStreamingBehavior::Steer),
+            )
+        };
+        assert_eq!(steer(), 0, "no wait is open yet");
+        let first = waits.open();
+        assert!(
+            !first.token().is_cancelled(),
+            "input sent before a wait opened is not remembered for it"
+        );
+        let second = waits.open();
+        assert_eq!(waits.open_count(), 2);
+        assert_eq!(steer(), 2, "one message ends every open wait");
+        assert!(first.token().is_cancelled() && second.token().is_cancelled());
+
+        drop(first);
+        drop(second);
+        assert_eq!(waits.open_count(), 0, "a closed wait leaves the set");
+        let third = waits.open();
+        assert!(
+            !third.token().is_cancelled(),
+            "a wait opened after the message is not ended by it"
         );
     }
 

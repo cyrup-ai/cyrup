@@ -69,6 +69,12 @@ fn wait_tool_description(enabled: bool) -> String {
          run records (which also reconciles crashed runners), keeps the turn alive for normal \
          notification delivery, and resolves early if the turn is aborted.",
     );
+    // SUBA-192 — pi `wait-tool.ts:27` @ad11b7ab (`ecc9bc41`), verbatim. Upstream shortened it after
+    // the pin (`b8f58f18`); parity is measured at the pin.
+    text.push_str(
+        "\nA message the user sends while a blocking wait is open ends the wait with a non-error \
+         user_input result; active work keeps running.",
+    );
     if !enabled {
         // pi `wait-tool.ts:27`: "Configured behavior: bg_wait is disabled by config.waitTool or
         // PI_SUBAGENT_WAIT_TOOL_ENABLED and returns immediately without blocking."
@@ -115,8 +121,9 @@ pub(crate) fn wait_tool_parameters() -> serde_json::Value {
 }
 
 /// The `bg_wait` tool (SUBA-004): the ONLY way an orchestrator can block on a background subagent
-/// run without ending its turn. See [`crate::background::wait`] for the loop itself, including the two
-/// escape hatches (timeout + cancellation) that keep a wedged child from hanging the orchestrator.
+/// run without ending its turn. See [`crate::background::wait`] for the loop itself, including the
+/// three escape hatches (timeout, cancellation, and a message from the operator) that keep a wedged
+/// child from hanging the orchestrator.
 ///
 /// Registered alongside [`crate::extension::SubagentTool`] in the [`crate::extension::host::registration::RegistrationMode::Full`] arm only: a fanout child
 /// has no business blocking on its parent's whole async root (the same reasoning that makes
@@ -174,6 +181,10 @@ impl Tool for WaitTool {
     /// Blocks the calling turn. `cancel` is the host's own token for this tool call (pi's
     /// `AbortSignal`) and is threaded straight into the wait loop — aborting the turn releases the
     /// wait immediately instead of after the remaining poll interval.
+    ///
+    /// SUBA-192 — a message the operator sends while this call blocks releases it too, as a
+    /// non-error `user_input` yield: the call opens its own entry in the executor's
+    /// [`crate::background::wait::UserInputWaits`] and the extension's `input` handler ends it.
     async fn execute(
         &self,
         _call_id: ToolCallId,
@@ -181,6 +192,11 @@ impl Tool for WaitTool {
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
+        // pi `wait-tool.ts:37-38` — the call's own user-input signal, opened FIRST, before any
+        // `.await`: a steer that lands while this call is still resolving its config must already
+        // find it listening. Held to the end of the call and deregistered on drop (`:51-53`'s
+        // `finally`), on every return path including the parse error just below.
+        let user_input = self.executor.user_input_waits().open();
         let parsed: crate::background::wait::WaitParams = serde_json::from_value(params)
             .map_err(|e| ToolError::new(format!("invalid {WAIT_TOOL_NAME} tool call: {e}")))?;
         // Re-resolved per call (not cached from registration) so a mid-session config/env change
@@ -223,7 +239,9 @@ impl Tool for WaitTool {
         // ever lives (upstream never writes one to disk — `foreground-history.ts:67-69` — and
         // cyrup's `persist.rs` refuses one). Without this the candidate set is async runs only and
         // `bg_wait({ id })` cannot see a detached run at all.
-        .with_detached_foreground(Some(self.executor.detached_foreground_hook()));
+        .with_detached_foreground(Some(self.executor.detached_foreground_hook()))
+        // SUBA-192 — pi `userInputSignal: userInput.signal` (`wait-tool.ts:46`).
+        .with_user_input(Some(user_input.token()));
         let outcome = crate::background::wait::wait_for_subagents(&parsed, &cancel, &deps).await;
         // cyrup's `Tool::execute` returns `Result<ToolResult, ToolError>` and the host maps `Err`
         // onto the result's error flag (`cyrup-core/src/tool.rs`: "Tools signal failure by
@@ -343,5 +361,23 @@ mod tests {
             )),
             "{disabled}"
         );
+    }
+
+    /// SUBA-192 — the description tells the model what a `user_input` result means, in pi's own
+    /// sentence (`wait-tool.ts:27` @ad11b7ab, added by `ecc9bc41`), whether or not the tool is
+    /// configured off: a model that sees the yield must know the work is still running and that
+    /// the call did not fail.
+    #[test]
+    fn the_description_says_a_user_message_ends_the_wait_without_an_error() {
+        let sentence = "A message the user sends while a blocking wait is open ends the wait with a \
+                        non-error user_input result; active work keeps running.";
+        for enabled in [true, false] {
+            let description = wait_tool_description(enabled);
+            assert!(
+                description.contains(sentence),
+                "wait_tool_description({enabled}) lacks upstream's user_input sentence: \
+                 {description}"
+            );
+        }
     }
 }

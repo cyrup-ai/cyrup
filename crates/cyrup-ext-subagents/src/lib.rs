@@ -44,6 +44,9 @@ pub mod herdr;
 pub mod identity;
 pub mod inspectors;
 pub mod jsonl;
+/// SUBA-192 / SUBA-198 — the one rule for which `input` events are the operator talking to a busy
+/// agent, called by both `bg_wait` and the main watchdog. See [`mid_run_input`].
+pub mod mid_run_input;
 pub mod missions;
 pub mod native_supervisor;
 /// The crate's single port of pi's `shared/utils.ts` path helpers: the `CYRUP_HOME` -> `HOME` ->
