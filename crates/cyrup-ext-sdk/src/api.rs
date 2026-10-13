@@ -682,6 +682,56 @@ pub struct RegisteredRenderer {
     pub renderer: Box<dyn MessageRenderer>,
 }
 
+// --- tool-renderer resolvers (EXT-107; pi `pi.registerToolRenderer`, types.ts:1696 @f1b2e77f5) ---
+
+/// Which of pi's two resolver idioms a [`ExtensionApi::register_tool_renderer`] declaration is.
+///
+/// pi's `registerToolRenderer(resolver)` takes a closure `(toolName, next) => renderers`; a closure
+/// cannot cross the component boundary, so a guest names the idiom instead and the host evaluates
+/// it at this extension's place in the load-order chain (the WIT `tool-renderer-mode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolRendererMode {
+    /// `next() ?? (matches ? mine : undefined)` — pi's MCP extension's form
+    /// (`extensions/mcp/index.ts:383-386` @f1b2e77f5): draw only calls nothing else would — a
+    /// registered tool keeps its own renderer, and so does a resolver loaded after this one.
+    FillIn,
+    /// `matches ? mine : next()` — draw every matching call, ahead of the registered tool and of
+    /// every resolver loaded after this one.
+    Claim,
+}
+
+/// A tool-renderer declaration: a tool-name pattern, its idiom, and the renderer that draws the
+/// calls the host routes here by it.
+pub struct RegisteredToolRenderer {
+    /// A tool name in which `*` matches any run of characters.
+    pub pattern: String,
+    /// See [`ToolRendererMode`].
+    pub mode: ToolRendererMode,
+    /// The renderer, which stays guest-side; called with the TOOL NAME's call / result.
+    pub renderer: Box<dyn MessageRenderer>,
+}
+
+/// `*`-only glob, the host's rule (`cyrup_core::tool_name_matches`, pi `createToolNameMatcher`):
+/// `*` matches any run of characters, everything else matches itself.
+pub(crate) fn tool_pattern_matches(pattern: &str, name: &str) -> bool {
+    let mut runs = pattern.split('*');
+    let first = runs.next().unwrap_or_default();
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let later: Vec<&str> = runs.collect();
+    let Some((last, middle)) = later.split_last() else {
+        return rest.is_empty();
+    };
+    for run in middle {
+        match rest.split_once(run) {
+            Some((_, after)) => rest = after,
+            None => return false,
+        }
+    }
+    rest.ends_with(last)
+}
+
 // --- markdown transformer (EXT-019; Pi `MarkdownTransformer`, types.ts:1153 @v0.84.1) ---
 
 /// The `MarkdownTransformContext` pi hands a transformer
@@ -916,6 +966,9 @@ pub struct ExtensionApi {
     /// (types.ts:1702 and `:1704` @v0.84.1 — the two maps are NOT adjacent, `:1703` between them is
     /// `markdownTransformer`); on the wire an entry still travels over `render-call`.
     pub(crate) entry_renderers: Vec<RegisteredRenderer>,
+    /// EXT-107: tool-renderer declarations (pi `extension.toolRenderers`, pushed by
+    /// `loader.ts:367-371` @f1b2e77f5), in declaration order.
+    pub(crate) tool_renderers: Vec<RegisteredToolRenderer>,
     /// EXT-019: at most one per extension (pi `extension.markdownTransformer`, types.ts:1703 @v0.84.1
     /// @v0.84.1).
     pub(crate) markdown_transformer: Option<Box<dyn MarkdownTransformer>>,
@@ -1137,6 +1190,31 @@ impl ExtensionApi {
     ) {
         self.renderers.push(RegisteredRenderer {
             custom_type: custom_type.into(),
+            renderer: Box::new(renderer),
+        });
+    }
+
+    /// Draw calls to tools this extension did not register — pi `pi.registerToolRenderer(resolver)`
+    /// (`core/extensions/types.ts:1696` @f1b2e77f5, EXT-107).
+    ///
+    /// `pattern` is a tool name in which `*` matches any run of characters (`mcp__*`, `*_ghost`,
+    /// or one exact name). The host places the declaration in the one chain every extension's
+    /// tool-renderer resolvers share, in LOAD ORDER, and evaluates it as `mode` says (see
+    /// [`ToolRendererMode`]). A call it chooses is drawn by `renderer` — its `render_call` /
+    /// `render_result` get the tool's call / result, exactly as a tool's own renderer does.
+    ///
+    /// May be called more than once; each declaration takes its own place in the chain. When two
+    /// of THIS extension's declarations match one name, the first declared draws. An empty pattern
+    /// is refused by the host, which fails `init` (EXT-082's rule).
+    pub fn register_tool_renderer(
+        &mut self,
+        pattern: impl Into<String>,
+        mode: ToolRendererMode,
+        renderer: impl MessageRenderer,
+    ) {
+        self.tool_renderers.push(RegisteredToolRenderer {
+            pattern: pattern.into(),
+            mode,
             renderer: Box::new(renderer),
         });
     }
@@ -2275,11 +2353,26 @@ impl ExtensionApi {
         call: &Value,
         opts: &RenderOptions,
     ) -> Option<Value> {
-        self.renderers
+        match self
+            .renderers
             .iter()
             .chain(self.entry_renderers.iter())
             .find(|r| r.custom_type == custom_type)
-            .and_then(|r| r.renderer.render_call(call, opts, &Ctx::new()))
+        {
+            Some(r) => r.renderer.render_call(call, opts, &Ctx::new()),
+            // EXT-107: a key no exact renderer claims is a tool the host routed here through one
+            // of this extension's `register_tool_renderer` declarations.
+            None => self
+                .tool_renderer_for(custom_type)
+                .and_then(|r| r.renderer.render_call(call, opts, &Ctx::new())),
+        }
+    }
+
+    /// The first of this extension's tool-renderer declarations whose pattern matches `tool_name`.
+    fn tool_renderer_for(&self, tool_name: &str) -> Option<&RegisteredToolRenderer> {
+        self.tool_renderers
+            .iter()
+            .find(|r| tool_pattern_matches(&r.pattern, tool_name))
     }
 
     /// Render a tool result via a registered renderer for `custom_type` (Pi `renderResult`).
@@ -2289,10 +2382,12 @@ impl ExtensionApi {
         result: &Value,
         opts: &RenderOptions,
     ) -> Option<Value> {
-        self.renderers
-            .iter()
-            .find(|r| r.custom_type == custom_type)
-            .and_then(|r| r.renderer.render_result(result, opts, &Ctx::new()))
+        match self.renderers.iter().find(|r| r.custom_type == custom_type) {
+            Some(r) => r.renderer.render_result(result, opts, &Ctx::new()),
+            None => self
+                .tool_renderer_for(custom_type)
+                .and_then(|r| r.renderer.render_result(result, opts, &Ctx::new())),
+        }
     }
 
     // --- provider OAuth + streamSimple callbacks (pi `ProviderConfig`, types.ts:1427-1464 @v0.83.0

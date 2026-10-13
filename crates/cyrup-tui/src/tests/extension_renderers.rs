@@ -1434,3 +1434,137 @@ fn the_events_arm_still_refreshes_extension_renders() {
         "the refresh must run AFTER the fold, so the row this event created is itself refreshable"
     );
 }
+
+// =============================================================================================
+// EXT-107 — an extension draws a tool it did NOT register (pi `pi.registerToolRenderer`,
+// `core/extensions/types.ts:1696` @f1b2e77f5). The TUI gates every tool row on
+// `ExtensionHost::has_tool_renderer` before it dispatches `RenderSurface::ToolCall` /
+// `RenderSurface::ToolResult`, so a resolver that only the render methods consulted would never
+// draw. These go through that gate on both the live and the replay path.
+// =============================================================================================
+
+/// Declares pi's MCP resolver as a native callback — `next() ?? (mcp__* ? mine : undefined)` — and
+/// registers no tool at all.
+struct FamilyExt;
+
+#[async_trait::async_trait]
+impl NativeExtension for FamilyExt {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("family-demo")
+    }
+
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.register_tool_renderer_resolver(|name, next| {
+            next().or_else(|| {
+                name.starts_with("mcp__")
+                    .then(cyrup_ext::ToolRenderers::mine)
+            })
+        });
+        Ok(())
+    }
+
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+
+    fn render_call(&self, key: &str, call: &Value) -> Option<Value> {
+        Some(Value::String(format!(
+            "FAMILYCALL[{key}] payload-bytes={}",
+            weigh(call)
+        )))
+    }
+
+    fn render_result(&self, key: &str, result: &Value) -> Option<Value> {
+        Some(Value::String(format!(
+            "FAMILYRESULT[{key}] payload-bytes={}",
+            weigh(result)
+        )))
+    }
+}
+
+/// LIVE: a call to `mcp__srv__ghost` — a tool nobody registered — draws the family's text on both
+/// halves of the row instead of the generic `name + pretty-printed arguments` shape; the built-in
+/// `read` next to it keeps its built-in header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_family_draws_a_live_row_for_a_tool_nobody_registered() {
+    let host = host_with(Arc::new(FamilyExt)).await;
+    let mut app = app();
+
+    let start = AgentSessionEvent::ToolExecutionStart {
+        tool_call_id: ToolCallId::from("call-ghost"),
+        tool_name: "mcp__srv__ghost".into(),
+        args: json!({ "query": "generic-args-marker" }),
+    };
+    app.ingest_event_with_extensions(&start, &host).await;
+    let builtin = AgentSessionEvent::ToolExecutionStart {
+        tool_call_id: ToolCallId::from("call-read"),
+        tool_name: "read".into(),
+        args: json!({ "path": "src/main.rs", "offset": 10, "limit": 5 }),
+    };
+    app.ingest_event_with_extensions(&builtin, &host).await;
+    app.draw().unwrap();
+    let live = buffer_text(&app);
+    assert!(
+        live.contains("FAMILYCALL[mcp__srv__ghost]"),
+        "the family drew the unregistered tool's call:\n{live}"
+    );
+    assert!(
+        !live.contains("generic-args-marker"),
+        "the generic shape did not also draw:\n{live}"
+    );
+    assert!(
+        live.contains("read src/main.rs:10-14") && !live.contains("FAMILYCALL[read]"),
+        "the built-in kept its own header (fill-in defers to base):\n{live}"
+    );
+
+    let end = AgentSessionEvent::ToolExecutionEnd {
+        duration_ms: None,
+        tool_call_id: ToolCallId::from("call-ghost"),
+        tool_name: "mcp__srv__ghost".into(),
+        is_error: false,
+        result: json!({ "content": [{ "type": "text", "text": "generic-output-marker" }] }),
+    };
+    app.ingest_event_with_extensions(&end, &host).await;
+    app.draw().unwrap();
+    let seen = format!("{}\n{}", buffer_text(&app), app.scrollback_text());
+    assert!(
+        seen.contains("FAMILYRESULT[mcp__srv__ghost]"),
+        "the family drew the result:\n{seen}"
+    );
+    assert!(
+        !seen.contains("generic-output-marker"),
+        "the generic output did not also draw:\n{seen}"
+    );
+}
+
+/// REPLAY (`--resume`, the case pi `#10285` is about): a persisted call to a tool whose server
+/// never connected reaches the family through the same gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_family_draws_a_replayed_row_for_a_tool_nobody_registered() {
+    let host = host_with(Arc::new(FamilyExt)).await;
+    let mut app = app();
+
+    app.replay_session_with_extensions(
+        &[
+            replay_assistant_call(
+                "call-1",
+                "mcp__srv__ghost",
+                json!({ "query": "generic-args-marker" }),
+            ),
+            replay_tool_result("call-1", "mcp__srv__ghost", "generic-output-marker"),
+        ],
+        &host,
+    )
+    .await;
+    app.draw().unwrap();
+
+    let sb = app.scrollback_text();
+    assert!(
+        sb.contains("FAMILYCALL[mcp__srv__ghost]") && sb.contains("FAMILYRESULT[mcp__srv__ghost]"),
+        "the replayed call and result reached the family:\n{sb}"
+    );
+    assert!(
+        !sb.contains("generic-args-marker") && !sb.contains("generic-output-marker"),
+        "the generic shape did not also draw:\n{sb}"
+    );
+}

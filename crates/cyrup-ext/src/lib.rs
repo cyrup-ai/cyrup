@@ -184,6 +184,7 @@ pub mod render;
 pub mod render_tree;
 pub mod replaceable;
 pub mod subscriber;
+pub mod tool_renderer;
 pub mod ui_prompt;
 pub mod virtual_model;
 pub mod word_nav;
@@ -263,6 +264,9 @@ pub use render::RenderOptions;
 pub use render_tree::{PreviewKeep, RenderNode, RenderedTree, TreeCtx};
 pub use replaceable::{ClaimKind, OmittedExtension};
 pub use subscriber::ExtSubscriber;
+pub use tool_renderer::{
+    ToolNamePattern, ToolRendererMode, ToolRendererResolver, ToolRendererResolverFn, ToolRenderers,
+};
 pub use ui_prompt::{UiPromptGuard, UiPromptKind, UiPromptTracker};
 pub use virtual_model::{VirtualModelFlushError, VirtualModelHub};
 pub use wrapper::{

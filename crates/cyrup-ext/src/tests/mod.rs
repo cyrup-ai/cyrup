@@ -58,6 +58,7 @@ mod seam_liveness;
 mod startup_timings;
 mod terminal_keys;
 mod tool_exposure;
+mod tool_renderer_resolvers;
 mod tool_result_structured_content;
 mod tool_result_structured_guest;
 mod trust_gate_order;

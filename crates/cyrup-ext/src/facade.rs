@@ -20,6 +20,7 @@ use crate::native::{ExtMode, HostCtx, InitApi, NativeExtension, NativeHandle};
 use crate::registry::{CommandDescriptor, ExtensionRegistry};
 use crate::render::RenderOptions;
 use crate::subscriber::ExtSubscriber;
+use crate::tool_renderer::ToolRenderers;
 use cyrup_agent::{EventSubscriber, Hooks};
 use cyrup_core::{CancelToken, Content, ExtensionId, Message, Tool};
 use serde_json::Value;
@@ -685,6 +686,7 @@ impl ExtensionHost {
         let typed_bus_topics = api.take_typed_bus_topics();
         let live_providers = api.take_live_providers();
         let virtual_models = api.take_virtual_models();
+        let tool_renderer_resolvers = api.take_tool_renderer_resolvers();
         let (
             subs,
             tools,
@@ -749,6 +751,12 @@ impl ExtensionHost {
         for tool_name in tool_renderers {
             self.registry
                 .register_tool_renderer(id.clone(), tool_name)?;
+        }
+        // EXT-107: the resolver chain, in this extension's declaration order — appended now, while
+        // this extension loads, which is what puts it at its LOAD-ORDER position in the chain.
+        for resolver in tool_renderer_resolvers {
+            self.registry
+                .register_tool_renderer_resolver(id.clone(), resolver)?;
         }
         for custom_type in message_renderers {
             self.registry
@@ -1639,6 +1647,42 @@ impl ExtensionHost {
         }
     }
 
+    /// Who draws calls to `tool_name` — pi `ExtensionRunner.resolveToolRenderers(toolName, base)`
+    /// (`core/extensions/runner.ts:790-795` @f1b2e77f5), the resolution BOTH tool-row surfaces and
+    /// [`Self::has_tool_renderer`] go through (EXT-107).
+    ///
+    /// The extensions' resolvers run in load order ([`crate::tool_renderer`]); `base` is pi's
+    /// `withBuiltInRenderers(toolName, session.getToolDefinition(toolName))`
+    /// (`modes/interactive/interactive-mode.ts:2228-2231`): it answers for every tool the session
+    /// KNOWS — an SDK tool, an extension's exact-name renderer, any registered extension tool, or a
+    /// built-in — and is `None` only for a name nothing knows. That is what makes a fill-in resolver
+    /// (`next() ?? mine`) defer to `bash`'s built-in drawing and to a registered tool with no
+    /// renderer of its own, exactly as pi's MCP resolver does, rather than taking them over.
+    ///
+    /// `None` = no extension draws and nothing knows the tool; [`ToolRenderers::is_registered_tool`]
+    /// = the exact-name tiers decide, as before EXT-107; [`ToolRenderers::extension`] = that
+    /// extension's resolver chose it.
+    pub fn resolve_tool_renderer(&self, tool_name: &str) -> Option<ToolRenderers> {
+        let resolvers = self.registry.tool_renderer_resolvers().unwrap_or_default();
+        crate::tool_renderer::resolve_chain(&resolvers, tool_name, &mut || {
+            self.tool_is_known(tool_name).then(ToolRenderers::base)
+        })
+    }
+
+    /// pi's `base()` is non-`undefined`: an SDK tool, an exact-name extension renderer, a tool an
+    /// extension registered, or a built-in.
+    fn tool_is_known(&self, tool_name: &str) -> bool {
+        self.native_tool_renderer(tool_name).is_some()
+            || self
+                .registry
+                .tool_renderer_owner(tool_name)
+                .ok()
+                .flatten()
+                .is_some()
+            || self.registry.tool_owner(tool_name).ok().flatten().is_some()
+            || cyrup_tools::BUILTIN_NAMES.contains(&tool_name)
+    }
+
     /// The registered native tool for `tool_name`, if any.
     fn native_tool_renderer(&self, tool_name: &str) -> Option<Arc<dyn Tool>> {
         self.native_tool_renderers
@@ -1654,19 +1698,33 @@ impl ExtensionHost {
     /// [`Self::native_tool_renderers`] for why the SDK tier is consulted FIRST): the tool's own
     /// `render_call`, then the extension that registered a renderer for this name. `None` from
     /// both leaves the caller to draw the built-in shell.
+    ///
+    /// EXT-107: both tiers are pi's `base()`; the extensions' tool-renderer RESOLVERS run around
+    /// them first ([`Self::resolve_tool_renderer`]), so a call to a name nothing registered can
+    /// still reach the extension whose resolver chose it.
     pub async fn render_tool_call_outcome(
         &self,
         tool_name: &str,
         call: &Value,
         opts: &RenderOptions,
     ) -> RenderOutcome {
-        if let Some(tool) = self.native_tool_renderer(tool_name)
-            && let Some(text) = tool.render_call(call)
-        {
-            return RenderOutcome::Rendered(Value::String(text));
-        }
-        let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
-            return RenderOutcome::None;
+        let owner = match self.resolve_tool_renderer(tool_name) {
+            None => return RenderOutcome::None,
+            Some(chosen) => match chosen.extension() {
+                Some(owner) => owner.clone(),
+                None => {
+                    if let Some(tool) = self.native_tool_renderer(tool_name)
+                        && let Some(text) = tool.render_call(call)
+                    {
+                        return RenderOutcome::Rendered(Value::String(text));
+                    }
+                    let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten()
+                    else {
+                        return RenderOutcome::None;
+                    };
+                    owner
+                }
+            },
         };
         if let Some(outcome) =
             self.native_tool_tree(&owner, tool_name, call, RenderKind::Call, opts)
@@ -1692,19 +1750,31 @@ impl ExtensionHost {
 
     /// [`Self::render_tool_result`] keeping the FAULT distinct from "no renderer" — see
     /// [`RenderOutcome`].
+    ///
+    /// Resolved through the same chain as [`Self::render_tool_call_outcome`] (EXT-107).
     pub async fn render_tool_result_outcome(
         &self,
         tool_name: &str,
         result: &Value,
         opts: &RenderOptions,
     ) -> RenderOutcome {
-        if let Some(tool) = self.native_tool_renderer(tool_name)
-            && let Some(text) = tool.render_result(result)
-        {
-            return RenderOutcome::Rendered(Value::String(text));
-        }
-        let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
-            return RenderOutcome::None;
+        let owner = match self.resolve_tool_renderer(tool_name) {
+            None => return RenderOutcome::None,
+            Some(chosen) => match chosen.extension() {
+                Some(owner) => owner.clone(),
+                None => {
+                    if let Some(tool) = self.native_tool_renderer(tool_name)
+                        && let Some(text) = tool.render_result(result)
+                    {
+                        return RenderOutcome::Rendered(Value::String(text));
+                    }
+                    let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten()
+                    else {
+                        return RenderOutcome::None;
+                    };
+                    owner
+                }
+            },
         };
         if let Some(outcome) =
             self.native_tool_tree(&owner, tool_name, result, RenderKind::Result, opts)
@@ -2183,19 +2253,26 @@ impl ExtensionHost {
     /// [`RenderOutcome::None`]. Upstream's gate is coarser still — `hasRendererDefinition()` is
     /// `builtInToolDefinition !== undefined || toolDefinition !== undefined`
     /// (`tool-execution.ts:104-106`), true for every tool that has a definition at all.
+    ///
+    /// EXT-107: answered through the SAME resolver chain the two `render_tool_*_outcome` methods
+    /// use ([`Self::resolve_tool_renderer`]). The TUI returns early on a `false` here, so a chain
+    /// consulted only by the render methods would never be reached from a tool row.
     pub fn has_tool_renderer(&self, tool_name: &str) -> bool {
-        if self
-            .native_tool_renderers
-            .read()
-            .is_ok_and(|g| g.contains_key(tool_name))
-        {
-            return true;
+        match self.resolve_tool_renderer(tool_name) {
+            None => false,
+            Some(chosen) if chosen.extension().is_some() => true,
+            Some(_) => {
+                self.native_tool_renderers
+                    .read()
+                    .is_ok_and(|g| g.contains_key(tool_name))
+                    || self
+                        .registry
+                        .tool_renderer_owner(tool_name)
+                        .ok()
+                        .flatten()
+                        .is_some()
+            }
         }
-        self.registry
-            .tool_renderer_owner(tool_name)
-            .ok()
-            .flatten()
-            .is_some()
     }
 
     /// Whether ANY extension registered a custom-message renderer for `custom_type` (Pi

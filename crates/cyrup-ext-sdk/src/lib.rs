@@ -71,9 +71,9 @@ mod tests;
 pub use api::{
     ArgCompleter, BashOperations, BranchChangeHandler, CommandExec, ContentBlock, ExtensionApi,
     MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
-    RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool, RegistrationError,
-    RenderOptions, ShortcutExec, TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput,
-    Unsubscribe, VirtualModelRouter,
+    RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool,
+    RegisteredToolRenderer, RegistrationError, RenderOptions, ShortcutExec, TerminalInputHandler,
+    TerminalInputResult, ToolExec, ToolOutput, ToolRendererMode, Unsubscribe, VirtualModelRouter,
 };
 pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
@@ -112,8 +112,9 @@ pub mod prelude {
         ArgCompleter, BashOperations, BranchChangeHandler, CommandExec, ContentBlock, ExtensionApi,
         MarkdownTransformContext, MarkdownTransformer, MessageRenderer, Outcome, RawOutcome,
         RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool,
-        RegistrationError, RenderOptions, ShortcutExec, TerminalInputHandler, TerminalInputResult,
-        ToolExec, ToolOutput, Unsubscribe, VirtualModelRouter,
+        RegisteredToolRenderer, RegistrationError, RenderOptions, ShortcutExec,
+        TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput, ToolRendererMode,
+        Unsubscribe, VirtualModelRouter,
     };
     pub use crate::autocomplete::{
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,

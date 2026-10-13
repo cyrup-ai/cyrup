@@ -257,6 +257,16 @@ fn push_registrations(api: &ExtensionApi) -> Result<(), String> {
     for r in &api.entry_renderers {
         registration::register_entry_renderer(&r.custom_type);
     }
+    // EXT-107: declare each tool-renderer resolver — the pattern and the idiom cross, the renderer
+    // stays guest-side behind `render-call` / `render-result`. Pi `pi.registerToolRenderer`,
+    // `core/extensions/loader.ts:367-371` @f1b2e77f5. A refused declaration fails `init`.
+    for r in &api.tool_renderers {
+        let mode = match r.mode {
+            crate::api::ToolRendererMode::FillIn => registration::ToolRendererMode::FillIn,
+            crate::api::ToolRendererMode::Claim => registration::ToolRendererMode::Claim,
+        };
+        registration::register_tool_renderer(&r.pattern, mode)?;
+    }
     // EXT-019: declare (not send) the markdown transformer — the closure stays guest-side and the
     // host reaches it through the `transform-markdown` export. Pi `registerMarkdownTransformer`,
     // `extensions/loader.ts:309-312` @v0.84.1.

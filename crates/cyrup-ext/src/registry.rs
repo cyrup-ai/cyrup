@@ -491,6 +491,12 @@ struct RegistryInner {
     /// route a tool NAME back to the guest that can render it (EXT-006). Without this table
     /// `has_renderer` was a field nothing read.
     tool_renderer_owner: HashMap<String, ExtensionId>,
+    /// EXT-107 — every tool-renderer RESOLVER, in registration order, which is extension LOAD
+    /// order (pi `ExtensionRunner.resolveToolRenderers`, `runner.ts:790-795` @f1b2e77f5, flattens
+    /// `ext.toolRenderers` over `this.extensions`). Both tiers land here — a native's callback or
+    /// pattern, a guest's pattern — so one chain orders them. Consulted by the facade AROUND
+    /// [`Self::tool_renderer_owner`] (the chain's `base`); see [`crate::tool_renderer`].
+    tool_renderer_resolvers: Vec<(ExtensionId, crate::tool_renderer::ToolRendererResolver)>,
     /// Which extension owns the CUSTOM-MESSAGE renderer for a custom type (Pi
     /// `registerMessageRenderer(customType, renderer)`, extensions/types.ts:1284, resolved by
     /// `extensions/runner.ts:579-587 getMessageRenderer` — FIRST extension in load order wins).
@@ -851,6 +857,29 @@ impl ExtensionRegistry {
         }
         g.tool_renderer_owner.insert(tool_name, owner);
         Ok(())
+    }
+
+    /// Append a tool-renderer RESOLVER for `owner` (EXT-107; pi `registerToolRenderer(resolver)`,
+    /// `core/extensions/loader.ts:367-371` @f1b2e77f5, which PUSHES onto the extension's
+    /// `toolRenderers` — an extension may register several, and every one of them stays in the
+    /// chain). Purged with its owner by [`Self::purge_owner`].
+    pub fn register_tool_renderer_resolver(
+        &self,
+        owner: ExtensionId,
+        resolver: crate::tool_renderer::ToolRendererResolver,
+    ) -> Result<(), ExtError> {
+        self.lock_write()?
+            .tool_renderer_resolvers
+            .push((owner, resolver));
+        Ok(())
+    }
+
+    /// Every tool-renderer resolver, in load order (a snapshot: the chain runs without the
+    /// registry lock held, since a native callback is arbitrary extension code).
+    pub fn tool_renderer_resolvers(
+        &self,
+    ) -> Result<Vec<(ExtensionId, crate::tool_renderer::ToolRendererResolver)>, ExtError> {
+        Ok(self.lock_read()?.tool_renderer_resolvers.clone())
     }
 
     /// The extension that renders the tool named `name` (`ToolDescriptor.has_renderer`), if any.
@@ -1898,6 +1927,12 @@ impl ExtensionRegistry {
         retain_not_owner!(branch_change_subscribers, |o: &ExtensionId| o != owner);
         retain_not_owner!(tool_renderer_owner, |_: &String, o: &mut ExtensionId| o
             != owner);
+        // EXT-107: a resolver goes with its owner, or `/reload` would leave a dead extension
+        // drawing every call its pattern matches.
+        retain_not_owner!(tool_renderer_resolvers, |(o, _): &(
+            ExtensionId,
+            crate::tool_renderer::ToolRendererResolver
+        )| o != owner);
         retain_not_owner!(message_renderer_owner, |_: &String, o: &mut ExtensionId| o
             != owner);
         retain_not_owner!(entry_renderer_owner, |_: &String, o: &mut ExtensionId| o

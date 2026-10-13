@@ -201,6 +201,15 @@
 // structuredContent`, `packages/agent/src/types.ts:433` @v1.0.4), which re-signs `events.
 // execute-tool`'s return, and `events.prepare-loadout` is NEW. A 0.19 guest calls the imports at
 // the old signature and exports no `prepare-loadout`, so it takes the bump.
+//
+// ADDED WITHOUT A BUMP, 0.20 (after the batch above): `registration.register-tool-renderer` and the
+// `tool-renderer-mode` enum it takes (EXT-107; pi `pi.registerToolRenderer(resolver)`,
+// `core/extensions/types.ts:1696` @f1b2e77f5). A new IMPORT, and a new type that only it uses; no
+// existing import or export changed shape, so a guest built against an earlier 0.20 still links:
+// the host simply offers an import it does not call (the "ADDED WITHOUT A BUMP" rule above, the
+// 0.18 `models.*` precedent). A guest built against THIS file and loaded on a host from before it
+// is accepted by `check_world` and fails on the missing import — the documented limit of the gate,
+// which no bump could change.
 package cyrup:ext@0.20.0;
 
 // ---------------------------------------------------------------------------
@@ -946,6 +955,34 @@ interface registration {
   // keyed by its custom-type, and the two surfaces are told apart by the HOST's registry table.
   // A fourth export would invalidate every already-built guest component for no behavioural gain.
   register-entry-renderer:   func(custom-type: string);
+  // EXT-107 — pi `pi.registerToolRenderer(resolver)` (`core/extensions/types.ts:1696` @f1b2e77f5;
+  // the `ToolRendererResolver = (toolName, next) => ToolRenderers | undefined` type at `:664-667`;
+  // `loader.ts:367-371` pushes it onto the extension's `toolRenderers`), resolved by
+  // `ExtensionRunner.resolveToolRenderers(toolName, base)` (`runner.ts:790-795`): every
+  // extension's resolvers run in LOAD ORDER, and `next()` returns what the remaining resolvers,
+  // then the registered tool, would use. It is how an extension draws calls to a tool it did NOT
+  // register — pi's MCP extension draws every `mcp__<server>__<tool>` call before (or without) the
+  // server connecting (`extensions/mcp/index.ts:383-386`, `next() ?? createMcpToolRenderers(...)`).
+  //
+  // The resolver is a closure, which ADR-0002 keeps on the guest's side of the boundary, so the
+  // guest DECLARES it: `pattern` is a tool name in which `*` matches any run of characters
+  // (`mcp__*`, `*_ghost`, or one exact name), and `mode` names which of the two resolver idioms it
+  // is. The host places the declaration in the same load-order chain a native's callback joins and
+  // evaluates it as that idiom; a call it chooses is drawn over `render-call` / `render-result`
+  // with the TOOL NAME as the key, exactly like a tool whose descriptor sets `has-renderer`.
+  // [CYRUP-DELTA] what `next()` returns is not observable to a guest beyond the idiom (a guest
+  // cannot wrap another extension's renderer); see `crates/cyrup-ext/src/tool_renderer.rs`.
+  //
+  // The `err` arm refuses an empty pattern (EXT-082's `result` precedent); nothing is registered.
+  enum tool-renderer-mode {
+    // `next() ?? (matches ? mine : undefined)` — draw only what nothing else would: a registered
+    // tool's own renderer, and a resolver loaded later, both win.
+    fill-in,
+    // `matches ? mine : next()` — draw every matching call, ahead of the registered tool and of
+    // every resolver loaded later.
+    claim,
+  }
+  register-tool-renderer:    func(pattern: string, mode: tool-renderer-mode) -> result<_, string>;
   // [CYRUP-DELTA] EXT-062: pi has no `addAutocomplete` CALL. The upstream thing this declares is a
   // FIELD on the command's own options bag — `getArgumentCompletions?: (argumentPrefix: string) =>
   // AutocompleteItem[] | null | Promise<…>` on `RegisteredCommand`
