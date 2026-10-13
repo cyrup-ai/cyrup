@@ -227,6 +227,37 @@ pub fn prompt_to_user_input(blocks: &[ContentBlock]) -> (String, Vec<Content>) {
     (message, images)
 }
 
+/// The title a session's first prompt gives it (`ACP-299`): its text blocks joined with a space,
+/// then [`normalize_session_title`] (pi-acp `promptToSessionTitle`, `translate/prompt.ts:9-19`
+/// @04d0a15). `None` for a prompt with no text, such as an image-only one.
+#[must_use]
+pub fn prompt_to_session_title(blocks: &[ContentBlock]) -> Option<String> {
+    let joined = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(TextContent { text, .. }) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalize_session_title(&joined)
+}
+
+/// The title normaliser `ACP-299`, `ACP-300` and `ACP-301` share: whitespace runs collapsed to one
+/// space, trimmed, clipped to 80 characters, or `None` when nothing is left (pi-acp
+/// `promptToSessionTitle`, `translate/prompt.ts` @04d0a15).
+///
+/// The clip counts `char`s, i.e. Unicode scalar values, which is upstream's
+/// `Array.from(...).slice(0, 80)`: an astral-plane character counts once on both sides.
+#[must_use]
+pub fn normalize_session_title(text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let clipped: String = collapsed.chars().take(80).collect();
+    // A clip can end on the space between two words; upstream trims before it clips, not after,
+    // so neither does this.
+    (!clipped.is_empty()).then_some(clipped)
+}
+
 // ===================================================================================================
 // The built-ins — `ACP-070`, `ACP-272`, `ACP-282` … `ACP-292`
 // ===================================================================================================
@@ -795,7 +826,7 @@ const NAME_USAGE: &str = "Usage: /name <name>";
 #[must_use]
 fn name_updates(name: &str, updated_at: String) -> Vec<SessionUpdate> {
     vec![
-        crate::config_options::session_info_update(Some(name.to_string()), updated_at),
+        crate::config_options::session_info_update(Some(name.to_string()), Some(updated_at)),
         chunk(format!("Session name set: {name}")),
     ]
 }
@@ -1506,6 +1537,30 @@ mod tests {
 
     fn text(s: &str) -> ContentBlock {
         ContentBlock::Text(TextContent::new(s))
+    }
+
+    // ---- ACP-299 -------------------------------------------------------------------------------
+
+    /// ACP-299 — text blocks joined with a space, whitespace runs collapsed, trimmed.
+    #[test]
+    fn acp299_a_prompt_titles_from_its_text_normalised() {
+        assert_eq!(
+            prompt_to_session_title(&[text("  Fix\n\nthe   bug  "), text("now")]),
+            Some("Fix the bug now".to_string())
+        );
+        assert_eq!(prompt_to_session_title(&[text(" \n\t ")]), None);
+        assert_eq!(prompt_to_session_title(&[]), None);
+    }
+
+    /// ACP-299 — the clip is 80 characters, and an astral-plane character is one of them (upstream
+    /// `Array.from(...).slice(0, 80)` counts code points, not UTF-16 units).
+    #[test]
+    fn acp299_an_astral_prompt_clips_to_eighty_characters() {
+        let prompt = format!("\u{1F600}{}", "a".repeat(80));
+        assert_eq!(prompt.chars().count(), 81);
+        let title = prompt_to_session_title(&[text(&prompt)]).unwrap();
+        assert_eq!(title.chars().count(), 80);
+        assert!(title.starts_with('\u{1F600}'));
     }
 
     // ---- ACP-276 … ACP-281 ---------------------------------------------------------------------

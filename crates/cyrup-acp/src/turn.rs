@@ -774,6 +774,12 @@ fn usage_update(stats: &cyrup_session_svc::SessionStats) -> Option<UsageUpdate> 
     Some(UsageUpdate::new(used, context.context_window).cost(Cost::new(stats.cost, "USD")))
 }
 
+/// The `usage_update` for `session` as it stands now, or `None` (`ACP-302`): the one function the
+/// settle, `session/new`, `session/load` and a model change all go through.
+pub(crate) async fn usage_of(session: &cyrup_session_svc::AgentSession) -> Option<SessionUpdate> {
+    usage_update(&session.session_stats().await).map(SessionUpdate::UsageUpdate)
+}
+
 /// The production [`TurnAgent`]: `AgentSessionRuntime`'s live session, re-read per call.
 ///
 /// # [CYRUP-DELTA] — no cached session, so no `rebind_session`

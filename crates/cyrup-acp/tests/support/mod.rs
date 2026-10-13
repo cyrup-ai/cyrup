@@ -199,6 +199,12 @@ impl Harness {
     /// nothing. Must be called inside a `LocalSet` — `serve` is spawned with `spawn_local`; see
     /// [`in_local_set`].
     pub async fn start(responses: Vec<AssistantMessage>) -> Self {
+        Self::start_with(FauxProvider::new(), responses).await
+    }
+
+    /// [`Harness::start`] over a provider the test configured, e.g. one listing two models with
+    /// different context windows.
+    pub async fn start_with(faux: FauxProvider, responses: Vec<AssistantMessage>) -> Self {
         let cwd = tempfile::tempdir().unwrap();
         // A file for a scripted `edit` to hit. `edit` is one of the four tools pi activates by
         // default (`read`, `write`, `edit`, `bash`); `ls` is registered but NOT active, which is
@@ -206,7 +212,7 @@ impl Harness {
         std::fs::write(cwd.path().join("hello.txt"), "one\ntwo\nthree\n").unwrap();
         let agent_dir = tempfile::tempdir().unwrap();
 
-        let faux = Arc::new(FauxProvider::new());
+        let faux = Arc::new(faux);
         faux.set_responses(responses);
         // The turbofish is load-bearing: `Arc::clone(&faux)` would infer its return type from the
         // argument and leave no coercion site, so the unsized coercion to `dyn Provider` has to

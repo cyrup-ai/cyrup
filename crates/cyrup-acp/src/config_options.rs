@@ -926,16 +926,20 @@ pub fn current_mode_update(applied: ModelThinkingLevel) -> SessionUpdate {
 /// Lives beside the config updates because `ACP-Q20` is one decision over all three notifications
 /// and they must be emitted from one place.
 #[must_use]
-pub fn session_info_update(name: Option<String>, updated_at: String) -> SessionUpdate {
+///
+/// `updated_at: None` omits the key (`ACP-300`): a title published because a session was reopened
+/// is not activity, and upstream's `publishTitle(title, null)` leaves the client's activity time
+/// alone.
+pub fn session_info_update(name: Option<String>, updated_at: Option<String>) -> SessionUpdate {
     let title = match name {
         Some(name) => MaybeUndefined::Value(name),
         None => MaybeUndefined::Null,
     };
-    SessionUpdate::SessionInfoUpdate(
-        SessionInfoUpdate::new()
-            .title(title)
-            .updated_at(MaybeUndefined::Value(updated_at)),
-    )
+    let update = SessionInfoUpdate::new().title(title);
+    SessionUpdate::SessionInfoUpdate(match updated_at {
+        Some(at) => update.updated_at(MaybeUndefined::Value(at)),
+        None => update,
+    })
 }
 
 /// The advertised value id for a model. **Shared by both directions**, so a model value id is never
@@ -1560,7 +1564,7 @@ mod tests {
     fn a_rename_sends_a_value_and_only_a_clear_sends_null() {
         let json = serde_json::to_value(session_info_update(
             Some("my session".into()),
-            "2026-09-05T00:00:00Z".into(),
+            Some("2026-09-05T00:00:00Z".into()),
         ))
         .unwrap();
         assert_eq!(
@@ -1570,9 +1574,17 @@ mod tests {
         assert_eq!(json["title"], serde_json::json!("my session"));
         assert_eq!(json["updatedAt"], serde_json::json!("2026-09-05T00:00:00Z"));
 
-        let cleared =
-            serde_json::to_value(session_info_update(None, "2026-09-05T00:00:00Z".into())).unwrap();
+        let cleared = serde_json::to_value(session_info_update(
+            None,
+            Some("2026-09-05T00:00:00Z".into()),
+        ))
+        .unwrap();
         assert!(cleared["title"].is_null());
+
+        // `ACP-300` — a reopened session's title carries no `updatedAt`.
+        let reopened = serde_json::to_value(session_info_update(Some("t".into()), None)).unwrap();
+        assert_eq!(reopened["title"], serde_json::json!("t"));
+        assert!(reopened.get("updatedAt").is_none(), "{reopened}");
     }
 
     /// ACP-075 — the update wraps the re-derived set, and the payload key is the one the schema
