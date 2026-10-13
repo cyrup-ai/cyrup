@@ -1766,6 +1766,27 @@ pub fn shutdown_state(
     })
 }
 
+/// Close a build's state that a second build inside the same generation superseded (MCP-641).
+///
+/// [`shutdown_state`] ends a state by stopping its owner, which is right when the generation is
+/// over. A build superseded within its generation shares that owner with the build that replaced
+/// it, so here the owner is left running and only this state's own runtime is closed: its
+/// health checks, its convergence pass and its servers ([`McpLifecycleManager::graceful_shutdown`],
+/// the cleanup `initialize_mcp` registered on the owner, which is memoised, so the owner's eventual
+/// stop does not close anything twice). The empty snapshot and the metadata flush happen as in
+/// [`shutdown_state`]; a flush failure is logged.
+pub async fn shutdown_superseded_state(
+    state: &Arc<McpState>,
+    reason: &'static str,
+    flush: &MetadataFlush,
+) {
+    state.publish_status(McpStatusSnapshot::default());
+    if let Err(error) = flush(state) {
+        tracing::debug!("MCP: metadata flush failed during shutdown ({reason}): {error}");
+    }
+    state.lifecycle.graceful_shutdown().await;
+}
+
 /// Recover a stop failure from behind the memoised `Shared`'s `Arc`.
 ///
 /// `McpRuntimeOwner::stop` must hand back a `Clone` output, so it yields `Arc<McpError>`. When this

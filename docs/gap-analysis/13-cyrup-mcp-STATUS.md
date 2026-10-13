@@ -728,6 +728,21 @@ Arithmetic on the 2026-10-12 census (576: `implemented` 377, `partial` 70, `miss
 380 + 67 + 97 + 34 = 578. Severity of the new rows: 2 low. Next free id: `MCP-642`. Area 13 is counted
 in this file by the standing rule, so `scripts/count_open_items.py` does not see this change.
 
+### Closures — 2026-10-13 (`MCP-640`, `MCP-641`)
+
+Both rows filed by the second wait census closed, on `claude/compassionate-cray-46f1tv` off `main`
+@ `01aba2bb`. The closure records are on the rows in `13e`; `MCP-641` was `MCP-635`'s regression
+and its row records what the fix restores and the two corrections the measurement made to it.
+
+| id | sev | § | kind | status | eff | title |
+|---|---|---|---|---|---|---|
+| `MCP-640` | ~~low~~ | 13e | `port-divergence` | **implemented** *(CLOSED 2026-10-13)* | S | the `session_shutdown` teardown is declared, with the handover's ceiling (35 s + the 5 s budget) |
+| `MCP-641` | ~~low~~ | 13e | `cyrup-original` | **implemented** *(CLOSED 2026-10-13)* | S | a call whose build is superseded inside its generation is answered through the build that won (re-gate; the superseded build no longer stops the shared owner) |
+
+Arithmetic on the census above (578): `implemented` 380 + 2 = **382**; `partial` **67**; `missing`
+97 − 2 = **95**; `not-applicable` **34**. 382 + 67 + 95 + 34 = 578. No row filed; next free id
+`MCP-642`.
+
 ### Additions — 2026-10-07 (area 18's pi `v1.0.1..v1.0.4` triage)
 
 One row filed: `MCP-616` (13e, low, M, **missing**): `--tools` / `--exclude-tools` accept `*` patterns, `--tools`
