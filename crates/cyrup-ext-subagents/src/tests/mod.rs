@@ -26,6 +26,7 @@ mod acceptance_role_inference;
 mod async_single_worktree_isolation;
 mod bundled_resources_registration_integration;
 mod child_prompt_runtime_integration;
+mod child_wait_wiring;
 mod deadline_checkpoint_runner_integration;
 mod discovery_integration;
 mod dynamic_collect_record_fidelity;

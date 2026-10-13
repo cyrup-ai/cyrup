@@ -132,6 +132,7 @@ mod tool_activation_integration;
 mod wait_tool_registration_integration;
 // SUBA-192 — a steer typed during a blocking `bg_wait` ends it, end to end on a real session.
 mod bg_wait_user_input_integration;
+mod child_bg_wait_integration;
 mod watchdog_model_turn_integration;
 mod watchdog_permission_arbiter_integration;
 mod watchdog_review_budget_integration;

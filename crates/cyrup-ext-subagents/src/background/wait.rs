@@ -117,9 +117,12 @@
 //! rule — [`crate::background::delivery::SessionGate`] for "may I act on this run?" and
 //! [`crate::background::delivery::OwnershipSnapshot::owns`] for "may I consume this completion?".
 //!
-//! `session_id: None` (headless / unpersisted orchestrator) applies no filter, which is pi's own
-//! falsy-`sessionId` path — see [`super::run_status::list_active_runs`] for why an unattributed run
-//! is dropped when a filter IS supplied.
+//! At this layer `WaitDeps::session_id: None` lists without a session filter, but no production
+//! wait reaches that path: the `bg_wait` tool refuses an enabled call with no session identity
+//! before it lists anything — pi's falsy-`sessionId` path is that refusal (`subagent-wait.ts:665-667`
+//! @ad11b7ab), not an unscoped listing — and both `agent_end` drains skip. See
+//! [`super::run_status::list_active_runs`] for why an unattributed run is dropped when a filter IS
+//! supplied.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -661,7 +664,11 @@ async fn user_input_sent(deps: &WaitDeps) {
     }
 }
 
-/// pi `formatDuration` (`shared/formatters.ts:49-53`).
+/// pi `formatDuration` (`shared/formatters.ts:61-65` @ad11b7ab).
+///
+/// `[CYRUP-DELTA]` on an exact tie the seconds round differently: Rust's `{:.1}` rounds half to
+/// even and JS `toFixed(1)` rounds half up, so 1250 ms reads `1.2s` here and `1.3s` upstream
+/// (2250 ms: `2.2s` against `2.3s`). Filed as `SUBA-244`.
 #[must_use]
 pub fn format_duration(ms: u64) -> String {
     if ms < 1000 {
@@ -779,14 +786,52 @@ pub fn active_detached_foreground_runs(
         run.session_id == session_id && run.children.iter().any(|child| child.status == "detached")
     });
     match params.id.as_deref() {
-        // `[CYRUP-DELTA]` every prefix match, with no exact preference and no ambiguity refusal
-        // (pi `subagent-wait.ts:704-708` @ad11b7ab) — `SUBA-237`.
+        // Every exact-or-prefix match, as upstream's own `activeDetachedForegroundRuns` keeps
+        // (`subagent-wait.ts:236` @ad11b7ab). Upstream's caller applies the exact preference and
+        // the ambiguity refusal across its MERGED async-plus-foreground candidates (`:699-708`);
+        // cyrup's applies them to this foreground half only ([`narrow_foreground_to_id`]), and only
+        // when no active async run matched — the `SUBA-240` `[CYRUP-DELTA]` in
+        // [`wait_for_subagents`].
         Some(id) => runs
             .filter(|run| run.run_id == id || run.run_id.starts_with(id))
             .collect(),
         None if params.all == Some(true) => runs.collect(),
         None => Vec::new(),
     }
+}
+
+/// pi `subagent-wait.ts:707` @ad11b7ab, verbatim — the ONE ambiguity refusal, whatever kind of run
+/// the prefix matched. A refusal is an error result (`result(…, true)`).
+fn ambiguous_run_id(id: &str, ids: &[&str]) -> WaitOutcome {
+    WaitOutcome::plain(
+        format!(
+            "Ambiguous subagent run id prefix \"{id}\" matched {} runs: {}. Pass a longer id.",
+            ids.len(),
+            ids.join(", ")
+        ),
+        WaitVerdict::AmbiguousId,
+    )
+}
+
+/// SUBA-237 — pi `subagent-wait.ts:704-708` @ad11b7ab over the foreground candidates: keep the
+/// exact match when there is one (`exact.length > 0 ? exact : candidates`), and refuse when more
+/// than one run remains. The live map is keyed by run id, so an exact match is at most one run.
+///
+/// # Errors
+///
+/// The [`ambiguous_run_id`] refusal, when `id` is a prefix of two or more runs and names none.
+fn narrow_foreground_to_id(
+    candidates: &mut Vec<DetachedForegroundRun>,
+    id: &str,
+) -> Result<(), WaitOutcome> {
+    if candidates.iter().any(|run| run.run_id == id) {
+        candidates.retain(|run| run.run_id == id);
+    }
+    if candidates.len() > 1 {
+        let ids: Vec<&str> = candidates.iter().map(|run| run.run_id.as_str()).collect();
+        return Err(ambiguous_run_id(id, &ids));
+    }
+    Ok(())
 }
 
 /// pi `foregroundChildrenNeedingAttention` (`subagent-wait.ts:241-243`): a still-`detached` child
@@ -1031,7 +1076,8 @@ pub enum WaitVerdict {
     NothingToWait,
     /// A run listing faulted, at entry (pi `:600-609`) or mid-loop (pi `:686-699`). Error.
     ListingFailed,
-    /// An id prefix matched several active runs — pi `:619`. Error.
+    /// An id prefix matched several runs and named none exactly — pi `:704-708` @ad11b7ab, async
+    /// or detached foreground alike ([`ambiguous_run_id`]). Error.
     AmbiguousId,
     /// The turn was aborted — pi `:677`. Error.
     Aborted,
@@ -1333,12 +1379,46 @@ async fn wait_for_detached_foreground_runs(
                 ..
             }
         ) {
+            if let WaitVerdict::WindowElapsed {
+                active_run_ids: observed,
+            } = outcome.verdict
+            {
+                // An id-scoped wait is upstream's direct `waitForDetachedForegroundRun` call
+                // (`:752-753` @ad11b7ab), whose window names that one run (`:611-613`): keep the
+                // ids exactly as the run's own loop observed them.
+                if runs.len() <= 1 {
+                    return WaitOutcome::plain(
+                        outcome.text,
+                        WaitVerdict::WindowElapsed {
+                            active_run_ids: observed,
+                        },
+                    );
+                }
+                // pi `:635-645` — an elapsed window over several runs names EVERY run this wait
+                // began with that still has a child detached since entry, not only the run the
+                // loop was on; the text stays that run's own. The others are re-read; the run just
+                // observed detached — in the same snapshot that closed the window — stays listed
+                // even if its child lands in between, since that snapshot is what the text says.
+                let still = foreground_runs_still_detached(runs, deps);
+                let active_run_ids = runs
+                    .iter()
+                    .map(|run| &run.run_id)
+                    .filter(|id| observed.contains(*id) || still.contains(*id))
+                    .cloned()
+                    .collect();
+                return WaitOutcome::plain(
+                    outcome.text,
+                    WaitVerdict::WindowElapsed { active_run_ids },
+                );
+            }
             return outcome;
         }
         last_done = Some(outcome);
     }
-    // Every selected run reached a terminal child result; upstream's loop likewise ends on the
-    // LAST one's text (`:627`). The fallback is unreachable from `wait_for_subagents`, whose
+    // Every selected run reached a terminal child result. `[CYRUP-DELTA]` this returns the LAST
+    // run's outcome alone; upstream joins every run's text (`texts.push`, `:647-649` @ad11b7ab), so
+    // an all-wait over several detached foreground runs reports each of them there and only the
+    // last here. Filed as `SUBA-246`. The fallback is unreachable from `wait_for_subagents`, whose
     // caller guard is `!detached_foreground.is_empty()`, and is a value rather than a panic
     // because an empty slice is a legitimate thing to hand a helper.
     last_done.unwrap_or_else(|| {
@@ -1389,12 +1469,10 @@ fn foreground_runs_still_detached(scope: &[DetachedForegroundRun], deps: &WaitDe
 /// lists the whole wait's still-active work, as upstream's `yieldWait` closes over the initial
 /// scope, not just the run this loop happens to be on.
 ///
-/// `[CYRUP-DELTA]` that scope is what [`active_detached_foreground_runs`] selected, and for an id
-/// it selects EVERY prefix match. Upstream prefers an exact match and refuses an ambiguous prefix
-/// (`subagent-wait.ts:704-708` @ad11b7ab), so its id-scoped wait holds one foreground run and its
-/// yield can name only that one (`scopedForeground = [selectedForeground]`, `:738`). Here
-/// `bg_wait({ id: "run-1" })` with `run-1` and `run-10` both detached waits on both, and a
-/// `user_input` yield can name both. Filed as `SUBA-237`; the selection predates SUBA-192.
+/// For an id that scope is ONE run: [`narrow_foreground_to_id`] keeps the exact match or refuses
+/// an ambiguous prefix before this loop is entered, as upstream's `scopedForeground =
+/// [selectedForeground]` (`subagent-wait.ts:738` @ad11b7ab) — so a yield can name only the run
+/// the caller asked about.
 ///
 /// `[CYRUP-DELTA]` upstream's `deps.hasPendingSupervisorRequest?.()` yield (`:594`) has no cyrup
 /// seam on this path — [`WaitDeps`] carries no supervisor-request probe, and the ask lock that
@@ -1591,11 +1669,14 @@ pub async fn wait_for_subagents(
 ) -> WaitOutcome {
     if !deps.enabled {
         return WaitOutcome::plain(
+            // pi `subagent-wait.ts:663` @ad11b7ab, with the registered tool name and cyrup's env var:
+            // the v0.34.0 sentence this replaces named a "Wait tool" that is not registered.
             format!(
-                "Wait tool is disabled by config.waitTool or {WAIT_TOOL_ENABLED_ENV}; returning \
-                 immediately without blocking background subagent runs. Active runs keep going, \
-                 and you can inspect them with subagent({{ action: \"status\" }}) or wait for \
-                 completion notifications."
+                "{} is disabled by config.waitTool or {WAIT_TOOL_ENABLED_ENV}; returning \
+                 immediately without blocking background work. Active work keeps going, and you \
+                 can inspect subagents with subagent({{ action: \"status\" }}) or rely on \
+                 completion notifications.",
+                crate::extension::wait_tool::WAIT_TOOL_NAME
             ),
             WaitVerdict::Disabled,
         );
@@ -1660,19 +1741,29 @@ pub async fn wait_for_subagents(
     // runs (`activeDetachedForegroundRuns`). `bg_wait` had only the async half, which is why
     // `WaitTargetKind::Foreground` had no production producer until now.
     //
-    // `[CYRUP-DELTA]` upstream MERGES the two lists into one candidate array and resolves the id
-    // across both (`:681-690`), so an id matching one async run AND one foreground run is reported
-    // as AMBIGUOUS. cyrup consults the foreground half only when the async half selected nothing,
-    // so that collision resolves to the async run instead. It is not reachable in practice — a
-    // `RunId` is minted once per run and the two maps are keyed by the same id space, so one id
-    // cannot name both — but the resolution rule differs and is stated rather than implied.
-    let detached_foreground = if active.is_empty() {
+    // `[CYRUP-DELTA]` upstream MERGES its candidates into one array — every async run of the
+    // session, terminal ones included when an id is given, plus the detached foreground runs — and
+    // resolves the id across all of them (`subagent-wait.ts:688`,`:699-708` @ad11b7ab), so a short
+    // prefix matching one async run and one foreground run, or an active and a terminal run, is
+    // refused as ambiguous. cyrup consults the foreground half only when no ACTIVE async run
+    // matched, and resolves a terminal one only after that, so those collisions resolve to the
+    // first half that matched instead. A full id cannot collide (ids are minted 32-hex); a short
+    // prefix can. Filed as `SUBA-240`.
+    let mut detached_foreground = if active.is_empty() {
         active_detached_foreground_runs(params, deps)
     } else {
         // The async half selected something, so the foreground half is not consulted and its
         // snapshot is not taken — a wait that already has work to do pays nothing for this.
         Vec::new()
     };
+    // SUBA-237 — pi `:704-708`,`:733`,`:738` @ad11b7ab: an id keeps its exact match when there is
+    // one and is refused when its prefix matches more than one run — BEFORE either arm below, so a
+    // blocking wait holds one run and a non-blocking one arms the run the caller named.
+    if let Some(id) = params.id.as_deref()
+        && let Err(refusal) = narrow_foreground_to_id(&mut detached_foreground, id)
+    {
+        return refusal;
+    }
     if !detached_foreground.is_empty() {
         // SCOPE_11 — the arming site's OTHER target kind, reachable from production for the first
         // time. pi `:704-714` arms whatever `selected.kind` resolved to; the record format, the
@@ -1735,15 +1826,8 @@ pub async fn wait_for_subagents(
         if exact.len() == 1 {
             active = exact;
         } else if active.len() > 1 {
-            return WaitOutcome::plain(
-                format!(
-                    "Ambiguous async run id prefix \"{id}\" matched {} active runs: {}. Pass a \
-                     longer id.",
-                    active.len(),
-                    join_ids(&active)
-                ),
-                WaitVerdict::AmbiguousId,
-            );
+            let ids: Vec<&str> = active.iter().map(run_id_of).collect();
+            return ambiguous_run_id(id, &ids);
         }
         // Narrow to the single resolved id so later polls cannot pick up a different prefix match.
         effective_id = active.first().map(|run| run_id_of(run).to_string());
@@ -1833,6 +1917,19 @@ pub async fn wait_for_subagents(
     };
 
     while !done(&pending, &attention) {
+        // SUBA-236 — pi `activeInitialRuns` (`subagent-wait.ts:787` @ad11b7ab): of this lap's
+        // listing, the runs the wait BEGAN with. Built ONCE per lap and shared by all three exits
+        // below — the `user_input` yield's ids, the abort's "Still active:", and the window's count,
+        // list and ids — so none of them can name a run a concurrent turn launched mid-wait, and no
+        // two can disagree. `active` is the refresh's unfiltered listing (`pending` is drawn from it
+        // unfiltered; `attention` is filtered at the refresh), so the filter has to be here. With
+        // `stop_on_attention` off (the drain) the set includes attention runs, so a window that
+        // elapses while only attention runs remain still names them.
+        let active_initial: Vec<ActiveRun> = active
+            .iter()
+            .filter(|run| initial_ids.iter().any(|id| id == run_id_of(run)))
+            .cloned()
+            .collect();
         // SUBA-192 — pi `:794` @ad11b7ab, `if (deps.userInputSignal?.aborted) return
         // yieldWait("user_input")`: inside the body, so `done` above already had its say — a run
         // that finished in the same tick as the message resolves the wait normally, which is
@@ -1841,15 +1938,15 @@ pub async fn wait_for_subagents(
         // abort, and a message plus an abort is the message, as upstream's `:794`-before-`:795`.
         //
         // The ids are upstream's `yieldForScope` (`:445`): the runs this wait BEGAN with that are
-        // still active. `pending` is refreshed from an unfiltered listing below, so it can hold a
-        // run a concurrent turn launched mid-wait; that run is not this wait's work.
+        // still active — `active_initial`, above.
         //
         // `[CYRUP-DELTA]` "still active" is as of the listing this lap already holds — the refresh
         // after the sleep that woke it, or on the first lap the entry listing — not a listing taken
         // AT the yield, as upstream's `yieldForScope` takes one (`:444`). It differs only when the
         // message lands before the first sleep, and then by a run that finished in those few
-        // milliseconds; `done` sees the same listing, so the yield and the done check agree. Upstream's
-        // yield-time listing-error result (`:455-457`) has no counterpart here as a consequence.
+        // milliseconds; `done` sees the same listing, so the yield and the done check agree.
+        // Upstream's yield-time listing-error result (`:455-457`) has no counterpart here as a
+        // consequence.
         //
         // `[CYRUP-DELTA]` upstream's scope also lists the session's remembered foreground runs
         // still detached (`:446-450`). This loop never holds any: cyrup consults the foreground
@@ -1860,60 +1957,46 @@ pub async fn wait_for_subagents(
             .as_ref()
             .is_some_and(CancelToken::is_cancelled)
         {
-            let active_run_ids: Vec<String> = pending
+            let active_run_ids: Vec<String> = active_initial
                 .iter()
-                .chain(attention.iter())
                 .map(|run| run_id_of(run).to_string())
-                .filter(|id| initial_ids.contains(id))
                 .collect();
             return WaitOutcome::plain(
                 USER_INPUT_YIELD_TEXT.to_string(),
                 WaitVerdict::UserInput { active_run_ids },
             );
         }
-        // pending + attention: upstream's abort/timeout messages name `activeInitialRuns` — the
-        // FULL active∩initial set (`subagent-wait.ts:787-801` @ad11b7ab). With `stop_on_attention`
-        // off (the drain), the wait can time out while ONLY attention runs remain, and a message
-        // built from `pending` alone would then claim "0 run(s) still active" about a live run.
-        // With the flag on, `attention` is empty at both sites (the `done` short-circuit exits
-        // first), so this changes nothing for the `bg_wait` tool.
-        //
-        // `[CYRUP-DELTA]` unlike the `user_input` yield above, neither site filters by
-        // `initial_ids`: `attention` is filtered at the refresh, `pending` is not, so a run a
-        // concurrent turn launched mid-wait is named here although upstream's `activeInitialRuns`
-        // (`:787`) would drop it. Filed as `SUBA-236`.
+        // pi `:795-796` @ad11b7ab — `Still active:` is `activeInitialRuns` (`:789-792`).
         if cancel.is_cancelled() {
-            let in_flight: Vec<ActiveRun> =
-                pending.iter().chain(attention.iter()).cloned().collect();
             return WaitOutcome::plain(
                 format!(
                     "Wait aborted after {}. Still active: {}.",
                     format_duration(elapsed_ms(started_at)),
-                    join_ids_with_state(&in_flight)
+                    join_ids_with_state(&active_initial)
                 ),
                 WaitVerdict::Aborted,
             );
         }
         let elapsed = started_at.elapsed();
         if elapsed >= timeout {
-            let in_flight: Vec<ActiveRun> =
-                pending.iter().chain(attention.iter()).cloned().collect();
-            // pi `activeInitialRuns.map((run) => run.id)` (`:801` @ad11b7ab). `in_flight` stands in
-            // for upstream's `activeInitialRuns` — pending ∪ attention, the same set the message's
-            // `n run(s) still active` count comes from, so the ids and the text cannot disagree —
-            // but it is NOT filtered to the initial runs (the `[CYRUP-DELTA]` above, `SUBA-236`).
-            let active_run_ids: Vec<String> = in_flight
+            // pi `windowElapsedResult` (`:798-802` @ad11b7ab): the pin's sentence, the count and
+            // the list over `activeInitialRuns`, and `activeInitialRuns.map((run) => run.id)` as the
+            // ids — one value, so the three cannot disagree. The tool name is spliced from
+            // `WAIT_TOOL_NAME`, so the sentence can only ever name the registered tool. cyrup has
+            // no provider-job registry (upstream's `backgroundWork`), so its provider count is `0`.
+            let active_run_ids: Vec<String> = active_initial
                 .iter()
                 .map(|run| run_id_of(run).to_string())
                 .collect();
             return WaitOutcome::plain(
                 format!(
-                    "Wait timed out after {} with {} run(s) still active: {}. The runs are \
-                     detached and keep going; call wait again or inspect with subagent({{ action: \
-                     \"status\" }}).",
+                    "Wait window elapsed after {} with {} async run(s) and 0 provider item(s) \
+                     still active: {}. The work keeps going; call {} again or inspect subagent \
+                     status.",
                     format_duration(timeout.as_millis().try_into().unwrap_or(u64::MAX)),
-                    in_flight.len(),
-                    join_ids_with_state(&in_flight)
+                    active_initial.len(),
+                    join_ids_with_state(&active_initial),
+                    crate::extension::wait_tool::WAIT_TOOL_NAME
                 ),
                 WaitVerdict::WindowElapsed { active_run_ids },
             );
@@ -2134,12 +2217,24 @@ pub async fn wait_for_subagents(
     }
 
     // First-completion mode.
+    //
+    // `[CYRUP-DELTA]` the count and the two fallback sentences are still v0.34.0's (`wait.ts:364`,
+    // `:383` @v0.34.0): `still_running` counts `pending`, which leaves out a run that needs
+    // attention, and the attention branch says "No other runs". The pin counts every initial run
+    // still active, attention runs included (`subagent-wait.ts:852-853` @ad11b7ab, changed in
+    // `315e1eb1`), and says "No other work is waitable until attention is handled." (`:885`). The
+    // attention note below is v0.34.0's too (`:850` at the pin). Filed as `SUBA-248`; only the
+    // first branch's sentence is the pin's.
     let still_running = pending
         .iter()
         .filter(|run| initial_ids.iter().any(|id| id == run_id_of(run)))
         .count();
     let remainder = if still_running > 0 {
-        format!(" {still_running} run(s) still in flight — call wait again to catch the next one.")
+        // pi `subagent-wait.ts:883` @ad11b7ab, with the registered tool name spliced in.
+        format!(
+            " {still_running} run(s) still in flight — call {} again to catch the next one.",
+            crate::extension::wait_tool::WAIT_TOOL_NAME
+        )
     } else if attention.is_empty() {
         " No runs remain in flight.".to_string()
     } else {
@@ -2660,6 +2755,25 @@ mod tests {
             .expect("write status.json");
         }
 
+        /// A `running` run written straight to disk with no session stamp — the shape a concurrent
+        /// turn's launch leaves while a wait is already in flight. Associated, not `&self`, so a
+        /// spawned task can call it with owned paths.
+        fn write_running_at(
+            async_root: &std::path::Path,
+            results_dir: &std::path::Path,
+            run_id: &RunId,
+        ) {
+            let paths = RunPaths::for_run(async_root, results_dir, run_id);
+            std::fs::create_dir_all(&paths.run_dir).expect("mkdir run dir");
+            let mut status = RunStatus::queued(run_id.clone(), RunMode::Single, Some(1));
+            status.state = RunState::Running;
+            std::fs::write(
+                &paths.status,
+                serde_json::to_string(&status).expect("status serializes"),
+            )
+            .expect("write status.json");
+        }
+
         /// Write the authoritative terminal `ResultFile` — the real completion signal a detached
         /// hop-2 runner emits, and the one thing that flips a run terminal for every reader.
         fn settle(async_root: &std::path::Path, results_dir: &std::path::Path, run_id: &RunId) {
@@ -2905,14 +3019,18 @@ mod tests {
             "the wedged run must be named in active_run_ids: {active_run_ids:?}"
         );
         let err = &outcome.text;
-        assert!(err.starts_with("Wait timed out after "), "got: {err}");
-        assert!(err.contains("1 run(s) still active"), "got: {err}");
+        // SUBA-236 — the pin's window sentence (pi `subagent-wait.ts:800` @ad11b7ab).
+        assert!(err.starts_with("Wait window elapsed after "), "got: {err}");
+        assert!(
+            err.contains("1 async run(s) and 0 provider item(s) still active"),
+            "got: {err}"
+        );
         assert!(
             err.contains(run_id.as_str()),
             "the wedged run must be named: {err}"
         );
         assert!(
-            err.contains("The runs are detached and keep going"),
+            err.ends_with("The work keeps going; call bg_wait again or inspect subagent status."),
             "got: {err}"
         );
     }
@@ -3324,7 +3442,7 @@ mod tests {
             }
         );
         assert!(
-            outcome.text.starts_with("Wait timed out after "),
+            outcome.text.starts_with("Wait window elapsed after "),
             "{}",
             outcome.text
         );
@@ -3501,8 +3619,11 @@ mod tests {
         );
         assert!(matches!(outcome.verdict, WaitVerdict::WindowElapsed { .. }));
         let err = outcome.text;
-        assert!(err.starts_with("Wait timed out after "), "got: {err}");
-        assert!(err.contains("1 run(s) still active"), "got: {err}");
+        assert!(err.starts_with("Wait window elapsed after "), "got: {err}");
+        assert!(
+            err.contains("1 async run(s) and 0 provider item(s) still active"),
+            "got: {err}"
+        );
         assert!(
             err.contains(run_id.as_str()),
             "the attention run must be named as still active: {err}"
@@ -3647,7 +3768,11 @@ mod tests {
         .text;
         settle.await.expect("settler task");
         assert!(text.contains("1 of 2 run(s) finished"), "got: {text}");
-        assert!(text.contains("1 run(s) still in flight"), "got: {text}");
+        // The tool's registered name, not the pre-rename `wait` (pi `subagent-wait.ts:883` @ad11b7ab).
+        assert!(
+            text.contains("1 run(s) still in flight — call bg_wait again to catch the next one."),
+            "got: {text}"
+        );
 
         // ...and `all: true` is STILL not satisfied, because run b never settled.
         let still_blocked = tokio::time::timeout(
@@ -3696,7 +3821,12 @@ mod tests {
         );
         assert!(outcome.is_error());
         let err = outcome.text;
-        assert!(err.starts_with("Ambiguous async run id prefix \"abc\" matched 2 active runs:"));
+        // SUBA-237 — the pin's one ambiguity text for every candidate kind (pi
+        // `subagent-wait.ts:707` @ad11b7ab), not v0.34.0's "async … active runs".
+        assert!(
+            err.starts_with("Ambiguous subagent run id prefix \"abc\" matched 2 runs: "),
+            "got: {err}"
+        );
         assert!(err.ends_with("Pass a longer id."), "got: {err}");
     }
 
@@ -3730,11 +3860,16 @@ mod tests {
             .await
             .text;
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(
-            text.starts_with("Wait tool is disabled by config.waitTool or "),
-            "got: {text}"
+        // pi `subagent-wait.ts:663` @ad11b7ab, with the tool's registered name and cyrup's env var.
+        assert_eq!(
+            text,
+            format!(
+                "bg_wait is disabled by config.waitTool or {WAIT_TOOL_ENABLED_ENV}; returning \
+                 immediately without blocking background work. Active work keeps going, and you \
+                 can inspect subagents with subagent({{ action: \"status\" }}) or rely on \
+                 completion notifications."
+            )
         );
-        assert!(text.contains("Active runs keep going"), "got: {text}");
     }
 
     #[test]
@@ -4310,7 +4445,7 @@ mod tests {
         );
         assert!(matches!(outcome.verdict, WaitVerdict::WindowElapsed { .. }));
         let err = outcome.text;
-        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("window elapsed"), "{err}");
         assert!(
             !ledger.is_claimed(&run),
             "Drop must release the claim on the timeout path"
@@ -4940,5 +5075,270 @@ mod tests {
         // Omitted stays omitted, never `false` — pi's `...(x ? {x} : {})` discipline.
         let bare = serde_json::to_value(WaitParams::default()).expect("serializes");
         assert!(bare.get("nonBlocking").is_none(), "{bare}");
+    }
+
+    // ---- SUBA-236 / SUBA-237: what a wait names, and what it says when it stops ----------------
+
+    /// SUBA-236 — pi `activeInitialRuns` (`subagent-wait.ts:787`,`:799-801` @ad11b7ab): the window
+    /// result names only the runs the wait BEGAN with — in its count, its list and its ids — and
+    /// says so in the pin's sentence, with the tool's registered name spliced in.
+    ///
+    /// The late run is written 150 ms in, while the wait is polling, the way a concurrent turn's
+    /// launch lands; every refresh after that lists it.
+    ///
+    /// **Gutting mutation this fails on:** build the window's run set from the refreshed listing
+    /// without the `initial_ids` filter — the late run is then counted, listed and returned.
+    #[tokio::test]
+    async fn the_window_result_names_only_the_runs_the_wait_began_with() {
+        let fx = Fixture::new();
+        let initial = RunId::from_token("winit00001".to_string());
+        fx.write_status(&initial, RunState::Running, false);
+        let late = RunId::from_token("wlate00001".to_string());
+        let writer = {
+            let (async_root, results_dir) = (fx.async_root.clone(), fx.results_dir.clone());
+            let late = late.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Fixture::write_running_at(&async_root, &results_dir, &late);
+            })
+        };
+        let outcome = wait_for_subagents(
+            &WaitParams {
+                timeout_ms: Some(700),
+                ..WaitParams::default()
+            },
+            &CancelToken::new(),
+            &fx.deps(true),
+        )
+        .await;
+        writer.await.expect("writer task");
+
+        assert!(!outcome.is_error(), "{}", outcome.text);
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::WindowElapsed {
+                active_run_ids: vec![initial.as_str().to_string()],
+            },
+            "the late run {} is not this wait's work",
+            late.as_str()
+        );
+        assert_eq!(
+            outcome.text,
+            format!(
+                "Wait window elapsed after 700ms with 1 async run(s) and 0 provider item(s) still \
+                 active: {} (running). The work keeps going; call bg_wait again or inspect \
+                 subagent status.",
+                initial.as_str()
+            )
+        );
+    }
+
+    /// SUBA-236 — the abort result's "Still active:" is the same `activeInitialRuns` (pi
+    /// `subagent-wait.ts:789-792`,`:795-796` @ad11b7ab).
+    ///
+    /// `start_paused`: the late run is written and the turn aborted only once the wait is parked in
+    /// its 30 s sleep, so the abort wakes it AFTER a refresh would list the late run — the one
+    /// moment an unfiltered set can leak it.
+    ///
+    /// **Gutting mutation this fails on:** the abort site's run set without the `initial_ids`
+    /// filter — "Still active:" then names the late run too.
+    #[tokio::test(start_paused = true)]
+    async fn the_abort_result_names_only_the_runs_the_wait_began_with() {
+        let fx = Fixture::new();
+        let initial = RunId::from_token("ainit00001".to_string());
+        fx.write_status(&initial, RunState::Running, false);
+        let late = RunId::from_token("alate00001".to_string());
+        let cancel = CancelToken::new();
+        let aborter = {
+            let (async_root, results_dir) = (fx.async_root.clone(), fx.results_dir.clone());
+            let (late, cancel) = (late.clone(), cancel.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Fixture::write_running_at(&async_root, &results_dir, &late);
+                cancel.cancel();
+            })
+        };
+        let deps = WaitDeps {
+            poll_interval: Duration::from_secs(30),
+            ..fx.deps(true)
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(&WaitParams::default(), &cancel, &deps),
+        )
+        .await
+        .expect("the abort ends the wait");
+        aborter.await.expect("aborter task");
+
+        assert_eq!(outcome.verdict, WaitVerdict::Aborted);
+        assert!(outcome.is_error(), "an abort is an error result");
+        assert!(
+            outcome.text.starts_with("Wait aborted after "),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .ends_with(&format!(". Still active: {} (running).", initial.as_str())),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            !outcome.text.contains(late.as_str()),
+            "the late run is not this wait's work: {}",
+            outcome.text
+        );
+    }
+
+    /// SUBA-237 — pi `subagent-wait.ts:704-705`,`:733`,`:738` @ad11b7ab: an exact id wins over the
+    /// runs it is a prefix of. `bg_wait({ id: "run-1" })` with `run-1` and `run-10` both detached
+    /// holds `run-1` ALONE — so a steer's yield names `run-1` and nothing it was not asked about.
+    ///
+    /// **Gutting mutations this fails on:** drop the exact-match preference in
+    /// [`narrow_foreground_to_id`] — `run-1` is then a prefix of two runs and the call is refused as
+    /// `AmbiguousId` instead of waiting; drop the `narrow_foreground_to_id` call altogether — the
+    /// wait then holds `run-10` too, and the yield names both.
+    #[tokio::test]
+    async fn an_exact_foreground_id_wins_over_the_runs_it_is_a_prefix_of() {
+        let fx = Fixture::new();
+        let source = FakeForegroundRuns::default();
+        source.set(vec![
+            foreground_run("run-1", "session-a", "detached"),
+            foreground_run("run-10", "session-a", "detached"),
+        ]);
+        let waits = UserInputWaits::default();
+        let wait = waits.open();
+        let mut deps = fx.deps(true).with_user_input(Some(wait.token()));
+        deps.session_id = Some("session-a".to_string());
+        deps.poll_interval = Duration::from_secs(30);
+        deps.detached_foreground = Some(source.hook());
+        let sender = {
+            let waits = waits.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                waits.on_input(
+                    cyrup_ext::InputEventSource::Interactive,
+                    Some(cyrup_ext::InputStreamingBehavior::Steer),
+                )
+            })
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(
+                &WaitParams {
+                    id: Some("run-1".to_string()),
+                    timeout_ms: Some(6_000),
+                    ..WaitParams::default()
+                },
+                &CancelToken::new(),
+                &deps,
+            ),
+        )
+        .await
+        .expect("the steer ends the wait");
+        assert_eq!(sender.await.expect("sender task"), 1);
+
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::UserInput {
+                active_run_ids: vec!["run-1".to_string()],
+            }
+        );
+    }
+
+    /// SUBA-237 — pi `subagent-wait.ts:704-708` @ad11b7ab: a prefix that matches two detached
+    /// foreground runs and no exact id is REFUSED with upstream's text — blocking and non-blocking
+    /// alike, before either arm can wait on or arm anything.
+    ///
+    /// **Gutting mutations this fails on:** drop the refusal — the blocking call then waits on
+    /// both runs until its window (`WindowElapsed`), and the non-blocking call arms `fg-a1`
+    /// (`SubscriptionArmed`, with a record on disk).
+    #[tokio::test]
+    async fn an_ambiguous_foreground_prefix_is_refused_with_upstreams_text() {
+        let fx = Fixture::new();
+        let subs = fx.async_root.parent().expect("temp root").join("subs");
+        let source = FakeForegroundRuns::default();
+        source.set(vec![
+            foreground_run("fg-a1", "session-a", "detached"),
+            foreground_run("fg-a2", "session-a", "detached"),
+        ]);
+        let manager = subscription_manager(&fx, &subs, Some("session-a"));
+        let mut deps = fx.deps(true);
+        deps.session_id = Some("session-a".to_string());
+        deps.poll_interval = Duration::from_secs(30);
+        deps.detached_foreground = Some(source.hook());
+        let arming: std::sync::Arc<dyn WaitSubscriptionArming> = manager;
+        deps.subscribe = Some(WaitSubscribeHook::new(arming));
+        let refusal = "Ambiguous subagent run id prefix \"fg-a\" matched 2 runs: fg-a1, fg-a2. \
+                       Pass a longer id.";
+
+        for non_blocking in [None, Some(true)] {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_for_subagents(
+                    &WaitParams {
+                        id: Some("fg-a".to_string()),
+                        non_blocking,
+                        timeout_ms: Some(2_000),
+                        ..WaitParams::default()
+                    },
+                    &CancelToken::new(),
+                    &deps,
+                ),
+            )
+            .await
+            .expect("a refusal returns at once");
+            assert_eq!(
+                outcome.verdict,
+                WaitVerdict::AmbiguousId,
+                "non_blocking {non_blocking:?}: {}",
+                outcome.text
+            );
+            assert!(outcome.is_error());
+            assert_eq!(outcome.text, refusal, "non_blocking {non_blocking:?}");
+        }
+        let armed = std::fs::read_dir(&subs).map_or(0, std::iter::Iterator::count);
+        assert_eq!(armed, 0, "an ambiguous prefix arms nothing");
+    }
+
+    /// pi `subagent-wait.ts:635-645` @ad11b7ab: a window that elapses over SEVERAL detached
+    /// foreground runs (`{ all: true }`) names every one still detached, not only the run the
+    /// loop happened to be on when the window closed.
+    ///
+    /// **Gutting mutation this fails on:** return the single run's own window result unchanged —
+    /// the ids then name `fg-w1` alone.
+    #[tokio::test]
+    async fn a_window_over_several_foreground_runs_names_every_one_still_detached() {
+        let fx = Fixture::new();
+        let source = FakeForegroundRuns::default();
+        source.set(vec![
+            foreground_run("fg-w1", "session-a", "detached"),
+            foreground_run("fg-w2", "session-a", "detached"),
+        ]);
+        let mut deps = fx.deps(true);
+        deps.session_id = Some("session-a".to_string());
+        deps.detached_foreground = Some(source.hook());
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_subagents(
+                &WaitParams {
+                    all: Some(true),
+                    timeout_ms: Some(400),
+                    ..WaitParams::default()
+                },
+                &CancelToken::new(),
+                &deps,
+            ),
+        )
+        .await
+        .expect("the window closes");
+        assert!(!outcome.is_error(), "{}", outcome.text);
+        assert_eq!(
+            outcome.verdict,
+            WaitVerdict::WindowElapsed {
+                active_run_ids: vec!["fg-w1".to_string(), "fg-w2".to_string()],
+            }
+        );
     }
 }
