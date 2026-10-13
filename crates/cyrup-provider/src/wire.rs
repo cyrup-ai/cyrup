@@ -93,6 +93,11 @@ pub struct WireProvider {
     /// `model.api` reports (PROV-157). [`ApiDispatch::Own`] unless the constructing site declares
     /// otherwise.
     api_dispatch: ApiDispatch,
+    /// SEAM-173 — [`WireProvider::operations_base`] encapsulates its own auth (it has no
+    /// [`Provider::provider_auth`]) and the layer composed over it configures none, so a model the
+    /// base answers streams through it UNRESOLVED and this provider has no auth strategy either
+    /// ([`WireProvider::with_auth_from_base`]).
+    auth_from_base: bool,
 }
 
 /// Which of pi's two api lookups a [`WireProvider`]'s [`ApiRegistry`] stands for — and so which of
@@ -179,6 +184,7 @@ impl WireProvider {
             operations_base: None,
             refresh_update: None,
             api_dispatch: ApiDispatch::Own,
+            auth_from_base: false,
         }
     }
 
@@ -276,6 +282,25 @@ impl WireProvider {
     #[must_use]
     pub fn with_operations_from(mut self, base: Arc<dyn Provider>) -> Self {
         self.operations_base = Some(base);
+        self
+    }
+
+    /// SEAM-173, `[CYRUP-DELTA]` in mechanism — the base this provider was composed over
+    /// ([`Self::with_operations_from`]) carries its auth inside itself, and the layer adds none.
+    ///
+    /// cyrup's [`Provider::provider_auth`] is optional: `None` is a provider that "fully
+    /// encapsulates its own auth", which a [`crate::Models`] collection streams without
+    /// re-resolution — an embedder's own provider, the offline faux. pi has no such provider (every
+    /// `Provider` carries `auth`), so `composeApiKeyAuth` always has a base strategy to inherit
+    /// (`provider-composer.ts:417-455` @f1b2e77f5). Composing a configured-key strategy over a
+    /// base that has none would refuse every request the base used to stream (`Provider is not
+    /// configured`) — the layer would change what the provider can do, which a composition never
+    /// does (`compose.rs`). So: a model the base answers streams through the base as is, and this
+    /// provider answers `provider_auth() == None`, the same encapsulation its base declares. A
+    /// model the base does not answer still resolves this provider's own auth.
+    #[must_use]
+    pub fn with_auth_from_base(mut self) -> Self {
+        self.auth_from_base = true;
         self
     }
 
@@ -459,7 +484,7 @@ impl Provider for WireProvider {
     }
 
     fn provider_auth(&self) -> Option<&ProviderAuth> {
-        Some(&self.auth)
+        (!self.auth_from_base).then_some(&self.auth)
     }
 
     /// pi's composed `refreshModels` (`provider-composer.ts:613-635` @f1b2e77f5): the base's own
@@ -520,6 +545,11 @@ impl Provider for WireProvider {
         // (`supportsBaseApi`, `provider-composer.ts:582`, `:593-596` @f1b2e77f5), reading the base's
         // live catalog per request; only the rest fall through to the registry. PROV-162.
         let through_base = self.base_for(model);
+        if self.auth_from_base
+            && let Some(base) = &through_base
+        {
+            return base.stream(model, context, options);
+        }
         let model = model.clone();
         let context = context.clone();
         let options = options.clone();
@@ -611,6 +641,9 @@ impl Provider for WireProvider {
             }
             return self.stream(model, context, &lowered);
         };
+        if self.auth_from_base {
+            return base.stream_simple(model, context, options);
+        }
         let (sink, rx) = channel(STREAM_BUFFER);
         let id = self.id.clone();
         let auth = self.auth.clone();

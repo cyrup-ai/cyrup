@@ -480,6 +480,11 @@ pub fn compose_over_base(
         provider = provider.with_auth_context(ctx);
     }
     if let Some(base) = base {
+        // SEAM-173 — a base that encapsulates its own auth, under a layer that configures none,
+        // keeps doing so (see `WireProvider::with_auth_from_base`).
+        if base.provider_auth().is_none() && layer_configures_no_auth(&layer.auth) {
+            provider = provider.with_auth_from_base();
+        }
         // Pi `headers: base?.headers` (provider-composer.ts:609).
         if let Some(headers) = base.headers() {
             provider = provider.with_headers(headers.clone());
@@ -490,6 +495,15 @@ pub fn compose_over_base(
         provider = provider.with_operations_from(base);
     }
     Ok(provider)
+}
+
+/// Whether `layer` configures no auth input at all: no key, no header of either scope, no
+/// `authHeader`.
+fn layer_configures_no_auth(layer: &AuthLayer) -> bool {
+    layer.api_key.is_none()
+        && layer.headers.is_none()
+        && layer.model_headers.is_empty()
+        && !layer.auth_header
 }
 
 /// Pi `findExtensionModelDefaults` (provider-composer.ts:261-273 @f1b2e77f5) for a chat

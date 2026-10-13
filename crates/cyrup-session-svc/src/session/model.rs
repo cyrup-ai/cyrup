@@ -1424,7 +1424,7 @@ impl AgentSession {
 /// |---|---|
 /// | guest | the registration's alone (PROV-162; rule 2 below) |
 /// | the session's own built-in | the provider's rows, which ARE the compiled-in rows over this `overlay` (it is rebuilt over the overlay before it is read, `follow_installed_builtin`), plus any the provider alone carries |
-/// | an embedder's | the provider's rows alone: the compiled-in rows of the id are NOT filled in, since selecting one would stream the provider's first row |
+/// | an embedder's | the provider's rows alone: the compiled-in rows of the id are NOT filled in, since selecting one would stream the provider's first row. The provider itself carries the id's `models.json` block (SEAM-173: composed over it as it reaches the slot, `GuestProviderRegistry::follow_installed` / `ProviderSwap`'s resolver arrival), so the top layer below re-applies a block its rows already carry — the same rows, as for the session's own built-in |
 ///
 /// **The dedupe is first-wins, in this order, and these are the rows that depend on it**
 /// (SEAM-168, enumerated):

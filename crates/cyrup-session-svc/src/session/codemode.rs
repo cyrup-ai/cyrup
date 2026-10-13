@@ -227,6 +227,15 @@ impl AgentSession {
         Ok(())
     }
 
+    /// The registry [`SessionCodemodeHost::models`] composes for the session as it stands now — the
+    /// same two reads (`provider.current()`, the overlay slot), uncached. Tests compare it with
+    /// `/model` (SEAM-173).
+    #[cfg(test)]
+    pub(crate) fn codemode_models_now(&self) -> Models {
+        let installed = self.provider.current();
+        self.compose_codemode_models(&installed, self.services.catalog_overlay.load())
+    }
+
     /// The registry the script `models` globals call: the composed built-in registry (the pi.dev
     /// overlay and `models.json` over the compiled-in catalogs) with the session's credentials,
     /// the guest-registered providers, and the session's own installed provider on top —
