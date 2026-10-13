@@ -69,7 +69,8 @@ fn push_startup_warnings(
 ///    [`App::render_initial_messages`]: the `--resume`/`--continue` replay, the untrusted-project
 ///    banner, `Session compacted N times`;
 /// 2. `run()`'s startup-warning block (`:1120-1161`) — [`push_startup_warnings`] (the merged
-///    startup diagnostics, then the migrated-credential notice) and the `modelFallbackMessage`
+///    startup diagnostics, then the migrated-credential notice), the `models.json error:` line
+///    (SEAM-150, `:1211-1214` @f1b2e77f5) and the `modelFallbackMessage`
 ///    warning (`:1149-1151`); on a credential-less start that is `formatNoModelsAvailableMessage()`,
 ///    the instruction that turns a modelless launch (SEAM-075) into a working session;
 /// 3. the CLI's initial message (`:1164-1166`), when there is one.
@@ -109,6 +110,11 @@ pub(crate) async fn render_boot_transcript<B: cyrup_tui::RebuildBackend>(
         startup_diagnostics,
         migrated_providers,
     );
+    // SEAM-150 — `const modelsJsonError = this.session.modelRuntime.getError(); if (modelsJsonError)
+    // this.showError(`models.json error: ${modelsJsonError}`)` (`interactive-mode.ts:1211-1214`
+    // @f1b2e77f5): after the diagnostics and the migrated-credential notice, before the
+    // model-fallback warning. Carries `Availability refresh: …` for a failing live-provider check.
+    app.show_models_json_error(session);
     if let Some(msg) = model_fallback_message {
         app.state_mut().transcript.show_warning(msg);
     }

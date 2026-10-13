@@ -284,3 +284,113 @@ async fn list_models_warns_about_a_failing_live_auth_check() {
     assert!(warning.contains("probe-llm"), "{warning}");
     assert!(warning.contains("server probe refused"), "{warning}");
 }
+
+/// A real session whose live provider `probe-llm`'s auth check always fails (the fixture above).
+async fn failing_probe_session() -> (tempfile::TempDir, Arc<AgentSession>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let auth =
+        Arc::new(AuthStore::at(agent_dir.join("auth.json")).with_ambient_env(HashMap::new()));
+    let mut config = SessionConfig::new(cwd, agent_dir);
+    config.trust_override = Some(true);
+    config.no_extensions = true;
+    let reg = cyrup_ext::provider::ProviderRegistration {
+        id: "probe-llm".to_string(),
+        config: serde_json::from_value(serde_json::json!({
+            "name": "probe-llm",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "api": "openai-completions",
+            "models": [{ "id": "tiny", "name": "tiny" }],
+        }))
+        .unwrap(),
+        resolved_api_key: None,
+    };
+    let live: Arc<dyn Provider> = Arc::new(ProbeProvider {
+        id: cyrup_sdk::core::ProviderId::from("probe-llm"),
+        auth: cyrup_provider::auth::ProviderAuth::with_api_key(Arc::new(FailingCheck)),
+        models: reg.build_models(),
+    });
+    let session = SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, config)
+        .auth(auth)
+        .with_native_extension(Arc::new(ProbeExt(live)) as Arc<dyn cyrup_ext::NativeExtension>)
+        .build()
+        .await
+        .unwrap();
+    (tmp, Arc::new(session))
+}
+
+/// **SEAM-150, the startup consumer.** pi's `run()` follows the startup diagnostics and the
+/// migrated-credential notice with `const modelsJsonError = this.session.modelRuntime.getError();
+/// if (modelsJsonError) this.showError(`models.json error: ${modelsJsonError}`)`, then the
+/// model-fallback warning (`interactive-mode.ts:1203-1218` @f1b2e77f5). With a live provider whose
+/// check fails, the boot transcript carries `Error: models.json error: Availability refresh: …`
+/// (the `Error: ` is `showError`'s, `:4623-4626`) in exactly that slot.
+///
+/// RED with the boot call removed (HEAD): `no models.json error line in [...]`; red with it moved
+/// after the fallback warning (the order assertion); red when `models_json_error` skips its catalog
+/// read (no check has run on this session yet, so `getError()` is still empty).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_boot_transcript_shows_a_failing_live_auth_check_as_a_models_json_error() {
+    use cyrup_tui::{App, Entry, UiTheme};
+    let (_tmp, session) = failing_probe_session().await;
+    let mut app = App::new(ratatui::backend::TestBackend::new(100, 30), UiTheme::dark()).unwrap();
+    crate::interactive::render_boot_transcript(
+        &mut app,
+        &session,
+        &[],
+        &["anthropic".to_string()],
+        Some("No models available.".to_string()),
+        None,
+    )
+    .await;
+    let got: Vec<String> = app
+        .state()
+        .transcript
+        .pending()
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Warning(w) => Some(format!("warning|{w}")),
+            Entry::Error(e) => Some(format!("error|{e}")),
+            _ => None,
+        })
+        .collect();
+    let error = got
+        .iter()
+        .position(|l| l.starts_with("error|Error: models.json error: Availability refresh: "))
+        .unwrap_or_else(|| panic!("no models.json error line in {got:#?}"));
+    assert!(got[error].contains("probe-llm"), "{got:#?}");
+    assert!(got[error].contains("server probe refused"), "{got:#?}");
+    let migrated = got
+        .iter()
+        .position(|l| l == "warning|Warning: Migrated credentials to auth.json: anthropic")
+        .unwrap();
+    let fallback = got
+        .iter()
+        .position(|l| l == "warning|Warning: No models available.")
+        .unwrap();
+    assert!(migrated < error && error < fallback, "pi's order: {got:#?}");
+}
+
+/// SEAM-150 startup control: a session with no `getError()` boots with no `models.json error:`
+/// line. Non-regression guard: green at HEAD; red under the mutation "`models_json_error` always
+/// answers a line".
+#[tokio::test]
+async fn a_clean_boot_transcript_has_no_models_json_error() {
+    use cyrup_tui::{App, Entry, UiTheme};
+    let fx = fixture(&[]).await;
+    let session = Arc::new(fx.session);
+    let mut app = App::new(ratatui::backend::TestBackend::new(100, 30), UiTheme::dark()).unwrap();
+    crate::interactive::render_boot_transcript(&mut app, &session, &[], &[], None, None).await;
+    assert!(
+        !app.state()
+            .transcript
+            .pending()
+            .iter()
+            .any(|e| matches!(e, Entry::Error(t) if t.contains("models.json error"))),
+        "{:#?}",
+        app.state().transcript.pending()
+    );
+}

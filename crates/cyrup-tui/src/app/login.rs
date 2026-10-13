@@ -556,7 +556,7 @@ impl<B: Backend> App<B> {
             // `showAmbientAuthDialog(providerOption)` (`:5023`, `:5229-5250`): a dialog with a
             // single info line and a close hint. Nothing to run, so no task is spawned.
             LoginStep::Ambient { title, message, .. } => {
-                self.open_login_dialog(title);
+                self.open_login_dialog(title, option.id.as_str());
                 if let Some(dialog) = self.login_dialog_mut() {
                     dialog.show_info(&message, &[], true);
                 }
@@ -573,7 +573,7 @@ impl<B: Backend> App<B> {
                 };
                 // `new LoginDialogComponent(ui, providerId, …, providerName)` → title
                 // `` `Login to ${providerName}` `` (`login-dialog.ts:41`).
-                self.open_login_dialog(format!("Login to {name}"));
+                self.open_login_dialog(format!("Login to {name}"), id.as_str());
                 // `dialog.signal` — the dialog's own AbortController (`login-dialog.ts:73-75`).
                 let cancel = CancelToken::new();
                 self.state.login_cancel = Some(cancel.clone());
@@ -650,15 +650,20 @@ impl<B: Backend> App<B> {
     /// The copy key is the LIVE `app.message.copy` binding (`login-dialog.ts:230` @v1.1.0 reads
     /// `getKeybindings()` per keystroke; the dialog lives for one login, so its open is per-login
     /// enough).
-    fn open_login_dialog(&mut self, title: impl Into<String>) {
-        let dialog = LoginDialog::new(title, &self.state.select_keymap).with_copy_keys(
-            self.state
-                .keymap
-                .keys_for(crate::keymap::Action::MessageCopy),
-            self.state
-                .keymap
-                .keys_label(crate::keymap::Action::MessageCopy),
-        );
+    ///
+    /// `provider_id` is the dialog's `providerId` (`login-dialog.ts:35`), which its auth prompts
+    /// are shown against (TUI-186).
+    fn open_login_dialog(&mut self, title: impl Into<String>, provider_id: &str) {
+        let dialog = LoginDialog::new(title, &self.state.select_keymap)
+            .with_provider_id(provider_id)
+            .with_copy_keys(
+                self.state
+                    .keymap
+                    .keys_for(crate::keymap::Action::MessageCopy),
+                self.state
+                    .keymap
+                    .keys_label(crate::keymap::Action::MessageCopy),
+            );
         self.open_boxed_selector(SelectorKind::LoginDialog, Box::new(dialog));
     }
 
@@ -691,7 +696,10 @@ impl<B: Backend> App<B> {
                     let _ = reply.send(Err(OAuthError::Cancelled));
                     return;
                 };
-                show_auth_prompt(dialog, &prompt);
+                // `showAuthPrompt(dialog, prompt, providerId)` (`interactive-mode.ts:6278`
+                // @f1b2e77f5): the dialog carries the id it was opened for (TUI-186).
+                let provider_id = dialog.provider_id().to_string();
+                show_auth_prompt(dialog, &prompt, &provider_id);
                 // A previous prompt still pending would be a flow bug, but resolving it as
                 // cancelled is strictly better than leaking the sender (which would hang the flow).
                 if let Some(stale) = self.state.pending_login_prompt.replace(reply) {
