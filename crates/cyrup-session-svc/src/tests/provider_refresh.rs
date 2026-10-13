@@ -200,7 +200,7 @@ fn phases(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<bool> {
 }
 
 fn registry_over(store: Arc<dyn ModelsStore>) -> Arc<GuestProviderRegistry> {
-    let registry = Arc::new(GuestProviderRegistry::new());
+    let registry = GuestProviderRegistry::new();
     registry.attach_models_store(store);
     registry
 }
@@ -2761,7 +2761,9 @@ async fn a_removal_between_the_publication_check_and_its_update_is_not_undone_by
     let registry = registry_over(Arc::new(InMemoryModelsStore::new()));
     let (stale, published) = stale_after(
         &registry,
-        Arc::new(|r: &GuestProviderRegistry| r.remove_provider(LLAMA)),
+        Arc::new(|r: &GuestProviderRegistry| {
+            let _ = r.remove_provider(LLAMA);
+        }),
     );
     let (provider, _) = scripted(LLAMA, &["boot"], None, stale);
     register(&registry, provider);
@@ -2790,6 +2792,83 @@ async fn an_unsuperseded_publication_reports_that_it_landed() {
 
     assert_eq!(ids(&registry.models()), vec!["stale".to_string()]);
     assert_eq!(*published.lock().unwrap(), Some(Ok(true)));
+}
+
+/// SEAM-151, the hub half — a publication superseded inside its own `update` changes NOTHING in the
+/// extension host's provider hub either: its re-registration goes through
+/// [`cyrup_ext::provider::ProviderHub::register_live`], the path a native's `update` takes
+/// (`LateRegistrar::register_provider_live` → `ExtensionRegistry::register_provider_live`), and the
+/// hub's `live` map must still hold the NEWER provider afterwards, as this registry does. pi has no
+/// second copy to go stale: a stale publication's `update` never runs (`packages/ai/src/models.ts:521-522`
+/// @f1b2e77f5).
+///
+/// The supersession is injected, not timed: the update itself lets a competing re-registration run
+/// to completion on a scoped thread (a genuine outside writer, since `PUBLISHING` is a thread-local)
+/// before making its own write, which places it exactly between `publish_queued`'s last check and
+/// the gate.
+///
+/// RED at `4f522804b`: `register_live` stored the stale provider in `live` before the sink refused
+/// it, so the hub held `stale` while the registry held `newer`.
+#[tokio::test]
+async fn a_superseded_publication_leaves_the_hubs_live_provider_as_the_newer_one() {
+    let registry = registry_over(Arc::new(InMemoryModelsStore::new()));
+    let hub = Arc::new(Mutex::new(cyrup_ext::provider::ProviderHub::new()));
+    hub.lock().unwrap().bind(registry.clone());
+    let newer = plain_provider(LLAMA, &["newer"]);
+    let stale_update = {
+        let hub = Arc::clone(&hub);
+        let newer = Arc::clone(&newer);
+        script(move |ctx| {
+            let hub = Arc::clone(&hub);
+            let newer = Arc::clone(&newer);
+            Box::pin(async move {
+                let _ = ctx
+                    .publish(ModelsPublication {
+                        persist: None,
+                        update: Some(Box::new(move || {
+                            std::thread::scope(|s| {
+                                s.spawn(|| {
+                                    let _ = hub
+                                        .lock()
+                                        .unwrap()
+                                        .register_live(LLAMA.to_string(), Arc::clone(&newer))
+                                        .unwrap();
+                                })
+                                .join()
+                                .unwrap();
+                            });
+                            let _ = hub
+                                .lock()
+                                .unwrap()
+                                .register_live(LLAMA.to_string(), plain_provider(LLAMA, &["stale"]))
+                                .unwrap();
+                        })),
+                    })
+                    .await;
+                Ok(())
+            })
+        })
+    };
+    let (provider, _) = scripted(LLAMA, &["boot"], None, stale_update);
+    let _ = hub
+        .lock()
+        .unwrap()
+        .register_live(LLAMA.to_string(), provider)
+        .unwrap();
+
+    let _ = registry.refresh(request(Some(&[LLAMA]), Some(false))).await;
+    settle(&registry).await;
+
+    assert!(
+        Arc::ptr_eq(&registry.provider(LLAMA).unwrap(), &newer),
+        "the registry holds the newer provider (SEAM-145)"
+    );
+    let live = hub.lock().unwrap().live_provider(LLAMA).unwrap();
+    assert!(
+        Arc::ptr_eq(&live, &newer),
+        "the stale update replaced the hub's live provider with {:?}",
+        ids(live.models())
+    );
 }
 
 // -------------------------------------------------------------------------------------------------

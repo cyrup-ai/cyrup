@@ -26,7 +26,7 @@ use crate::images::{
     AssistantImages, ImageApiRegistry, ImagesContext, ImagesOptions, ProviderImages,
 };
 use crate::model::Model;
-use crate::provider::Provider;
+use crate::provider::{ModelsPublication, Provider, RefreshModelsContext};
 use crate::stream::{StreamEvent, StreamOptions};
 use crate::utils::simple_options::{SimpleStreamOptions, build_base_options};
 use cyrup_core::{ApiId, EventStream, ProviderId};
@@ -86,6 +86,9 @@ pub struct WireProvider {
     /// operations. When set, it answers the image and classifier operations INSTEAD of
     /// `images` and `classifiers`.
     operations_base: Option<Arc<dyn Provider>>,
+    /// What this provider publishes as its `update` after [`WireProvider::operations_base`]
+    /// refreshed ([`WireProvider::with_refresh_update`], PROV-164).
+    refresh_update: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Which of pi's two api lookups [`WireProvider::registry`] stands for, and so what a miss on
     /// `model.api` reports (PROV-157). [`ApiDispatch::Own`] unless the constructing site declares
     /// otherwise.
@@ -174,6 +177,7 @@ impl WireProvider {
             classifier_models: Vec::new(),
             classifiers: None,
             operations_base: None,
+            refresh_update: None,
             api_dispatch: ApiDispatch::Own,
         }
     }
@@ -265,9 +269,26 @@ impl WireProvider {
     /// undefined` and the same for `filterAllModels` (`provider-composer.ts:636-641` @f1b2e77f5),
     /// so [`Provider::filter_models`] and [`Provider::filter_all_models`] answer with `base`'s
     /// (PROV-147; `CFG-112` for the chat filter, which the composer dropped before).
+    ///
+    /// And its catalog refresh: the composed provider refreshes exactly when `base` does (pi
+    /// `refreshModels: base?.refreshModels || …`, `provider-composer.ts:613` @f1b2e77f5), by running
+    /// `base`'s refresh (PROV-164; see [`Provider::refresh_models`] below).
     #[must_use]
     pub fn with_operations_from(mut self, base: Arc<dyn Provider>) -> Self {
         self.operations_base = Some(base);
+        self
+    }
+
+    /// What this provider publishes as its own `update` after the base it was composed over
+    /// ([`Self::with_operations_from`]) refreshed — pi's composed `refreshModels` runs
+    /// `await base?.refreshModels?.(context)` and then `context.publish({ update })`
+    /// (`provider-composer.ts:613-635` @f1b2e77f5), after which its `getAllModels` reads the
+    /// refreshed base. A cyrup provider's rows are an immutable borrow, so the update that makes a
+    /// refreshed base show is a re-composition over it, which only the composition's owner can make:
+    /// it hands that in here. Without one, a refresh still runs the base's. PROV-164.
+    #[must_use]
+    pub fn with_refresh_update(mut self, update: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.refresh_update = Some(update);
         self
     }
 
@@ -439,6 +460,45 @@ impl Provider for WireProvider {
 
     fn provider_auth(&self) -> Option<&ProviderAuth> {
         Some(&self.auth)
+    }
+
+    /// pi's composed `refreshModels` (`provider-composer.ts:613-635` @f1b2e77f5): the base's own
+    /// refresh with THIS refresh's context (so its publications are this id's and are gated as
+    /// such), then — unless the refresh was aborted (`if (context.signal.aborted) return;`,
+    /// `:619`) — this provider's own publication of [`Self::with_refresh_update`]'s update. `None`:
+    /// no base, or a base that does not refresh. PROV-164.
+    async fn refresh_models(
+        &self,
+        ctx: &RefreshModelsContext,
+    ) -> Option<Result<(), ProviderError>> {
+        let base = self.operations_base.as_ref()?;
+        if let Err(error) = base.refresh_models(ctx).await? {
+            return Some(Err(error));
+        }
+        if ctx.is_aborted() {
+            return Some(Ok(()));
+        }
+        if let Some(update) = &self.refresh_update {
+            let update = Arc::clone(update);
+            let published = ctx
+                .publish(ModelsPublication {
+                    persist: None,
+                    update: Some(Box::new(move || update())),
+                })
+                .await;
+            if let Err(error) = published {
+                return Some(Err(error));
+            }
+        }
+        Some(Ok(()))
+    }
+
+    /// Forwarded with [`Self::refresh_models`]: refreshable exactly when the base is (pi
+    /// `base?.refreshModels || …`, `provider-composer.ts:613`). PROV-164.
+    fn has_refresh_models(&self) -> bool {
+        self.operations_base
+            .as_ref()
+            .is_some_and(|base| base.has_refresh_models())
     }
 
     fn stream(

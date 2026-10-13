@@ -252,8 +252,8 @@ pub use nested::{
     callable_tools_json, tool_update_json,
 };
 pub use provider::{
-    ModelCost, ModelCostTier, ModelRegistrySink, ProviderConfig, ProviderHub, ProviderModelConfig,
-    ProviderRegistration, resolve_api_key,
+    ComposeOptions, ModelCost, ModelCostTier, ModelRegistrySink, ProviderConfig, ProviderHub,
+    ProviderModelConfig, ProviderRegistration, ProviderWrite, resolve_api_key,
 };
 pub use registry::{
     CommandDescriptor, ExecModeWire, ExtensionConflict, ExtensionFlagDeclaration,

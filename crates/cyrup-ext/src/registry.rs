@@ -1528,7 +1528,8 @@ impl ExtensionRegistry {
     /// Register a custom LLM provider (R-08-019; A-08-7). Parses the typed config, resolves the API
     /// key (env / `!command` / literal), and routes it through the [`ProviderHub`] (immediate upsert
     /// if the model registry is bound, else queued for the next bind). A parse/resolution failure is
-    /// surfaced as a typed error, never a panic.
+    /// surfaced as a typed error, never a panic. The id's owner becomes `owner` only if the write
+    /// landed: a superseded publication's re-registration changes no owner (SEAM-151).
     pub fn register_provider(
         &self,
         owner: ExtensionId,
@@ -1537,10 +1538,13 @@ impl ExtensionRegistry {
     ) -> Result<(), ExtError> {
         let id = id.into();
         let mut g = self.lock_write()?;
-        g.provider_hub
+        let write = g
+            .provider_hub
             .register(id.clone(), &config)
             .map_err(ExtError::Component)?;
-        g.provider_owner.insert(id, owner);
+        if write.landed() {
+            g.provider_owner.insert(id, owner);
+        }
         Ok(())
     }
 
@@ -1551,19 +1555,26 @@ impl ExtensionRegistry {
     /// owner becomes `owner` (last registration wins, exactly as the JSON door does) — so
     /// [`Self::purge_owner`] drops it with the rest of the owner's registrations. Re-registering an
     /// id REPLACES the previous provider, which is how a native swaps a catalog after startup.
+    ///
+    /// Answers whether the write landed ([`crate::provider::ProviderWrite`]): a native's catalog
+    /// publication superseded mid-flight re-registers through here, is refused by the model
+    /// registry, and then changes no owner here and nothing in the native either (SEAM-151).
     pub fn register_provider_live(
         &self,
         owner: ExtensionId,
         id: impl Into<String>,
         provider: Arc<dyn cyrup_provider::Provider>,
-    ) -> Result<(), ExtError> {
+    ) -> Result<crate::provider::ProviderWrite, ExtError> {
         let id = id.into();
         let mut g = self.lock_write()?;
-        g.provider_hub
+        let write = g
+            .provider_hub
             .register_live(id.clone(), provider)
             .map_err(ExtError::Component)?;
-        g.provider_owner.insert(id, owner);
-        Ok(())
+        if write.landed() {
+            g.provider_owner.insert(id, owner);
+        }
+        Ok(write)
     }
 
     /// Register (or replace) a VIRTUAL model — pi `pi.registerVirtualModel`
@@ -1900,10 +1911,15 @@ impl ExtensionRegistry {
         dropped
     }
 
+    /// Unregister a provider. Its owner is forgotten only once the removal landed: a removal the
+    /// model registry refused as a superseded publication's leaves both in place (SEAM-151).
     pub fn unregister_provider(&self, id: &str) -> Result<bool, ExtError> {
         let mut g = self.lock_write()?;
-        g.provider_owner.remove(id);
-        Ok(g.provider_hub.unregister(id))
+        let removed = g.provider_hub.unregister(id);
+        if removed {
+            g.provider_owner.remove(id);
+        }
+        Ok(removed)
     }
 
     /// [`Self::unregister_provider`], but only when `owner` is the id's CURRENT owner; a provider
@@ -1919,8 +1935,11 @@ impl ExtensionRegistry {
         if g.provider_owner.get(id) != Some(owner) {
             return Ok(false);
         }
-        g.provider_owner.remove(id);
-        Ok(g.provider_hub.unregister(id))
+        let removed = g.provider_hub.unregister(id);
+        if removed {
+            g.provider_owner.remove(id);
+        }
+        Ok(removed)
     }
 
     /// Bind the model-registry sink and flush queued provider AND virtual-model registrations (Pi

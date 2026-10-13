@@ -521,7 +521,8 @@ mod decision_models {
     }
 
     fn controller() -> LlamaController {
-        let register: RegisterProviderFn = Arc::new(|_: Arc<dyn Provider>| Ok(()));
+        let register: RegisterProviderFn =
+            Arc::new(|_: Arc<dyn Provider>| Ok(cyrup_ext::ProviderWrite::Landed));
         LlamaController::new(LlamaControllerOptions::new(
             Arc::new(InMemoryCredentialStore::new()),
             register,

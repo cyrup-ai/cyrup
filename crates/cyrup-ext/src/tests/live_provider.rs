@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::provider::{ModelRegistrySink, ProviderRegistration};
+use crate::provider::{ModelRegistrySink, ProviderRegistration, ProviderWrite};
 use crate::registry::ExtensionRegistry;
 use crate::{
     ExtError, ExtMode, ExtensionHost, HookOutcome, HostConfig, HostCtx, HostEvent, InitApi,
@@ -66,23 +66,26 @@ impl Sink {
 }
 
 impl ModelRegistrySink for Sink {
-    fn upsert_provider(&self, reg: &ProviderRegistration) {
+    fn upsert_provider(&self, reg: &ProviderRegistration) -> ProviderWrite {
         self.live.lock().unwrap().remove(&reg.id);
         self.events
             .lock()
             .unwrap()
             .push(format!("upsert:{}", reg.id));
+        ProviderWrite::Landed
     }
-    fn upsert_live_provider(&self, id: &str, provider: Arc<dyn Provider>) {
+    fn upsert_live_provider(&self, id: &str, provider: Arc<dyn Provider>) -> ProviderWrite {
         self.live.lock().unwrap().insert(id.to_string(), provider);
         self.events
             .lock()
             .unwrap()
             .push(format!("upsert-live:{id}"));
+        ProviderWrite::Landed
     }
-    fn remove_provider(&self, id: &str) {
+    fn remove_provider(&self, id: &str) -> ProviderWrite {
         self.live.lock().unwrap().remove(id);
         self.events.lock().unwrap().push(format!("remove:{id}"));
+        ProviderWrite::Landed
     }
     fn upsert_virtual_model(
         &self,

@@ -260,7 +260,7 @@ fn futures_empty() -> impl futures::Stream<Item = StreamEvent> {
 
 fn registry() -> (Arc<GuestProviderRegistry>, Arc<Mutex<Vec<bool>>>) {
     let phases = Arc::new(Mutex::new(Vec::new()));
-    let registry = Arc::new(GuestProviderRegistry::new());
+    let registry = GuestProviderRegistry::new();
     registry.upsert_live_provider(
         "llama.cpp",
         Arc::new(Recording {
@@ -367,7 +367,7 @@ impl Provider for BlockedUntilAborted {
 #[tokio::test(start_paused = true)]
 async fn a_blocked_extension_refresh_is_aborted_after_fifteen_seconds() {
     let saw_abort = Arc::new(Mutex::new(false));
-    let registry = Arc::new(GuestProviderRegistry::new());
+    let registry = GuestProviderRegistry::new();
     registry.upsert_live_provider(
         "llama.cpp",
         Arc::new(BlockedUntilAborted {

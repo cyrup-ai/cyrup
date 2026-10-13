@@ -252,7 +252,7 @@ async fn refresh_through_the_host(
     let controller = LlamaController::new(
         LlamaControllerOptions::new(
             Arc::new(InMemoryCredentialStore::new()),
-            Arc::new(|_provider| Ok(())),
+            Arc::new(|_provider| Ok(cyrup_ext::ProviderWrite::Landed)),
         )
         .with_refresh_host(Arc::new(ContextRefreshHost) as Arc<dyn LlamaRefreshHost>),
     );

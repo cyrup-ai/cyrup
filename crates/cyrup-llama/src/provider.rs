@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use cyrup_core::{CancelToken, EventStream, ProviderId};
+use cyrup_ext::provider::ProviderWrite;
 use cyrup_provider::Provider;
 use cyrup_provider::api::llama_cpp_classify::llama_cpp_classify_api;
 use cyrup_provider::api::typesafe_system_one::typesafe_system_one_api;
@@ -782,8 +783,11 @@ pub struct SetCatalogOptions {
 
 /// Hands a freshly built provider to the host, replacing the one registered under
 /// [`LLAMA_PROVIDER_ID`] (`LateRegistrar::register_provider_live` in `cyrup-ext`). An `Err` is the
-/// host's refusal text.
-pub type RegisterProviderFn = Arc<dyn Fn(Arc<dyn Provider>) -> Result<(), String> + Send + Sync>;
+/// host's refusal text; `Ok` says whether the write landed: a catalog publication superseded while
+/// its `update` ran answers [`ProviderWrite::Superseded`], and the controller then keeps the
+/// provider it had (SEAM-151).
+pub type RegisterProviderFn =
+    Arc<dyn Fn(Arc<dyn Provider>) -> Result<ProviderWrite, String> + Send + Sync>;
 
 /// How a [`LlamaController`] is built.
 pub struct LlamaControllerOptions {
@@ -846,7 +850,7 @@ struct ControllerShared {
     parts: Parts,
     register: RegisterProviderFn,
     /// Serialises [`Self::try_install`]: `current` and the provider the host registered are two
-    /// copies of one fact, so the write of one and the hand-off of the other must not interleave
+    /// copies of one fact, so the hand-off of one and the write of the other must not interleave
     /// with another install's. Upstream has a single pair of closure arrays (`provider.ts:147-149`,
     /// `:254-257`), so last-write-wins is always consistent there.
     install: Mutex<()>,
@@ -870,14 +874,22 @@ impl ControllerShared {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = error;
     }
 
-    /// Replace the catalog: build the provider for it, make it current and hand it to the host.
+    /// Replace the catalog: build the provider for it, hand it to the host, and make it current.
+    ///
+    /// SEAM-151 — the host answers FIRST, and `current` changes only after it: a refresh's `update`
+    /// whose publication was superseded while it ran is refused by the host's registry
+    /// ([`ProviderWrite::Superseded`]), and then nothing changes here either — not `current`, not
+    /// the last refusal. pi never runs a stale `update` at all (`packages/ai/src/models.ts:521-522`
+    /// @f1b2e77f5); the registry's check is the one cyrup makes, and this obeys it rather than
+    /// repeating it. A host REFUSAL (`Err`) still changes the catalog, as before: the host keeps
+    /// its old provider and the refusal is kept for [`LlamaController::register_error`].
     fn try_install(
         &self,
         models: Vec<Model>,
         classifiers: Vec<ClassifierModel>,
     ) -> Result<(), LlamaError> {
-        // Held until the host has the provider, so two installs (a `/llama` `set_catalog` and a
-        // refresh's `update`) land in the same order in `current` and in the host's registry.
+        // Held until `current` is written, so two installs (a `/llama` `set_catalog` and a
+        // refresh's `update`) land in the same order in the host's registry and in `current`.
         let _installing = self
             .install
             .lock()
@@ -888,11 +900,15 @@ impl ControllerShared {
             classifiers,
             self.this.clone(),
         ));
+        let outcome = match (self.register)(provider.clone()) {
+            Ok(ProviderWrite::Superseded) => return Ok(()),
+            Ok(ProviderWrite::Landed) => Ok(()),
+            Err(refusal) => Err(LlamaError::Message(refusal)),
+        };
         *self
             .current
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = provider.clone();
-        let outcome = (self.register)(provider).map_err(LlamaError::Message);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = provider;
         self.set_register_error(outcome.as_ref().err().map(ToString::to_string));
         outcome
     }

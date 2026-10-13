@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use cyrup_core::{CancelToken, ProviderId};
 use cyrup_ext::host::services::{ProviderRefreshRequest, ProviderRefresher};
-use cyrup_ext::provider::{ModelRegistrySink, ProviderRegistration};
+use cyrup_ext::provider::{ComposeOptions, ModelRegistrySink, ProviderRegistration, ProviderWrite};
 use cyrup_provider::{
     AuthContext, Credential, CredentialStore, EnvAuthContext, InMemoryCredentialStore,
     InMemoryModelsStore, Model, ModelsPersist, ModelsPublication, ModelsPublisher,
@@ -44,9 +44,12 @@ use crate::provider_swap::ProviderSwap;
 
 /// The bound sink + shared lookup for guest-registered providers. Cheaply shareable via `Arc`
 /// (interior `Mutex`); the SAME `Arc` is handed to [`cyrup_ext::ExtensionRegistry::bind_model_registry`]
-/// (as the sink) and to the session (as the read view).
-#[derive(Default)]
+/// (as the sink) and to the session (as the read view). Built only behind its `Arc`
+/// ([`GuestProviderRegistry::new`]), because what it composes holds a weak handle back to it.
 pub struct GuestProviderRegistry {
+    /// This registry, weakly: what a composed provider's refresh publishes as its `update` re-composes
+    /// its registration HERE ([`GuestProviderRegistry::compose_options`], PROV-164).
+    this: Weak<GuestProviderRegistry>,
     /// Realized providers keyed by provider id, in insertion order (BTreeMap for a stable catalog).
     providers: Mutex<BTreeMap<String, Arc<dyn Provider>>>,
     /// Monotonic mutation counter — the CACHE KEY for the composed-registry snapshot
@@ -103,6 +106,11 @@ pub struct GuestProviderRegistry {
     /// `model-runtime.ts:343`), not by being registered. See
     /// [`GuestProviderRegistry::carries_own_credentials`].
     keyless_composed: Mutex<BTreeSet<String>>,
+    /// PROV-164 — the session's `models.json`, whose `modelOverrides` for an id apply over the rows a
+    /// registration under it declares (pi's topmost user-config layer,
+    /// `provider-composer.ts:553-575` @f1b2e77f5). See
+    /// [`GuestProviderRegistry::attach_model_config`].
+    model_config: Mutex<Option<Arc<cyrup_config::ModelFile>>>,
 }
 
 /// Resolves the base provider a registration under `id` composes over (see
@@ -161,8 +169,22 @@ impl cyrup_provider::VirtualModelCatalog for LiveGuestCatalog<'_> {
 }
 
 impl GuestProviderRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    /// An empty registry, behind the `Arc` every holder shares (the extension host's sink and the
+    /// session's read view are the same one).
+    pub fn new() -> Arc<Self> {
+        Arc::new_cyclic(|this| Self {
+            this: this.clone(),
+            providers: Mutex::default(),
+            generation: AtomicU64::default(),
+            refresh: Arc::default(),
+            installed: Mutex::default(),
+            restore_started: AtomicBool::default(),
+            virtual_models: Mutex::default(),
+            restore_runtime: Mutex::default(),
+            base_resolver: Mutex::default(),
+            keyless_composed: Mutex::default(),
+            model_config: Mutex::default(),
+        })
     }
 
     /// The provider realized for `id`, if a guest registered one (cheap `Arc` clone). Poison-safe.
@@ -245,6 +267,38 @@ impl GuestProviderRegistry {
     /// `models.json`.
     pub fn attach_base_resolver(&self, resolver: BaseResolver) {
         *poison_safe(&self.base_resolver) = Some(resolver);
+    }
+
+    /// PROV-164 — install the session's `models.json`, whose `modelOverrides` for an id apply over
+    /// the rows a registration under it declares. Called by [`crate::SessionBuilder`] beside
+    /// [`Self::attach_base_resolver`], BEFORE the bind flush. Unattached, no override applies.
+    pub fn attach_model_config(&self, model_config: Arc<cyrup_config::ModelFile>) {
+        *poison_safe(&self.model_config) = Some(model_config);
+    }
+
+    /// What composing `reg` over its base takes from this session (PROV-164): the id's
+    /// `models.json` `modelOverrides`, and the `update` the composed provider publishes after its
+    /// base refreshed — this registration composed again, over the base as it stands then, which is
+    /// how a refreshed base reaches the composed rows (pi's composed `getAllModels` reads its base
+    /// live, `provider-composer.ts:555-560` @f1b2e77f5; a cyrup provider's rows are an immutable
+    /// borrow, so the provider is replaced instead). The update runs inside the publication, so
+    /// its write goes through the same gate as every other ([`Self::lock_unless_stale`]).
+    fn compose_options(&self, reg: &ProviderRegistration) -> ComposeOptions {
+        let model_overrides = poison_safe(&self.model_config)
+            .as_ref()
+            .and_then(|file| file.providers.get(&reg.id))
+            .map(|block| block.model_overrides.clone())
+            .unwrap_or_default();
+        let this = self.this.clone();
+        let recompose = reg.clone();
+        ComposeOptions {
+            model_overrides,
+            refreshed: Some(Arc::new(move || {
+                if let Some(registry) = this.upgrade() {
+                    let _ = registry.upsert_provider(&recompose);
+                }
+            })),
+        }
     }
 
     /// The base a registration under `id` composes over: the attached resolver's answer, else the
@@ -1060,16 +1114,32 @@ impl GuestProviderRegistry {
     /// stale write is dropped, and if after, the newer refresh publishes later and overwrites it.
     /// No lock is held across the provider's `update` code.
     ///
-    /// NOT closed by this: the update's side effects other than this registry's write (a
-    /// provider's own state, an extension host's map) still run — they live outside this crate.
-    /// The provider IS told: a superseded refresh's signal is cancelled with the bump, so its
-    /// `publish` returns `Err(ProviderError::Aborted)`, never `Ok(true)`.
+    /// SEAM-151 — this is the ONLY staleness check on the publication path, and everything else
+    /// the update writes obeys it: each sink write answers [`ProviderWrite`], and the extension
+    /// host's hub and owner map and the provider's own copy (`cyrup-llama`'s `current`) record a
+    /// change only on [`ProviderWrite::Landed`]. So a stale update's re-registration, which reaches
+    /// here last, changes nothing anywhere. The provider is also told: a superseded refresh's signal
+    /// is cancelled with the bump, so its `publish` returns `Err(ProviderError::Aborted)`, never
+    /// `Ok(true)`.
     fn stale_publication(&self, id: &str) -> bool {
         PUBLISHING.with(|slot| {
             slot.borrow()
                 .as_ref()
                 .is_some_and(|(p, generation)| p == id && !self.refresh.is_current(id, *generation))
         })
+    }
+
+    /// The provider map, locked, unless the write about to be made for `id` is a superseded
+    /// publication's ([`Self::stale_publication`]): then `None`, and the writer writes nothing and
+    /// answers [`ProviderWrite::Superseded`]. The three writers of the map take it only through
+    /// here, so the check is made once, in one place, under the same hold of the lock as the write
+    /// it guards (SEAM-145, SEAM-151).
+    fn lock_unless_stale(
+        &self,
+        id: &str,
+    ) -> Option<std::sync::MutexGuard<'_, BTreeMap<String, Arc<dyn Provider>>>> {
+        let providers = self.lock();
+        (!self.stale_publication(id)).then_some(providers)
     }
 
     /// Back catalog persistence with `store` — the session's `<agent_dir>/models-store.json`
@@ -1223,38 +1293,38 @@ impl ProviderRefresher for GuestProviderRegistry {
 }
 
 impl ModelRegistrySink for GuestProviderRegistry {
-    fn upsert_provider(&self, reg: &ProviderRegistration) {
+    fn upsert_provider(&self, reg: &ProviderRegistration) -> ProviderWrite {
         // Full replacement for this provider id (Pi "replaces all models", model-registry.ts:919).
         //
         // PROV-162 — pi stores the registration as the id's `extension` layer and recomposes the
         // id OVER its base (`model-runtime.ts:921-934` → `composeProvider`, `:301-310`). An id a
         // base owns is composed over it with the session's own store and auth context (pi's
-        // `ModelRuntime` `credentials`/`authContext`); an id no base owns is realized from the
-        // registration alone, exactly as before.
-        let (provider, keyless) = match self.base_provider(&reg.id) {
-            Some(base) => {
-                let (store, ctx) = self.refresh.auth();
-                match reg.compose_over(base, store, Some(ctx)) {
-                    Ok(provider) => (
-                        provider,
-                        reg.resolved_api_key.as_deref().is_none_or(str::is_empty),
-                    ),
-                    // pi records the composition error and keeps the base registered
-                    // (`model-runtime.ts:312-315`): the registration does not land.
-                    Err(message) => {
-                        tracing::warn!(provider = %reg.id, "{message}");
-                        return;
-                    }
-                }
+        // `ModelRuntime` `credentials`/`authContext`) and its `models.json` layers (PROV-164); an
+        // id no base owns is realized from the registration alone, exactly as before. Composed
+        // BEFORE the gate: composing writes nothing, and no lock is held across provider code.
+        let composed = self.base_provider(&reg.id).map(|base| {
+            let (store, ctx) = self.refresh.auth();
+            reg.compose_over(base, store, Some(ctx), self.compose_options(reg))
+        });
+        // One hold of the map for the stale check, the supersede, the insert, the installed slot
+        // and the bump (SEAM-145, see `stale_publication`).
+        let Some(mut providers) = self.lock_unless_stale(&reg.id) else {
+            return ProviderWrite::Superseded;
+        };
+        let (provider, keyless) = match composed {
+            Some(Ok(provider)) => (
+                provider,
+                reg.resolved_api_key.as_deref().is_none_or(str::is_empty),
+            ),
+            // pi records the composition error and keeps the base registered
+            // (`model-runtime.ts:312-315`) — and keeps the registration it stored (`:933`), which is
+            // why this is not a refusal: the hub records it, nothing lands here.
+            Some(Err(message)) => {
+                tracing::warn!(provider = %reg.id, "{message}");
+                return ProviderWrite::Landed;
             }
             None => (reg.build_provider(), false),
         };
-        // One hold of the map for the stale check, the supersede, the insert, the installed slot
-        // and the bump (SEAM-145, see `stale_publication`).
-        let mut providers = self.lock();
-        if self.stale_publication(&reg.id) {
-            return;
-        }
         self.supersede_refresh(&reg.id);
         providers.insert(reg.id.clone(), Arc::clone(&provider));
         {
@@ -1267,9 +1337,10 @@ impl ModelRegistrySink for GuestProviderRegistry {
         }
         self.replace_installed(&reg.id, &provider);
         self.generation.fetch_add(1, Ordering::Relaxed);
+        ProviderWrite::Landed
     }
 
-    fn upsert_live_provider(&self, id: &str, provider: Arc<dyn Provider>) {
+    fn upsert_live_provider(&self, id: &str, provider: Arc<dyn Provider>) -> ProviderWrite {
         // A native's own provider, stored as given — no `ConfigProvider` is rebuilt. Replacing the
         // id swaps the `Arc` (Pi "replaces all models", model-registry.ts:919), and the bump is what
         // makes `full_model_registry()` recompose so the replacement's catalog is what `/model` lists.
@@ -1279,10 +1350,9 @@ impl ModelRegistrySink for GuestProviderRegistry {
             // registrations of an id cannot interleave them, and a publication superseded after
             // `publish_queued`'s check cannot land over the newer provider (SEAM-145, see
             // `stale_publication`). Lock order: providers -> refresh slots -> installed -> swap.
-            let mut providers = self.lock();
-            if self.stale_publication(id) {
-                return;
-            }
+            let Some(mut providers) = self.lock_unless_stale(id) else {
+                return ProviderWrite::Superseded;
+            };
             self.supersede_refresh(id);
             let is_new = providers
                 .insert(id.to_string(), Arc::clone(&provider))
@@ -1302,16 +1372,16 @@ impl ModelRegistrySink for GuestProviderRegistry {
         if let Some(restore) = late_restore {
             restore.spawn();
         }
+        ProviderWrite::Landed
     }
 
-    fn remove_provider(&self, id: &str) {
+    fn remove_provider(&self, id: &str) -> ProviderWrite {
         let restore = {
             // Same single hold as the upserts (SEAM-145): a stale publication's removal is
             // dropped, and the supersede happens under the lock its check reads under.
-            let mut providers = self.lock();
-            if self.stale_publication(id) {
-                return;
-            }
+            let Some(mut providers) = self.lock_unless_stale(id) else {
+                return ProviderWrite::Superseded;
+            };
             self.supersede_refresh(id);
             providers.remove(id);
             poison_safe(&self.keyless_composed).remove(id);
@@ -1324,6 +1394,7 @@ impl ModelRegistrySink for GuestProviderRegistry {
         if let Some(restore) = restore {
             restore.spawn();
         }
+        ProviderWrite::Landed
     }
 
     fn upsert_virtual_model(
@@ -1408,7 +1479,7 @@ mod tests {
         let ext = ExtensionRegistry::new();
         ext.register_provider(ExtensionId::from("acme-ext"), "acme", config())
             .unwrap();
-        let sink: Arc<GuestProviderRegistry> = Arc::new(GuestProviderRegistry::new());
+        let sink: Arc<GuestProviderRegistry> = GuestProviderRegistry::new();
         ext.bind_model_registry(sink.clone()).unwrap();
 
         assert!(sink.has_provider("acme"));
@@ -1423,7 +1494,7 @@ mod tests {
     #[test]
     fn live_registration_after_bind_upserts_immediately() {
         let ext = ExtensionRegistry::new();
-        let sink: Arc<GuestProviderRegistry> = Arc::new(GuestProviderRegistry::new());
+        let sink: Arc<GuestProviderRegistry> = GuestProviderRegistry::new();
         ext.bind_model_registry(sink.clone()).unwrap();
         assert!(!sink.has_provider("acme"));
 

@@ -27,7 +27,7 @@ use cyrup_ext::registry::CommandDescriptor;
 use cyrup_ext::{
     ExtError, ExtMode, ExtensionHost, HostConfig, HostCtx, HostServices, InitApi,
     InteractiveOverlay, LateRegistrar, ModelRegistrySink, NativeExtension, NotifyKind, OverlayKey,
-    OverlayKeyCode, ProviderRegistration,
+    OverlayKeyCode, ProviderRegistration, ProviderWrite,
 };
 use cyrup_provider::auth::InMemoryCredentialStore;
 use cyrup_provider::{ModelsRefreshResult, Provider, ProviderError};
@@ -311,10 +311,10 @@ impl LateRegistrar for FakeRegistrar {
         &self,
         id: String,
         provider: Arc<dyn Provider>,
-    ) -> Result<(), ExtError> {
+    ) -> Result<ProviderWrite, ExtError> {
         assert_eq!(id, LLAMA_PROVIDER_ID);
         self.providers.lock().unwrap().push(provider);
-        Ok(())
+        Ok(ProviderWrite::Landed)
     }
 
     /// The extension never unregisters its provider; a call is a bug the test must see, not a
@@ -589,7 +589,7 @@ impl Rig {
             Arc::new(InMemoryCredentialStore::new()),
             Arc::new(move |provider| {
                 sink.lock().unwrap().push(provider);
-                Ok(())
+                Ok(ProviderWrite::Landed)
             }),
         ));
         let mut client = LlamaClient::with_http_client(server.url(), None, http()).unwrap();
@@ -1867,24 +1867,27 @@ impl Sink {
 }
 
 impl ModelRegistrySink for Sink {
-    fn upsert_provider(&self, reg: &ProviderRegistration) {
+    fn upsert_provider(&self, reg: &ProviderRegistration) -> ProviderWrite {
         self.events
             .lock()
             .unwrap()
             .push(format!("upsert:{}", reg.id));
+        ProviderWrite::Landed
     }
 
-    fn upsert_live_provider(&self, id: &str, provider: Arc<dyn Provider>) {
+    fn upsert_live_provider(&self, id: &str, provider: Arc<dyn Provider>) -> ProviderWrite {
         self.live.lock().unwrap().insert(id.to_string(), provider);
         self.events
             .lock()
             .unwrap()
             .push(format!("upsert-live:{id}"));
+        ProviderWrite::Landed
     }
 
-    fn remove_provider(&self, id: &str) {
+    fn remove_provider(&self, id: &str) -> ProviderWrite {
         self.live.lock().unwrap().remove(id);
         self.events.lock().unwrap().push(format!("remove:{id}"));
+        ProviderWrite::Landed
     }
 
     fn upsert_virtual_model(
