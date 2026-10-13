@@ -1864,23 +1864,32 @@ impl SessionBuilder {
         // session's own store and auth context — the provider pi's `rebuildProviders` would hand
         // `composeModelProvider` as `base` after its `config` layer. Attached BEFORE the bind below,
         // so the extensions' startup registrations compose over it.
+        //
+        // PROV-165 — the overlay is handed IN, by the registry, which records the overlay each
+        // composition was resolved with and composes again on any read that finds the slot holding
+        // another (pi's composed `getAllModels` reads its base on every call,
+        // `provider-composer.ts:555-575`). `model_config` is this session's for its whole life.
         {
             let model_config = Arc::clone(&model_config);
-            let catalog_overlay = Arc::clone(&catalog_overlay);
             let store: Arc<dyn cyrup_provider::CredentialStore> = auth.clone();
             let ctx: Arc<dyn cyrup_provider::AuthContext> =
                 Arc::new(cyrup_config::login::StoreAuthContext(auth.clone()));
-            guest_providers.attach_base_resolver(Arc::new(move |id: &str| {
-                let (models, _errors) = cyrup_config::compose_provider_registry(
-                    &model_config,
-                    cyrup_provider::CreateModelsOptions {
-                        credentials: Some(Arc::clone(&store)),
-                        auth_context: Some(Arc::clone(&ctx)),
-                        catalog_overlay: catalog_overlay.load(),
+            guest_providers.attach_base_resolver(
+                Arc::new(
+                    move |id: &str, overlay: Option<&Arc<cyrup_provider::CatalogOverlay>>| {
+                        let (models, _errors) = cyrup_config::compose_provider_registry(
+                            &model_config,
+                            cyrup_provider::CreateModelsOptions {
+                                credentials: Some(Arc::clone(&store)),
+                                auth_context: Some(Arc::clone(&ctx)),
+                                catalog_overlay: overlay.cloned(),
+                            },
+                        );
+                        models.get_provider(id)
                     },
-                );
-                models.get_provider(id)
-            }));
+                ),
+                Arc::clone(&catalog_overlay),
+            );
         }
         // PROV-164 — the `models.json` `modelOverrides` a registration's own rows take (pi applies
         // them over the extension layer, `provider-composer.ts:553-575` @f1b2e77f5). Attached
@@ -1979,7 +1988,23 @@ impl SessionBuilder {
         // registered and restored. The model is looked up across their catalogs like `/model`
         // does (`AgentSession::set_model`); the provider owning it becomes the session's provider,
         // and the seeds taken from the step-3 resolution are replaced with its values.
-        if let Some(pattern) = deferred_model_pattern {
+        //
+        // SEAM-166 — and the model step 3 DID resolve is resolved again here when its provider is
+        // one a guest registered: step 3 ran before any registration existed (this registry is
+        // built after it), so it resolved against the base, where pi resolves `--model`, the
+        // restore and the default only after every extension's provider is registered
+        // (`createAgentSessionServices` runs before `createAgentSession`), i.e. against the
+        // COMPOSED provider. Both arms resolve against the owner with `models.json` minus the
+        // guest-registered ids' blocks ([`GuestProviderRegistry::without_guest_blocks`], the rule
+        // `compose_model_registry` applies): the owner's rows already carry that block UNDER the
+        // registration (pi's order built-in → `models.json` → extension,
+        // `provider-composer.ts:555-560` @f1b2e77f5), and composing it again put a `models.json`
+        // `baseUrl` back over the registration's — so the session started on a row `/model` does
+        // not list.
+        //
+        // The three `resolve_model` calls in this file: the two at step 3 (`self.provider`, before
+        // `guest_providers` exists, so no guest-composed row can reach them) and this one.
+        let reresolve_against = if let Some(pattern) = deferred_model_pattern {
             let owner = {
                 let candidates = guest_providers.models();
                 cyrup_config::ModelResolver::new(&candidates)
@@ -2007,8 +2032,16 @@ impl SessionBuilder {
                     None => pattern,
                 }));
             };
+            Some(owner)
+        } else {
+            model_ref
+                .as_ref()
+                .and_then(|reference| guest_providers.provider(reference.provider.as_str()))
+        };
+        if let Some(owner) = reresolve_against {
+            let guest_free_model_file = guest_providers.without_guest_blocks(&model_file);
             let (model, reference, level, fallback) =
-                resolve_model(&*owner, &cfg, &settings, &restore, &model_file)?;
+                resolve_model(&*owner, &cfg, &settings, &restore, &guest_free_model_file)?;
             read_model_vision.set(
                 model
                     .as_ref()
