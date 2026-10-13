@@ -119,6 +119,61 @@ const KEEP_ALIVE_RETRY_MAX_DOUBLINGS: u32 = 10;
 /// convergence pass probes at once.
 pub const KEEP_ALIVE_CHECK_CONCURRENCY: usize = 10;
 
+/// How long an HTTP session's close may take: rmcp's `SESSION_CLEANUP_TIMEOUT` for the `DELETE`
+/// that ends it (`transport/streamable_http_client.rs:35` @3.1.4).
+pub const HTTP_SESSION_CLOSE: Duration = Duration::from_secs(5);
+
+/// The longest one keep-alive server's convergence can take, added up from the bounded stages it
+/// runs (MCP-636). `request_timeout` is the server's resolved `requestTimeoutMs`
+/// ([`crate::runtime::resolve_request_timeout`], 60 s by default).
+///
+/// * **stdio** — no probe: a server without a `url` returns before `refresh_tools`
+///   ([`McpLifecycleManager::ensure_converged`]'s per-server check), so the work is a reconnect of
+///   a missing child: its `!command` secrets ([`crate::secrets::COMMAND_SECRET_TIMEOUT`] each, run
+///   one after another), the `initialize` handshake (`request_timeout`), discovery (the three lists
+///   run together, each under `request_timeout`), and the close of a connect whose discovery
+///   failed ([`crate::stdio_child::MAX_WAIT_ON_DROP`] before the kill).
+/// * **HTTP** — the `tools/list` probe (`request_timeout`), then a reconnect: its secrets, a
+///   handshake the auth ladder may make twice (a 401 retries once with a token,
+///   `UnauthorizedAction::RetryOnce`), discovery, and the `DELETE` of a failed connect
+///   ([`HTTP_SESSION_CLOSE`]). A probe that finds its connection superseded checks the server once
+///   more (`handleSupersededConnection`, `lifecycle.ts:271-295`), so all of it may run twice.
+///
+/// Not counted, because nothing in cyrup bounds them: an OAuth token read from the OS keyring and
+/// an `auth.provider` token source (both raced against the attempt's cancel, neither timed). A
+/// convergence that waits on one of those past this bound is cut where the dispatcher cuts an
+/// undeclared handler.
+#[must_use]
+pub fn keep_alive_check_bound(definition: &ServerEntry, request_timeout: Duration) -> Duration {
+    let commands = |record: Option<&std::collections::BTreeMap<String, String>>| {
+        record.map_or(0, |values| {
+            values
+                .values()
+                .filter(|value| crate::credentials::is_command_secret(value))
+                .count()
+        })
+    };
+    let bearer = definition
+        .bearer_token
+        .as_deref()
+        .is_some_and(crate::credentials::is_command_secret);
+    let secret_commands = commands(definition.env.as_deref())
+        + commands(definition.headers.as_deref())
+        + usize::from(bearer);
+    let secrets = crate::secrets::COMMAND_SECRET_TIMEOUT
+        .saturating_mul(u32::try_from(secret_commands).unwrap_or(u32::MAX));
+    if definition.url.is_none() {
+        return secrets
+            .saturating_add(request_timeout.saturating_mul(2))
+            .saturating_add(crate::stdio_child::MAX_WAIT_ON_DROP);
+    }
+    let check = request_timeout
+        .saturating_add(secrets)
+        .saturating_add(request_timeout.saturating_mul(3))
+        .saturating_add(HTTP_SESSION_CLOSE);
+    check.saturating_mul(2)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Session teardown reasons — `index.ts:98`, `:464`, `:467`, `:522`, `:528`
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -1014,6 +1069,29 @@ impl McpLifecycleManager {
         }
     }
 
+    /// The longest one [`Self::ensure_converged`] pass can take (MCP-636): the keep-alive servers
+    /// are checked [`KEEP_ALIVE_CHECK_CONCURRENCY`] at a time, a slot taken as one frees, so with
+    /// `n` servers no check starts later than `⌊i / 10⌋` times the slowest one's bound, and the
+    /// pass ends within `⌈n / 10⌉` of them. Each server's bound is [`keep_alive_check_bound`] at the
+    /// request timeout `request_timeout` resolves for it. Zero with no keep-alive server.
+    #[must_use]
+    pub fn convergence_bound(
+        &self,
+        request_timeout: impl Fn(&ServerEntry) -> Duration,
+    ) -> Duration {
+        let servers: Vec<Arc<ServerEntry>> = match self.registry.lock() {
+            Ok(registry) => registry.keep_alive_servers.values().cloned().collect(),
+            Err(_) => return Duration::ZERO,
+        };
+        let slowest = servers
+            .iter()
+            .map(|definition| keep_alive_check_bound(definition, request_timeout(definition)))
+            .max()
+            .unwrap_or_default();
+        let waves = servers.len().div_ceil(KEEP_ALIVE_CHECK_CONCURRENCY);
+        slowest.saturating_mul(u32::try_from(waves).unwrap_or(u32::MAX))
+    }
+
     /// `checkKeepAliveConnections(signal)` (`lifecycle.ts:150-157`) — `parallelLimit` at
     /// [`KEEP_ALIVE_CHECK_CONCURRENCY`].
     ///
@@ -1785,7 +1863,7 @@ async fn shutdown_oauth(runtime: Option<Arc<OAuthRuntime>>) -> McpResult<()> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -1816,19 +1894,19 @@ mod tests {
 
     /// The scripted manager the whole state machine is driven against.
     #[derive(Default)]
-    struct FakeSupervisor {
+    pub(crate) struct FakeSupervisor {
         connections: Mutex<IndexMap<String, ConnectionHandle>>,
         idle: Mutex<HashSet<String>>,
         /// Every observable side effect, in order — the assertion surface for the ordering tests.
         log: Mutex<Vec<String>>,
         connect_fails: AtomicBool,
         /// How long `connect` takes, in virtual time.
-        connect_delay: Mutex<Duration>,
+        pub(crate) connect_delay: Mutex<Duration>,
         close_all_calls: AtomicUsize,
     }
 
     impl FakeSupervisor {
-        fn arc() -> Arc<Self> {
+        pub(crate) fn arc() -> Arc<Self> {
             Arc::new(Self::default())
         }
         fn record(&self, entry: impl Into<String>) {
@@ -1836,7 +1914,7 @@ mod tests {
                 log.push(entry.into());
             }
         }
-        fn log(&self) -> Vec<String> {
+        pub(crate) fn log(&self) -> Vec<String> {
             self.log.lock().map(|l| l.clone()).unwrap_or_default()
         }
         fn set_connection(&self, name: &str, connection: ConnectionHandle) {
@@ -2496,6 +2574,80 @@ mod tests {
     }
 
     // ── ensureConverged ─────────────────────────────────────────────────────────────────────
+
+    /// MCP-636 — the ceiling the `input` handler declares for its convergence pass is added up from
+    /// the reconnects' own bounds. One stdio server at the 60 s default: handshake 60, discovery 60
+    /// and the 3 s close of a failed connect, 123 s; each `!command` secret adds its 10 s. One HTTP
+    /// server with a `!command` bearer: probe 60 + secret 10 + two handshakes 120 + discovery 60 +
+    /// the 5 s `DELETE` = 255 s, twice for the superseded retry = 510 s. Ten servers are checked at
+    /// once, so eleven take two rounds of the slowest.
+    #[test]
+    fn the_convergence_bound_is_added_up_from_the_reconnects_own_bounds() {
+        let default = crate::runtime::DEFAULT_REQUEST_TIMEOUT;
+        let stdio = keep_alive_entry();
+        assert_eq!(
+            keep_alive_check_bound(&stdio, default),
+            Duration::from_secs(123)
+        );
+        assert_eq!(
+            keep_alive_check_bound(&stdio, Duration::from_secs(2)),
+            Duration::from_secs(7)
+        );
+        let with_secrets = ServerEntry {
+            env: Some(
+                std::collections::BTreeMap::from([
+                    ("A".to_string(), "!pass show a".to_string()),
+                    ("B".to_string(), "!!literal".to_string()),
+                    ("C".to_string(), "plain".to_string()),
+                ])
+                .into(),
+            ),
+            ..keep_alive_entry()
+        };
+        assert_eq!(
+            keep_alive_check_bound(&with_secrets, default),
+            Duration::from_secs(133),
+            "one `!command` adds its 10 s; `!!` is a literal"
+        );
+        let http = ServerEntry {
+            url: Some("https://example.invalid/mcp".to_string()),
+            bearer_token: Some("!token-cmd".to_string()),
+            ..keep_alive_entry()
+        };
+        assert_eq!(
+            keep_alive_check_bound(&http, default),
+            Duration::from_secs(2 * (60 + 10 + 3 * 60 + 5))
+        );
+
+        let lc = lifecycle();
+        assert_eq!(lc.convergence_bound(|_| default), Duration::ZERO);
+        for index in 0..10 {
+            let name = format!("s{index}");
+            lc.register_server(&name, keep_alive_entry(), None);
+            lc.mark_keep_alive(&name);
+        }
+        assert_eq!(
+            lc.convergence_bound(|_| default),
+            Duration::from_secs(123),
+            "ten servers are checked together"
+        );
+        lc.register_server("h", http.clone(), None);
+        lc.mark_keep_alive("h");
+        assert_eq!(
+            lc.convergence_bound(|_| default),
+            Duration::from_secs(2 * 510),
+            "the eleventh starts when a slot frees: two rounds of the slowest"
+        );
+        assert_eq!(
+            lc.convergence_bound(|definition| if definition.url.is_some() {
+                Duration::from_secs(1)
+            } else {
+                default
+            }),
+            Duration::from_secs(2 * 123),
+            "each server at its own request timeout"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn ensure_converged_shares_one_pass_across_concurrent_callers() {

@@ -113,6 +113,17 @@ pub const DEFAULT_MAX_COLLAPSED_CHARS: usize = 8000;
 const CONTENT_SUMMARY_LIMIT: usize = 20;
 /// `mcp-output-guard.ts:12` `KEY_PREVIEW_LIMIT`.
 const KEY_PREVIEW_LIMIT: usize = 20;
+
+/// How many arrays and objects deep `details.mcpResult` sits inside the session entry that records
+/// it: the entry's line, its `message`, and the message's `details` (MCP-637). Measured on a real
+/// session by `cyrup-it`'s `mcp` `deep_result` test, which fails if the session format moves it.
+pub const SESSION_DETAILS_DEPTH: usize = 3;
+
+/// The deepest a raw MCP result may nest and still be read back from its session entry: the
+/// session loader reads with serde_json's limit, [`crate::depth_guard::MAX_READ_DEPTH`], and the
+/// result sits [`SESSION_DETAILS_DEPTH`] deeper than itself there (MCP-637). A deeper one is
+/// summarized, as an oversized one is.
+pub const MCP_RESULT_MAX_DEPTH: usize = crate::depth_guard::MAX_READ_DEPTH - SESSION_DETAILS_DEPTH;
 /// `mcp-output-guard.ts:13` `KEY_MAX_CHARS`.
 const KEY_MAX_CHARS: usize = 120;
 
@@ -1349,13 +1360,17 @@ pub fn guard_mcp_output(
     };
     let normalized = with_empty_text_fallback(normalized, options.empty_text_fallback);
 
-    // 2. The kill switch. It disables `details.mcpResult` bounding too — that is the point of
-    //    `MCP_OUTPUT_GUARD=0`: raw MCP output, for debugging.
+    // 2. The kill switch. It disables `details.mcpResult`'s size bound too — that is the point of
+    //    `MCP_OUTPUT_GUARD=0`: raw MCP output, for debugging. Not its depth bound (MCP-637): a
+    //    result too deep for its session entry would make the whole tool result vanish on resume,
+    //    which no debugging asks for, so it is summarized whatever the switch says.
     if !options.enabled {
         return GuardedMcpOutput {
             content: add_affixes(normalized, options.prefix, options.suffix),
             output_guard: None,
-            mcp_result: options.raw_mcp_result.cloned(),
+            mcp_result: options
+                .raw_mcp_result
+                .map(|raw| bound_mcp_result(raw, usize::MAX)),
         };
     }
 
@@ -1599,17 +1614,33 @@ fn save_artifact(kind: &str, text: &str) -> (Option<String>, Option<String>) {
 
 /// `mcp-output-guard.ts:268-273` `boundMcpResult` (MCP-229) — the raw value survives untouched under
 /// the threshold.
+///
+/// [CYRUP-DELTA] A result nested deeper than [`MCP_RESULT_MAX_DEPTH`] is summarized too, whatever
+/// its size (MCP-637). The session loader skips a line serde_json cannot read, so a result whose
+/// entry nests past [`crate::depth_guard::MAX_READ_DEPTH`] — a reply nested 126 or 127 levels,
+/// which the transport reads — vanished from the session on resume, tool result and all. Upstream's
+/// session reader is `JSON.parse`, which has no such limit.
 fn bound_mcp_result(result: &Value, details_max_bytes: usize) -> Value {
     let raw = safe_stringify(result);
     let raw_bytes = byte_length(&raw);
-    if raw_bytes <= details_max_bytes {
+    let depth = crate::depth_guard::nesting_depth(raw.as_bytes());
+    if raw_bytes <= details_max_bytes && depth <= MCP_RESULT_MAX_DEPTH {
         return result.clone();
     }
-    summarize_mcp_result(result, &raw, raw_bytes)
+    let too_deep = (depth > MCP_RESULT_MAX_DEPTH).then_some(depth);
+    summarize_mcp_result(result, &raw, raw_bytes, details_max_bytes, too_deep)
 }
 
-/// `mcp-output-guard.ts:275-307` `summarizeMcpResult`.
-fn summarize_mcp_result(result: &Value, raw: &str, raw_bytes: usize) -> Value {
+/// `mcp-output-guard.ts:275-307` `summarizeMcpResult`. `too_deep` is the result's nesting when it is
+/// past [`MCP_RESULT_MAX_DEPTH`] (MCP-637), recorded as `nestingDepth`; the reason names it unless
+/// the result is oversized too, which keeps upstream's reason.
+fn summarize_mcp_result(
+    result: &Value,
+    raw: &str,
+    raw_bytes: usize,
+    details_max_bytes: usize,
+    too_deep: Option<usize>,
+) -> Value {
     let (full_result_path, result_write_error) = save_artifact("mcp-result", raw);
     let record = result.as_object();
     let content = record
@@ -1619,13 +1650,18 @@ fn summarize_mcp_result(result: &Value, raw: &str, raw_bytes: usize) -> Value {
 
     let mut summary = Map::new();
     summary.insert("omitted".to_string(), Value::Bool(true));
-    summary.insert(
-        "reason".to_string(),
-        Value::String(
-            "Raw MCP result exceeded the details size limit and was replaced with this summary to keep session context bounded."
-                .to_string(),
+    let oversized = raw_bytes > details_max_bytes;
+    let reason = match too_deep.filter(|_| !oversized) {
+        Some(depth) => format!(
+            "Raw MCP result is nested {depth} levels deep, deeper than its session entry can be read back (at most {MCP_RESULT_MAX_DEPTH}), and was replaced with this summary."
         ),
-    );
+        None => "Raw MCP result exceeded the details size limit and was replaced with this summary to keep session context bounded."
+            .to_string(),
+    };
+    summary.insert("reason".to_string(), Value::String(reason));
+    if let Some(depth) = too_deep {
+        summary.insert("nestingDepth".to_string(), Value::from(depth));
+    }
     summary.insert(
         "isError".to_string(),
         Value::Bool(record.and_then(|r| r.get("isError")) == Some(&Value::Bool(true))),
@@ -3256,6 +3292,26 @@ mod tests {
         assert_eq!(guarded.content.len(), 1);
     }
 
+    /// MCP-637's residual, closed: with the guard off (`MCP_OUTPUT_GUARD=0`) a raw result keeps its
+    /// size but not a nesting its session entry cannot be read back at — 125 levels is summarized,
+    /// 124 kept verbatim. Red at the first round of this fix, where the kill switch passed the raw
+    /// result through untouched.
+    #[test]
+    fn the_kill_switch_still_summarizes_a_result_too_deep_for_its_session_entry() {
+        let mut options = guard_options();
+        options.enabled = false;
+        let deep = result_nested(MCP_RESULT_MAX_DEPTH + 1);
+        options.raw_mcp_result = Some(&deep);
+        let guarded = guard_mcp_output(&[text("x")], &options);
+        let kept = guarded.mcp_result.expect("a summary");
+        assert_eq!(kept.get("nestingDepth").and_then(Value::as_u64), Some(125));
+
+        let fits = result_nested(MCP_RESULT_MAX_DEPTH);
+        options.raw_mcp_result = Some(&fits);
+        let guarded = guard_mcp_output(&[text("x")], &options);
+        assert_eq!(guarded.mcp_result.as_ref(), Some(&fits));
+    }
+
     #[test]
     fn a_huge_single_line_is_truncated_to_one_partial_line_plus_a_notice() {
         // MCP-227's `verify`, first clause.
@@ -3391,6 +3447,55 @@ mod tests {
         let guarded = guard_mcp_output(&[text("ok")], &options);
         assert_eq!(guarded.mcp_result.as_ref(), Some(&raw));
         assert_eq!(guarded.details().get("mcpResult"), Some(&raw));
+    }
+
+    /// A raw result whose own nesting is `depth`: `{"content":[],"structuredContent":{"v":[[…1…]]}}`.
+    fn result_nested(depth: usize) -> Value {
+        let arrays = depth - 2;
+        let text = format!(
+            r#"{{"content":[],"structuredContent":{{"v":{}1{}}}}}"#,
+            "[".repeat(arrays),
+            "]".repeat(arrays)
+        );
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            crate::depth_guard::nesting_depth(safe_stringify(&value).as_bytes()),
+            depth
+        );
+        value
+    }
+
+    /// MCP-637 — `details.mcpResult` is kept only as deep as its session entry can be read back:
+    /// 124 levels, which the entry holds at 127 (the line, `message`, `details`), stays; 125 is
+    /// summarized, saying how deep it was, with the whole result written out as an oversized one is.
+    /// Red at `83daabf4`, where only size was bounded and the 125-level result was kept verbatim.
+    #[test]
+    fn a_raw_result_too_deep_for_its_session_entry_becomes_a_summary() {
+        assert_eq!(MCP_RESULT_MAX_DEPTH, 124);
+        let fits = result_nested(MCP_RESULT_MAX_DEPTH);
+        assert_eq!(bound_mcp_result(&fits, 16 * 1024), fits);
+
+        let deep = result_nested(MCP_RESULT_MAX_DEPTH + 1);
+        let summary = bound_mcp_result(&deep, 16 * 1024);
+        assert_eq!(summary.get("omitted"), Some(&Value::Bool(true)));
+        assert_eq!(
+            summary.get("nestingDepth").and_then(Value::as_u64),
+            Some(125)
+        );
+        assert_eq!(
+            summary.get("reason").and_then(Value::as_str),
+            Some(
+                "Raw MCP result is nested 125 levels deep, deeper than its session entry can be read back (at most 124), and was replaced with this summary."
+            )
+        );
+        assert!(
+            summary.get("fullResultPath").is_some() || summary.get("resultWriteError").is_some(),
+            "the whole result is written out: {summary}"
+        );
+        assert!(
+            crate::depth_guard::nesting_depth(safe_stringify(&summary).as_bytes())
+                <= MCP_RESULT_MAX_DEPTH
+        );
     }
 
     #[test]
