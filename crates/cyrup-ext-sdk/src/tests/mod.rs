@@ -21,5 +21,6 @@ mod nested_calls;
 mod payload_fidelity;
 mod prelude_export_parity;
 mod tool_exposure;
+mod tool_renderer_resolvers;
 mod virtual_models;
 mod world_import_coverage;

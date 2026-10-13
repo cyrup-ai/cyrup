@@ -67,6 +67,7 @@ mod wasm_model_calls;
 mod wasm_provider;
 mod wasm_renderer_routing;
 mod wasm_thinking_level;
+mod wasm_tool_renderer_resolvers;
 mod wasm_tool_result_structured;
 mod wasm_tool_result_usage;
 mod wasm_virtual_model;

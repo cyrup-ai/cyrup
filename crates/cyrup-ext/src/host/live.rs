@@ -435,6 +435,34 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         guest.add_renderer(custom_type);
     }
 
+    /// EXT-107 — the GUEST tier of pi `pi.registerToolRenderer(resolver)`
+    /// (`core/extensions/types.ts:1696` @f1b2e77f5, impl `loader.ts:367-371`). The resolver closure
+    /// cannot cross the boundary (ADR-0002), so the guest declares a pattern and the idiom it
+    /// would have written; the declaration goes through the SAME registry door the native tier's
+    /// resolvers do ([`crate::ExtensionRegistry::register_tool_renderer_resolver`]), so one
+    /// load-order chain orders both tiers and the `/reload` purge is inherited. A call it chooses
+    /// is drawn over `render-call` / `render-result` keyed by the tool name.
+    async fn register_tool_renderer(
+        &mut self,
+        pattern: String,
+        mode: bindings::cyrup::ext::registration::ToolRendererMode,
+    ) -> Result<(), String> {
+        use bindings::cyrup::ext::registration::ToolRendererMode as Wit;
+        let guest = guest_of(self)?;
+        let pattern = crate::tool_renderer::ToolNamePattern::new(pattern)?;
+        let mode = match mode {
+            Wit::FillIn => crate::tool_renderer::ToolRendererMode::FillIn,
+            Wit::Claim => crate::tool_renderer::ToolRendererMode::Claim,
+        };
+        guest
+            .registry
+            .register_tool_renderer_resolver(
+                guest.owner.clone(),
+                crate::tool_renderer::ToolRendererResolver::Pattern { pattern, mode },
+            )
+            .map_err(|e| e.to_string())
+    }
+
     /// [CYRUP-DELTA] EXT-062: cyrup-original CALL for an upstream FIELD —
     /// `RegisteredCommand.getArgumentCompletions?` (`extensions/types.ts:1166` @v0.83.0), which a pi
     /// guest passes inline to `registerCommand`. A WIT record cannot carry a closure, so the flag

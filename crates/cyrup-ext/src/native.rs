@@ -499,6 +499,11 @@ pub struct InitApi {
     tools: Vec<Arc<dyn Tool>>,
     commands: Vec<(String, CommandDescriptor)>,
     tool_renderers: Vec<String>,
+    /// EXT-107: tool-renderer RESOLVERS ([`Self::register_tool_renderer_resolver`],
+    /// [`Self::register_tool_renderer_pattern`]), in declaration order. Kept apart from
+    /// [`InitParts`] because a callback cannot ride in it; taken by the facade with
+    /// [`Self::take_tool_renderer_resolvers`].
+    tool_renderer_resolvers: Vec<crate::tool_renderer::ToolRendererResolver>,
     message_renderers: Vec<String>,
     entry_renderers: Vec<String>,
     // --- EXT-035: the six surfaces `interface registration` offered and `InitApi` did not. pi has
@@ -590,6 +595,66 @@ impl InitApi {
     /// `Arc<dyn Tool>` and has no descriptor, so it declares it here.
     pub fn register_tool_renderer(&mut self, tool_name: impl Into<String>) {
         self.tool_renderers.push(tool_name.into());
+    }
+
+    /// Choose how calls to ANY tool are drawn, including tools no extension registered — pi
+    /// `pi.registerToolRenderer(resolver)` (`core/extensions/types.ts:1696` @f1b2e77f5, EXT-107).
+    ///
+    /// `resolver(tool_name, next)` runs in EXTENSION LOAD ORDER with every other extension's
+    /// resolvers; `next()` answers what the remaining resolvers, then the registered tool, would
+    /// use. Return [`crate::ToolRenderers::mine`] to draw the call yourself — the host then calls
+    /// this extension's [`NativeExtension::render_call_tree`] / [`NativeExtension::render_call`]
+    /// (and the result-side twins) with the TOOL NAME as the key — or return what `next()` gave
+    /// you to defer. pi's MCP idiom, `next() ?? mine`, is
+    /// `next().or_else(|| matches(name).then(ToolRenderers::mine))`: it draws only what nothing
+    /// else would, so a registered tool keeps its own renderer. See [`crate::tool_renderer`].
+    ///
+    /// May be called more than once: pi pushes each resolver, and each takes its own place in the
+    /// chain.
+    pub fn register_tool_renderer_resolver(
+        &mut self,
+        resolver: impl Fn(
+            &str,
+            &mut dyn FnMut() -> Option<crate::tool_renderer::ToolRenderers>,
+        ) -> Option<crate::tool_renderer::ToolRenderers>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.tool_renderer_resolvers
+            .push(crate::tool_renderer::ToolRendererResolver::Callback(
+                Arc::new(resolver),
+            ));
+    }
+
+    /// The declarative form of [`Self::register_tool_renderer_resolver`] — the one shape a WASM
+    /// guest has (`registration.register-tool-renderer`), offered here too so the two tiers can
+    /// declare the same thing the same way. `pattern` is a tool name in which `*` matches any run
+    /// of characters; `mode` says whether it fills in ([`crate::ToolRendererMode::FillIn`], pi's
+    /// `next() ?? mine`) or claims ([`crate::ToolRendererMode::Claim`], `matches ? mine :
+    /// next()`).
+    ///
+    /// # Errors
+    ///
+    /// An empty pattern ([`ExtError::Registration`]).
+    pub fn register_tool_renderer_pattern(
+        &mut self,
+        pattern: impl Into<String>,
+        mode: crate::tool_renderer::ToolRendererMode,
+    ) -> Result<(), ExtError> {
+        let pattern =
+            crate::tool_renderer::ToolNamePattern::new(pattern).map_err(ExtError::Registration)?;
+        self.tool_renderer_resolvers
+            .push(crate::tool_renderer::ToolRendererResolver::Pattern { pattern, mode });
+        Ok(())
+    }
+
+    /// The resolvers declared through [`Self::register_tool_renderer_resolver`] and
+    /// [`Self::register_tool_renderer_pattern`], moved out in declaration order.
+    pub(crate) fn take_tool_renderer_resolvers(
+        &mut self,
+    ) -> Vec<crate::tool_renderer::ToolRendererResolver> {
+        std::mem::take(&mut self.tool_renderer_resolvers)
     }
 
     /// Declare that this extension renders custom ENTRIES of `custom_type` (Pi

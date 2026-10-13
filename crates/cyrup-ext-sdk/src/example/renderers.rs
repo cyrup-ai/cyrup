@@ -1,9 +1,11 @@
 //! The demo extension's RENDERERS: the four renderer types and the four registrations that key
 //! them — two message renderers (the custom type `demo`, and the per-tool renderer for
 //! `demo_echo`) and two entry renderers (`demo_card`, which draws, and `demo_boom`, which
-//! deliberately faults).
+//! deliberately faults) — plus two tool-renderer RESOLVER declarations (EXT-107) for tool names the
+//! demo does not register: the `demo_family_*` family it FILLS IN and the `demo_claim_*` family it
+//! CLAIMS.
 
-use crate::{ExtensionApi, MessageRenderer, RenderOptions};
+use crate::{ExtensionApi, MessageRenderer, RenderOptions, ToolRendererMode};
 use serde_json::Value;
 
 /// A trivial custom renderer for the demo's `custom_type` (Pi `renderCall`/`renderResult`).
@@ -97,7 +99,46 @@ impl MessageRenderer for FaultingEntryRenderer {
     }
 }
 
+/// EXT-107 — the renderer behind the demo's two tool-renderer declarations. It draws calls to
+/// tools NOBODY registered (`demo_family_ghost`, `demo_claim_x`), which is the whole point of pi's
+/// `registerToolRenderer`; the marker names which declaration routed the call here.
+struct DemoFamilyRenderer(&'static str);
+impl MessageRenderer for DemoFamilyRenderer {
+    fn render_call(&self, call: &Value, _opts: &RenderOptions, _ctx: &crate::Ctx) -> Option<Value> {
+        Some(crate::widget::text(format!(
+            "guest-{} call: {call}",
+            self.0
+        )))
+    }
+    fn render_result(
+        &self,
+        result: &Value,
+        _opts: &RenderOptions,
+        _ctx: &crate::Ctx,
+    ) -> Option<Value> {
+        Some(crate::widget::text(format!(
+            "guest-{} result: {result}",
+            self.0
+        )))
+    }
+}
+
 pub(super) fn install(api: &mut ExtensionApi) {
+    // EXT-107: pi `pi.registerToolRenderer(resolver)`. `demo_family_*` FILLS IN (pi's MCP idiom,
+    // `next() ?? mine`): it draws a family member nothing else draws, and leaves one that has a
+    // renderer of its own alone. `demo_claim_*` CLAIMS (`matches ? mine : next()`), which is what
+    // lets a host test see load order between this guest and another extension claiming the same
+    // family.
+    api.register_tool_renderer(
+        "demo_family_*",
+        ToolRendererMode::FillIn,
+        DemoFamilyRenderer("family"),
+    );
+    api.register_tool_renderer(
+        "demo_claim_*",
+        ToolRendererMode::Claim,
+        DemoFamilyRenderer("claim"),
+    );
     // A custom-MESSAGE renderer (Pi `registerMessageRenderer(customType, renderer)`,
     // `types.ts:1276` @v0.83.0; EXT-036 corrected `:1284`) keyed by a custom message type.
     api.register_message_renderer("demo", DemoRenderer);
