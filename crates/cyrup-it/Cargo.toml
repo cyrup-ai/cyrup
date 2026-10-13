@@ -104,6 +104,10 @@ cyrup-codemode-runtime  = { workspace = true, features = ["testkit"] }
 cyrup-session-svc       = { workspace = true }
 cyrup-modes             = { workspace = true }
 cyrup-sdk               = { workspace = true }
+# `tests/bin/acp_session.rs`'s `ACP-014` guard reads the agent methods the ACP schema declares
+# (`cyrup_acp::connection::schema_agent_methods`) and the methods this port declines. A dev edge only:
+# the `cyrup` binary already takes `cyrup-acp` as a normal dependency.
+cyrup-acp               = { workspace = true }
 # `scrollback-accumulator` arms the test-only `AppState::scrollback` mirror (TUI-092 F1) for
 # `tests/bin/wasm_renderer_screen.rs`'s `scrollback_text()` assertions. A dev edge only — this
 # crate has no `[lib]`/`[dependencies]`, so the feature can never reach the `cyrup` binary's

@@ -633,11 +633,13 @@ impl SessionConfigKnob {
     /// Port of pi-acp v0.0.33 `agent.ts`'s `setSessionModel` and its `proc.setThinkingLevel(mode)`
     /// call, with two mechanisms replaced outright.
     ///
-    /// **Model.** Upstream splits the requested id on the first `/`, rejoins the rest, and — when
-    /// there is no `/` — re-queries `getAvailableModels` and takes the **first** `String(m?.id) ===
-    /// modelId` match, so two providers exposing the same model id silently select the wrong one.
-    /// Here the value id is looked up in the catalog it was minted from
-    /// ([`model_value_id`] is the only minter), and the resolved `Model` goes to
+    /// **Model.** Upstream accepts two forms (`setSessionModel`, pi-acp v0.0.33 `agent.ts`): a value
+    /// with a `/` is split on the first `/` into provider and id, and a value **without** one —
+    /// "fallback, resolve via available models" — re-queries `getAvailableModels` and takes the
+    /// **first** `String(m?.id) === modelId` match. Here the value is resolved against the catalog
+    /// the advertised values were minted from ([`resolve_model_value`]: the exact
+    /// [`model_value_id`] first, then, for a value with no `/`, the first catalog entry whose id is
+    /// exactly it — upstream's bare form, in upstream's order), and the resolved `Model` goes to
     /// `AgentSession::set_model_resolved`, which runs the `has_configured_auth` precheck and
     /// `install_owning_provider`.
     ///
@@ -649,6 +651,13 @@ impl SessionConfigKnob {
     /// exact membership check against `available_model_catalog()` first, which is what `ACP-073`
     /// prescribes when parity on the rejection path matters. It also closes the `/`-ambiguity:
     /// `openrouter/anthropic/claude-x` is one catalog entry, not a `split('/')` puzzle.
+    ///
+    /// **The bare form is kept (`ACP-298`).** Exactness is about leniency, not about the form: a
+    /// value with no `/` still resolves, by an EXACT id match, as upstream's does, so a client or a
+    /// script sending `claude-sonnet-4-5` switches models where it switched under pi-acp — while
+    /// `"4"` is still refused, because no catalog id is exactly `"4"`. When two providers expose
+    /// the same id, the bare form takes the first in catalog order, as upstream's `find` does; the
+    /// `provider/id` form is how a client picks the other.
     ///
     /// **What it costs.** A client cannot use cyrup's friendlier partial patterns over ACP — but it
     /// has no reason to, because it is picking from the list this agent just advertised.
@@ -674,13 +683,14 @@ impl SessionConfigKnob {
     pub async fn apply(&self, session: &AgentSession) -> Result<AppliedKnob, AcpFailure> {
         match self {
             Self::Model(value_id) => {
-                let model = session
-                    .available_model_catalog()
-                    .into_iter()
-                    .find(|m| model_value_id(m.provider.as_str(), m.id.as_str()) == *value_id)
-                    .ok_or(AcpFailure::InvalidParams {
-                        message: format!("Unknown modelId: {value_id}"),
-                    })?;
+                let catalog = session.available_model_catalog();
+                let model = resolve_model_value(value_id, &catalog, |m| {
+                    (m.provider.as_str(), m.id.as_str())
+                })
+                .cloned()
+                .ok_or(AcpFailure::InvalidParams {
+                    message: format!("Unknown modelId: {value_id}"),
+                })?;
                 let applied = session
                     .set_model_resolved(model)
                     .await
@@ -977,6 +987,26 @@ pub fn model_from_value_id(id: &str, catalog: &[String]) -> Option<String> {
     catalog.iter().find(|c| c.as_str() == id).cloned()
 }
 
+/// The catalog entry a `model` value names (`ACP-298`): the entry whose [`model_value_id`] is
+/// exactly `value`; else, for a value with no `/`, the FIRST entry whose model id is exactly
+/// `value` — pi-acp v0.0.33 `setSessionModel`'s two forms ("provider/model" and the bare "model"
+/// fallback, `models.find(m => String(m?.id) === modelId)`). Exact both ways, so `"4"` names nothing.
+/// `key` reads an entry's `(provider, id)`.
+pub fn resolve_model_value<'a, T>(
+    value: &str,
+    catalog: &'a [T],
+    key: impl Fn(&T) -> (&str, &str),
+) -> Option<&'a T> {
+    let exact = catalog.iter().find(|entry| {
+        let (provider, id) = key(entry);
+        model_value_id(provider, id) == value
+    });
+    if exact.is_some() || value.contains('/') {
+        return exact;
+    }
+    catalog.iter().find(|entry| key(entry).1 == value)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -987,6 +1017,27 @@ pub fn model_from_value_id(id: &str, catalog: &[String]) -> Option<String> {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::ProtocolVersion;
+
+    /// `ACP-298` — the bare model id resolves by an exact id match, as pi-acp's `setSessionModel`
+    /// resolves it; `"4"` and an unknown id still name nothing, and `provider/id` is unchanged. Red
+    /// at the base, where only the `provider/id` form matched: `"y"` named nothing.
+    #[test]
+    fn a_bare_model_id_resolves_by_an_exact_id_match() {
+        let catalog = [("a", "x"), ("b", "y")];
+        fn key<'a>(entry: &'a (&'static str, &'static str)) -> (&'a str, &'a str) {
+            (entry.0, entry.1)
+        }
+        assert_eq!(resolve_model_value("y", &catalog, key), Some(&("b", "y")));
+        assert_eq!(resolve_model_value("b/y", &catalog, key), Some(&("b", "y")));
+        assert_eq!(resolve_model_value("4", &catalog, key), None);
+        assert_eq!(resolve_model_value("zz", &catalog, key), None);
+        // A value with a `/` is never re-read as a bare id.
+        assert_eq!(resolve_model_value("c/y", &catalog, key), None);
+        // Two providers with one id: the first in catalog order, as upstream's `find`.
+        let shared = [("a", "x"), ("b", "x")];
+        assert_eq!(resolve_model_value("x", &shared, key), Some(&("a", "x")));
+        assert_eq!(resolve_model_value("b/x", &shared, key), Some(&("b", "x")));
+    }
     use agent_client_protocol::schema::v1::{
         AuthCapabilities, ClientCapabilities, InitializeRequest, SessionConfigKind,
         SessionConfigSelectOptions, SessionConfigValueId,
