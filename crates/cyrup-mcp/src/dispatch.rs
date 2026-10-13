@@ -105,42 +105,59 @@ impl McpDispatch {
     /// server's tools from that server's connection once ready (`registerTools`,
     /// `extensions/mcp/index.ts:368` @v1.0.4) and calls through it (`tools.ts:281-283`). A server
     /// whose startup connect failed, or a build that settles first, gets the build's own answer.
+    ///
+    /// A build superseded by a second build of the same generation is not the call's answer
+    /// (MCP-641): the call waits on the generation's current build instead, as often as that
+    /// happens. Only a call whose generation is over — its owner gone or replaced — is answered
+    /// `not_initialized`, as before.
     async fn gate(&self, server: &str, cancel: &CancelToken) -> Gate {
         let Some(extension) = self.extension.upgrade() else {
             return Gate {
                 owner: None,
                 outcome: GateOutcome::NotInitialized,
+                route: None,
             };
         };
         let owner = extension.owner();
-        if let Some(ctx) = extension.proxy_ctx() {
-            return Gate {
-                owner,
-                outcome: GateOutcome::Ready(ctx),
-            };
-        }
-        let Some(build) = extension.init_task() else {
-            return Gate {
-                owner,
-                outcome: GateOutcome::NotInitialized,
-            };
-        };
-        let settled = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
+        loop {
+            if let Some(ctx) = extension.proxy_ctx() {
                 return Gate {
                     owner,
-                    outcome: GateOutcome::Aborted,
+                    outcome: GateOutcome::Ready(ctx),
+                    route: None,
                 };
             }
-            settled = settle_for(&extension, &build, server) => settled,
-        };
-        let outcome = match settled {
-            Settled::Ready(ctx) => GateOutcome::Ready(ctx),
-            Settled::Failed(message) => GateOutcome::Failed(message),
-            Settled::Gone => GateOutcome::NotInitialized,
-        };
-        Gate { owner, outcome }
+            let Some(build) = extension.init_task() else {
+                return Gate {
+                    owner,
+                    outcome: GateOutcome::NotInitialized,
+                    route: None,
+                };
+            };
+            let settled = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Gate {
+                        owner,
+                        outcome: GateOutcome::Aborted,
+                        route: None,
+                    };
+                }
+                settled = settle_for(&extension, &build, server) => settled,
+            };
+            let (outcome, route) = match settled {
+                Settled::Ready(ctx) => (GateOutcome::Ready(ctx), None),
+                Settled::Routed(ctx) => (GateOutcome::Ready(ctx), Some(build)),
+                Settled::Failed(message) => (GateOutcome::Failed(message), None),
+                Settled::Gone if superseded_within(&extension, &build, owner.as_ref()) => continue,
+                Settled::Gone => (GateOutcome::NotInitialized, None),
+            };
+            return Gate {
+                owner,
+                outcome,
+                route,
+            };
+        }
     }
 
     /// The gateway router, primed with the phase this generation is in.
@@ -164,15 +181,33 @@ impl McpDispatch {
             gate.set_owner(extension.owner());
             if let Some(ctx) = extension.proxy_ctx() {
                 let _ = sender.send(InitPhase::Ready(ctx));
-            } else if let Some(build) = extension.init_task() {
+            } else if let Some(mut build) = extension.init_task() {
                 let _ = sender.send(InitPhase::Pending);
+                let owner = extension.owner();
                 tokio::spawn(async move {
-                    let phase = match settle(&extension, &build).await {
-                        Settled::Ready(ctx) => InitPhase::Ready(ctx),
-                        Settled::Failed(message) => InitPhase::Failed(message),
-                        // Upstream's `!state` after the await: the build resolved, and the commit
-                        // tail dropped it as stale rather than committing it.
-                        Settled::Gone => InitPhase::NotInitialized,
+                    let phase = loop {
+                        match settle(&extension, &build).await {
+                            Settled::Ready(ctx) | Settled::Routed(ctx) => {
+                                break InitPhase::Ready(ctx);
+                            }
+                            Settled::Failed(message) => break InitPhase::Failed(message),
+                            // MCP-641 — superseded inside this generation: the wait goes on with
+                            // the build that replaced it, still within the gateway's own bound.
+                            Settled::Gone
+                                if superseded_within(&extension, &build, owner.as_ref()) =>
+                            {
+                                if let Some(ctx) = extension.proxy_ctx() {
+                                    break InitPhase::Ready(ctx);
+                                }
+                                match extension.init_task() {
+                                    Some(next) => build = next,
+                                    None => break InitPhase::NotInitialized,
+                                }
+                            }
+                            // Upstream's `!state` after the await: the build resolved, and the
+                            // commit tail dropped it as stale rather than committing it.
+                            Settled::Gone => break InitPhase::NotInitialized,
+                        }
                     };
                     let _ = sender.send(phase);
                 });
@@ -188,6 +223,9 @@ struct Gate {
     /// started, or the extension itself is gone.
     owner: Option<Arc<McpRuntimeOwner>>,
     outcome: GateOutcome,
+    /// The build whose route the call was given before its commit (MCP-635), if it was: a second
+    /// build of the generation may yet supersede it and close its servers (MCP-641).
+    route: Option<Arc<Build>>,
 }
 
 /// The init gate's four answers — upstream's `state` slot crossed with its `initPromise` slot,
@@ -206,6 +244,8 @@ enum GateOutcome {
 /// What joining the in-flight build resolved to, once the commit tail has had its turn.
 enum Settled {
     Ready(Arc<ProxyCtx>),
+    /// The route to the call's own server, built over the build's state before its commit.
+    Routed(Arc<ProxyCtx>),
     Failed(String),
     /// The build resolved, but no context was committed — the generation was superseded and the
     /// commit tail shut the new state down instead of installing it.
@@ -240,7 +280,40 @@ async fn settle_for(extension: &Arc<McpExtension>, build: &Arc<Build>, server: &
     tokio::select! {
         biased;
         settled = settle(extension, build) => settled,
-        ctx = own => Settled::Ready(ctx),
+        ctx = own => Settled::Routed(ctx),
+    }
+}
+
+/// Whether `build` was superseded by a second build of the same generation, which is still
+/// running under `owner` (MCP-641) — so a call that joined `build` has a build to go to instead.
+fn superseded_within(
+    extension: &Arc<McpExtension>,
+    build: &Arc<Build>,
+    owner: Option<&Arc<McpRuntimeOwner>>,
+) -> bool {
+    let same_generation = match (owner, extension.owner()) {
+        (Some(captured), Some(current)) => Arc::ptr_eq(captured, &current) && current.is_active(),
+        _ => false,
+    };
+    let replaced = extension.proxy_ctx().is_some()
+        || extension
+            .init_task()
+            .is_some_and(|current| !Arc::ptr_eq(&current, build));
+    same_generation && build.is_superseded() && replaced
+}
+
+/// Whether a call's result says it did not get an answer from its server.
+fn unanswered(result: &Result<ToolResult, crate::errors::McpError>) -> bool {
+    match result {
+        Err(_) => true,
+        Ok(result) => {
+            result.is_error
+                || result
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("error"))
+                    .is_some()
+        }
     }
 }
 
@@ -314,67 +387,89 @@ impl McpToolDispatch for McpDispatch {
         // began does not wait for anything.
         crate::abort::throw_if_aborted(&cancel, None)
             .map_err(|error| ToolError::new(error.to_string()))?;
-        let gate = self.gate(&spec.server_name, &cancel).await;
-        let ctx = match gate.outcome {
-            GateOutcome::Ready(ctx) => ctx,
-            // [CYRUP-DELTA, upward] The call's own cancel ends its wait for the build; upstream's
-            // `await ensureSessionRuntime(ctx)` observes no signal.
-            GateOutcome::Aborted => {
-                return Err(ToolError::new(crate::abort::ABORTED_FALLBACK_REASON));
-            }
-            GateOutcome::Failed(message) => {
-                // An owner abort rethrows rather than reporting — the session is going away, and a
-                // successful result describing that would be recorded in a transcript nobody keeps.
-                if gate.owner.is_some_and(|owner| owner.token().is_cancelled()) {
-                    return Err(ToolError::new(message));
+        loop {
+            let gate = self.gate(&spec.server_name, &cancel).await;
+            let ctx = match gate.outcome {
+                GateOutcome::Ready(ctx) => ctx,
+                // [CYRUP-DELTA, upward] The call's own cancel ends its wait for the build; upstream's
+                // `await ensureSessionRuntime(ctx)` observes no signal.
+                GateOutcome::Aborted => {
+                    return Err(ToolError::new(crate::abort::ABORTED_FALLBACK_REASON));
                 }
-                return Ok(init_failed_result(&message));
+                GateOutcome::Failed(message) => {
+                    // An owner abort rethrows rather than reporting — the session is going away, and a
+                    // successful result describing that would be recorded in a transcript nobody keeps.
+                    if gate.owner.is_some_and(|owner| owner.token().is_cancelled()) {
+                        return Err(ToolError::new(message));
+                    }
+                    return Ok(init_failed_result(&message));
+                }
+                GateOutcome::NotInitialized => return Ok(not_initialized_result()),
+            };
+
+            // The generation fence — a call that outlived its generation aborts rather than writing
+            // into a restarted session.
+            if let Some(owner) = gate.owner.as_ref() {
+                owner
+                    .throw_if_inactive()
+                    .map_err(|error| ToolError::new(error.to_string()))?;
             }
-            GateOutcome::NotInitialized => return Ok(not_initialized_result()),
-        };
 
-        // The generation fence — a call that outlived its generation aborts rather than writing
-        // into a restarted session.
-        if let Some(owner) = gate.owner.as_ref() {
-            owner
-                .throw_if_inactive()
-                .map_err(|error| ToolError::new(error.to_string()))?;
+            let result = execute_call(
+                &ctx,
+                // The CATALOG name, which is the model-facing prefixed one — NOT `original_name`.
+                //
+                // This parameter is `execute_call`'s **lookup key**, not its wire name. Phase 1 resolves
+                // it with `get_single_tool_match`, whose comparison is `tool.name == tool_name`
+                // (`proxy/results.rs`, upstream `proxy-modes.ts:39`), and `ToolMetadata::name` is
+                // `format_tool_name(tool.name, server, effective_prefix)` — the same expression
+                // `resolve_direct_tools` builds `prefixed_name` from, so the two are equal by
+                // construction in every prefix mode, `ToolPrefix::None` included. The un-prefixing back
+                // to the server's own name happens once, downstream, where the invocation reads
+                // `tool_meta.original_name` (`proxy/call.rs`).
+                //
+                // Passing `original_name` here un-prefixed it a second time, so under the DEFAULT
+                // `ToolPrefix::Server` every direct tool looked up `echo` in a catalog holding
+                // `fixture_echo` and answered `tool_not_found` with `suggestions: ["fixture_echo"]` —
+                // the model's own tool, next to the name it just failed to find.
+                &spec.prefixed_name,
+                // The provider always sends an object for a tool call; anything else carries no
+                // arguments rather than an argument that is not a record.
+                if params.is_object() {
+                    Some(&params)
+                } else {
+                    None
+                },
+                // The server hint that pins phases 1 and 3 and skips 2, 4 and 5.
+                Some(&spec.server_name),
+                &cancel,
+                // `direct-tools.ts:440` `spec.resourceUri ? "resource" : "direct"`.
+                Some(ApprovalOrigin::for_direct_tool(spec.resource_uri.as_ref())),
+                OriginatingCall::of(&call_id).as_ref(),
+            )
+            .await;
+            // MCP-641 — the call went through its server's route before the commit, and a second build
+            // of this generation superseded that build while the call ran: its servers were closed
+            // under the call, which therefore has no answer. It goes again through the generation's
+            // current build. Only then: a call answered, failed for any other reason, cancelled, or
+            // whose generation is over keeps the result it got. The cost, chosen over losing the
+            // call: a request the closed server had already read may have run there, and runs
+            // again on the winner.
+            if let Some(route) = gate.route.as_ref()
+                && !cancel.is_cancelled()
+                && unanswered(&result)
+                && let Some(extension) = self.extension.upgrade()
+                && superseded_within(&extension, route, gate.owner.as_ref())
+            {
+                tracing::debug!(
+                    "MCP: {} went through a build that was superseded; calling again through the \
+                 current one",
+                    spec.prefixed_name
+                );
+                continue;
+            }
+            return result.map_err(|error| ToolError::new(error.to_string()));
         }
-
-        execute_call(
-            &ctx,
-            // The CATALOG name, which is the model-facing prefixed one — NOT `original_name`.
-            //
-            // This parameter is `execute_call`'s **lookup key**, not its wire name. Phase 1 resolves
-            // it with `get_single_tool_match`, whose comparison is `tool.name == tool_name`
-            // (`proxy/results.rs`, upstream `proxy-modes.ts:39`), and `ToolMetadata::name` is
-            // `format_tool_name(tool.name, server, effective_prefix)` — the same expression
-            // `resolve_direct_tools` builds `prefixed_name` from, so the two are equal by
-            // construction in every prefix mode, `ToolPrefix::None` included. The un-prefixing back
-            // to the server's own name happens once, downstream, where the invocation reads
-            // `tool_meta.original_name` (`proxy/call.rs`).
-            //
-            // Passing `original_name` here un-prefixed it a second time, so under the DEFAULT
-            // `ToolPrefix::Server` every direct tool looked up `echo` in a catalog holding
-            // `fixture_echo` and answered `tool_not_found` with `suggestions: ["fixture_echo"]` —
-            // the model's own tool, next to the name it just failed to find.
-            &spec.prefixed_name,
-            // The provider always sends an object for a tool call; anything else carries no
-            // arguments rather than an argument that is not a record.
-            if params.is_object() {
-                Some(&params)
-            } else {
-                None
-            },
-            // The server hint that pins phases 1 and 3 and skips 2, 4 and 5.
-            Some(&spec.server_name),
-            &cancel,
-            // `direct-tools.ts:440` `spec.resourceUri ? "resource" : "direct"`.
-            Some(ApprovalOrigin::for_direct_tool(spec.resource_uri.as_ref())),
-            OriginatingCall::of(&call_id).as_ref(),
-        )
-        .await
-        .map_err(|error| ToolError::new(error.to_string()))
     }
 
     /// `index.ts:849` — one `mcp({...})` gateway call, routed through the nine modes.

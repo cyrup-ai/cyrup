@@ -133,6 +133,11 @@ impl Build {
         self.startup.finish();
     }
 
+    /// Whether a newer build of the same session replaced this one before it committed (MCP-641).
+    pub(crate) fn is_superseded(&self) -> bool {
+        *self.settled.borrow() == BuildState::Superseded
+    }
+
     /// Wait until the build has been committed, failed or been superseded.
     ///
     /// No bound: the build is bounded by its own stages (each server's connect by its
@@ -1478,6 +1483,21 @@ impl McpExtension {
         if !owner.is_active() || ext.generation() != generation || !ext.init_task_is(task) {
             // Before the teardown: a call waiting on this build is answered now, not after it.
             task.settle(BuildState::Superseded);
+            // MCP-641 — superseded by a second build inside this same generation. The owner is
+            // the generation's, shared with the build that replaced this one, so stopping it (as
+            // `shutdown_state` does) would end the winner too: its connects abort, its commit
+            // finds the owner stopped, and the session is left with no MCP at all. Only this
+            // build's own servers are closed; a direct call that was using them goes again
+            // through the winner ([`crate::dispatch`]).
+            if owner.is_active() && ext.generation() == generation {
+                crate::lifecycle::shutdown_superseded_state(
+                    &next_state,
+                    stale_reason,
+                    &crate::live::metadata_flush(ext.dirs.clone()),
+                )
+                .await;
+                return;
+            }
             if let Err(error) = crate::lifecycle::shutdown_state(
                 Some(next_state),
                 stale_reason,
@@ -1591,8 +1611,19 @@ impl McpExtension {
         generation: u64,
         task: &Arc<Build>,
     ) {
-        // A call waiting on this build gets the rejection however this generation fares.
-        task.settle(BuildState::Failed(error.to_string()));
+        // A call waiting on this build gets the rejection however this generation fares — unless a
+        // second build of this generation replaced it, which is the build such a call then waits
+        // on (MCP-641): this build's failure is not the generation's answer.
+        let replaced_within = owner.is_active()
+            && self.generation() == generation
+            && self
+                .init_task()
+                .is_some_and(|current| !Arc::ptr_eq(&current, task));
+        task.settle(if replaced_within {
+            BuildState::Superseded
+        } else {
+            BuildState::Failed(error.to_string())
+        });
         // `if (!owner.isActive() || generation !== lifecycleGeneration) return;`
         if !owner.is_active() || self.generation() != generation {
             return;
@@ -2143,8 +2174,17 @@ impl McpExtension {
     /// routes through the joined teardown rather than stopping the owner alone.
     ///
     /// cyrup dispatches this as an **awaited** notify *before* the session cancel token fires, so
-    /// the handler genuinely gets to finish — better than upstream, and it needs no compensation.
-    async fn on_session_shutdown(&self, reason: &str) {
+    /// the handler gets to finish — **provided the dispatcher's budget does not cut it** (MCP-640).
+    /// Every native handler runs under `cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET` (5 s), and the
+    /// teardown waits on the servers: an HTTP session's `DELETE` takes up to its 5 s and a stdio
+    /// child up to its 3 s before the kill, together at most 10 s (see
+    /// [`PREVIOUS_GENERATION_TEARDOWN`]). Cut at 5 s, the future that holds the remaining closes
+    /// was dropped: a stdio child was killed without its grace and an HTTP session was never
+    /// ended. So the wait is declared, as `on_session_start`'s identical teardown declares it, with
+    /// the same ceiling — it is the same [`crate::lifecycle::shutdown_previous_generation`] over
+    /// the same stages, so a different number would be a fourth one for one bound. Upstream awaits
+    /// it with no ceiling (`pi.on("session_shutdown")`, `index.ts:1463-1488` @v5.2.0).
+    async fn on_session_shutdown(&self, reason: &str, ctx: &HostCtx) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         let previous = crate::lifecycle::PreviousGeneration {
             state: self.state.lock().ok().and_then(|mut slot| slot.take()),
@@ -2162,6 +2202,10 @@ impl McpExtension {
             *slot = None;
         }
         tracing::debug!("MCP: session shutdown ({reason})");
+        let _teardown = ctx.begin_sanctioned_wait(
+            cyrup_ext::native::SanctionedWaitKind::ServerShutdown,
+            PREVIOUS_GENERATION_TEARDOWN + cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET,
+        );
         crate::lifecycle::shutdown_previous_generation(
             previous,
             crate::lifecycle::SESSION_SHUTDOWN_STOP_REASON,
@@ -3128,7 +3172,7 @@ impl NativeExtension for McpExtension {
                 })
             }
             HostEvent::SessionShutdown { reason, .. } => {
-                self.on_session_shutdown(reason).await;
+                self.on_session_shutdown(reason, ctx).await;
                 HookOutcome::Noop
             }
             // `error-signal.ts:13-21` `toolErrorOverride` — re-flag EXACTLY two `details.error`
@@ -3472,7 +3516,7 @@ mod tests {
     async fn session_shutdown_bumps_the_generation_and_clears_the_slots() {
         let ext = extension();
         assert_eq!(ext.generation(), 0);
-        ext.on_session_shutdown("quit").await;
+        ext.on_session_shutdown("quit", &event_ctx()).await;
         assert_eq!(ext.generation(), 1);
         assert!(ext.state().is_none() && ext.owner().is_none());
     }
@@ -4022,7 +4066,7 @@ mod tests {
 
         // The symmetric teardown takes all four slots, including the OAuth runtime — without which
         // every session would leak one process-global live-runtime id.
-        ext.on_session_shutdown("quit").await;
+        ext.on_session_shutdown("quit", &event_ctx()).await;
         assert_eq!(ext.generation(), 2);
         assert!(ext.state().is_none() && ext.owner().is_none() && ext.proxy_ctx().is_none());
         assert!(ext.oauth_runtime.lock().unwrap().is_none());
@@ -4183,7 +4227,7 @@ done
         assert!(state.on_tool_metadata_updated.lock().unwrap().is_some());
 
         // Teardown drains the child through the owner's cleanup stack.
-        ext.on_session_shutdown("quit").await;
+        ext.on_session_shutdown("quit", &event_ctx()).await;
         assert!(ext.state().is_none());
         assert!(
             state.manager.get_connection("fixture").is_none(),
@@ -4695,6 +4739,346 @@ done
             elapsed < std::time::Duration::from_secs(15),
             "the call waited {elapsed:?}, as long as the 20 s server"
         );
+    }
+
+    /// A server for the supersession test: `$2` gets this process's pid appended when it starts, and
+    /// its `hold` tool marks `$3.waiting.<pid>` and answers `answered by <pid>` only once the file
+    /// `$3` exists. So a test knows which process a call reached, holds it there, and releases it.
+    const HOLD_MCP: &str = r#"
+echo $$ >> "$2"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}\n' "$id" "$1"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"hold","description":"answers once released","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"notifications/'*) : ;;
+    *'"method":"tools/call"'*)
+      : > "$3.waiting.$$"
+      while [ ! -f "$3" ]; do sleep 0.05; done
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"answered by %s"}],"isError":false}}\n' "$id" "$$"
+      ;;
+    *)
+      if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi
+      ;;
+  esac
+done
+"#;
+
+    /// The pids `HOLD_MCP` processes appended to `marker`, in start order.
+    fn started_pids(marker: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(marker)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Poll (real time, the children are real) until `ready` holds, or fail with `why`.
+    async fn until(why: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {why}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// MCP-641 — a direct call routed on build A, with A superseded by a second build B inside the
+    /// same generation, is answered through B.
+    ///
+    /// What the test forces, rather than races: the call is held inside A's `fast` server (its
+    /// `hold` tool waits on a file); a second build B is then started in the SAME generation, under
+    /// the SAME owner — `start_initialization` called a second time, which is the "two
+    /// `SessionStart`s inside one generation" the commit's third staleness check exists for (no
+    /// production caller does this today: `on_session_start` advances the generation every time) —
+    /// and only then is A let finish (its `slow` server waits on a gate file), so A's commit finds
+    /// itself superseded with the call still in flight on A.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mcp641_a_call_routed_on_a_superseded_build_is_answered_through_the_winner() {
+        use cyrup_core::Tool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("fast-pids");
+        let release = dir.path().join("release");
+        let gate = dir.path().join("gate");
+        let fast = serde_json::json!({
+            "command": "sh",
+            "args": [
+                "-c",
+                HOLD_MCP,
+                "sh",
+                rmcp::model::ProtocolVersion::LATEST.as_str(),
+                pids.to_string_lossy(),
+                release.to_string_lossy(),
+            ],
+            "directTools": true,
+            "lifecycle": "keep-alive",
+        });
+        let slow = serde_json::json!({
+            "command": "sh",
+            "args": [
+                "-c",
+                format!("while [ ! -f \"$3\" ]; do sleep 0.05; done\n{LIVE_MCP}"),
+                "sh",
+                rmcp::model::ProtocolVersion::LATEST.as_str(),
+                dir.path().join("slow-started").to_string_lossy(),
+                gate.to_string_lossy(),
+            ],
+            "lifecycle": "keep-alive",
+        });
+        let config: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": { "fast": fast, "slow": slow }
+        }))
+        .unwrap();
+        let ext = McpExtension::with_config(
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            Some(config),
+        )
+        .with_home(dir.path().to_path_buf())
+        .into_arc();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let ctx = event_ctx();
+        let _ = ext.on_event(&session_start_event(), &ctx).await;
+        let first = ext.init_task().expect("build A is in flight");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                first.startup().route_for("fast")
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "the precondition: `fast` settled in A's pass and has a route"
+        );
+
+        let direct = Arc::new(crate::registration::DirectTool::new(
+            crate::registration::DirectToolSpec {
+                server_name: "fast".to_string(),
+                original_name: "hold".to_string(),
+                prefixed_name: "fast_hold".to_string(),
+                description: "answers once released".to_string(),
+                input_schema: None,
+                resource_uri: None,
+                lazy: false,
+            },
+            cyrup_core::ToolRenderKind::SelfRendered,
+            ext.dispatch().expect("the executor slot"),
+            None,
+        ));
+        let call = {
+            let direct = Arc::clone(&direct);
+            tokio::spawn(async move {
+                direct
+                    .execute(
+                        cyrup_core::ToolCallId::from("held"),
+                        serde_json::json!({}),
+                        cyrup_core::CancelToken::new(),
+                        Box::new(|_| {}),
+                    )
+                    .await
+            })
+        };
+        let pid_a = started_pids(&pids).first().cloned().unwrap();
+        let waiting = |pid: &str| dir.path().join(format!("release.waiting.{pid}"));
+        until("the call reached A's `fast` server", || {
+            waiting(&pid_a).exists()
+        })
+        .await;
+
+        // The supersession: a second build in this generation, under this generation's owner.
+        let owner = ext.owner().unwrap();
+        let oauth = ext.oauth_runtime.lock().unwrap().clone().unwrap();
+        let second = ext
+            .start_initialization(
+                Arc::clone(&owner),
+                oauth,
+                ext.context_snapshot(&ctx),
+                ctx.clone(),
+                ext.generation(),
+                STALE_SESSION_START_STATE_REASON,
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        // A may finish now: its commit finds the memo replaced.
+        std::fs::write(&gate, b"").unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), first.settled())
+                .await
+                .unwrap(),
+            BuildState::Superseded
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while started_pids(&pids).len() < 2 {
+            if std::time::Instant::now() > deadline {
+                let b =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), second.settled()).await;
+                let answer = tokio::time::timeout(std::time::Duration::from_secs(5), call).await;
+                panic!(
+                    "B's `fast` server never started: owner active {}, B {b:?}, the call {:?}",
+                    owner.is_active(),
+                    answer.map(|joined| joined.unwrap().map(|result| result_text(&result)))
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let pid_b = started_pids(&pids).get(1).cloned().unwrap();
+
+        // The call must come to B; at the base it ended with A's connection instead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !waiting(&pid_b).exists() {
+            if call.is_finished() || std::time::Instant::now() > deadline {
+                let answer = call.await.unwrap();
+                panic!(
+                    "the call was not sent through B; it ended with {:?} (B committed: {})",
+                    answer.map(|result| result_text(&result)),
+                    ext.proxy_ctx().is_some()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::fs::write(&release, b"").unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(30), call)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("a direct call reports through its result");
+        assert_eq!(result_text(&answer), format!("answered by {pid_b}"));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), second.settled())
+                .await
+                .unwrap(),
+            BuildState::Committed,
+            "the winner commits"
+        );
+        assert!(
+            owner.is_active(),
+            "the generation's owner survives A's teardown"
+        );
+    }
+
+    /// MCP-641, the waiting half: a direct call still waiting on build A when a second build B of
+    /// the same generation supersedes it waits on B and gets B's answer. Forced with two detached
+    /// builds: A is superseded by hand while the call waits on it, then B fails with its own
+    /// message, which only a call that went on to B can report. At the base (and before MCP-635)
+    /// the call was answered `not_initialized` the moment A was superseded.
+    #[tokio::test]
+    async fn mcp641_a_call_waiting_on_a_superseded_build_waits_on_the_one_that_replaced_it() {
+        use crate::registration::McpToolDispatch as _;
+
+        let ext = extension().into_arc();
+        *ext.owner.lock().unwrap() = Some(Arc::new(McpRuntimeOwner::new()));
+        let first = Build::detached(futures::future::pending().boxed().shared());
+        let second = Build::detached(futures::future::pending().boxed().shared());
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&first));
+
+        let dispatch = crate::dispatch::McpDispatch::new(Arc::downgrade(&ext));
+        let call = tokio::spawn(async move {
+            dispatch
+                .call_direct(
+                    &crate::registration::DirectToolSpec {
+                        server_name: "srv".to_string(),
+                        original_name: "t".to_string(),
+                        prefixed_name: "srv_t".to_string(),
+                        description: String::new(),
+                        input_schema: None,
+                        resource_uri: None,
+                        lazy: false,
+                    },
+                    cyrup_core::ToolCallId::from("c"),
+                    serde_json::json!({}),
+                    cyrup_core::CancelToken::new(),
+                    Box::new(|_| {}),
+                )
+                .await
+        });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!call.is_finished(), "the precondition: the call waits on A");
+
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&second));
+        first.settle(BuildState::Superseded);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        second.settle(BuildState::Failed("B's own answer".to_string()));
+
+        let answer = call.await.unwrap().unwrap();
+        assert_eq!(
+            answer.details.as_ref().and_then(|d| d.get("message")),
+            Some(&serde_json::json!("B's own answer")),
+            "the call was answered by A's supersession, not by B: {}",
+            result_text(&answer)
+        );
+    }
+
+    /// MCP-641, the other way a second build stranded a call: a superseded build that FAILS rather
+    /// than resolves. Its rejection is not the generation's answer, so a call waiting on it waits on
+    /// the build that replaced it. Forced through `fail_initialization` with a detached build B
+    /// in the memo. Red at the base: the call was answered A's `init_failed`.
+    #[tokio::test]
+    async fn mcp641_a_call_waiting_on_a_superseded_build_that_fails_gets_the_winners_answer() {
+        use crate::registration::McpToolDispatch as _;
+
+        let ext = extension().into_arc();
+        let owner = Arc::new(McpRuntimeOwner::new());
+        *ext.owner.lock().unwrap() = Some(Arc::clone(&owner));
+        let first = Build::detached(futures::future::pending().boxed().shared());
+        let second = Build::detached(futures::future::pending().boxed().shared());
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&first));
+
+        let dispatch = crate::dispatch::McpDispatch::new(Arc::downgrade(&ext));
+        let call = tokio::spawn(async move {
+            dispatch
+                .call_direct(
+                    &crate::registration::DirectToolSpec {
+                        server_name: "srv".to_string(),
+                        original_name: "t".to_string(),
+                        prefixed_name: "srv_t".to_string(),
+                        description: String::new(),
+                        input_schema: None,
+                        resource_uri: None,
+                        lazy: false,
+                    },
+                    cyrup_core::ToolCallId::from("c"),
+                    serde_json::json!({}),
+                    cyrup_core::CancelToken::new(),
+                    Box::new(|_| {}),
+                )
+                .await
+        });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&second));
+        let oauth = crate::oauth::create_oauth_runtime(Some(&owner.token()));
+        ext.fail_initialization(
+            &Arc::new(McpError::Aborted("A's own failure".to_string())),
+            &owner,
+            &oauth,
+            ext.generation(),
+            &first,
+        )
+        .await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        second.settle(BuildState::Failed("B's own answer".to_string()));
+
+        let answer = call.await.unwrap().unwrap();
+        assert_eq!(
+            answer.details.as_ref().and_then(|d| d.get("message")),
+            Some(&serde_json::json!("B's own answer")),
+            "{}",
+            result_text(&answer)
+        );
+        assert!(owner.is_active(), "A's failure does not end the generation");
     }
 
     /// MCP-635's other half, a guard (green at `83daabf4`, where every mid-build call waited for the
@@ -5398,6 +5782,125 @@ done
             ext.init_task().is_some() || ext.state().is_some(),
             "the handler was cut while the previous session's server was closing, before it \
              started the new session's build"
+        );
+    }
+
+    fn session_shutdown_event() -> HostEvent {
+        HostEvent::SessionShutdown {
+            reason: "quit".to_string(),
+            target_session_file: None,
+        }
+    }
+
+    /// MCP-640 — a `session_shutdown` whose teardown takes 8 s runs to its end through the real
+    /// [`cyrup_ext::Dispatcher`] and its default 5 s budget (paused clock). The teardown's closes
+    /// are the owner's cleanups, run together; one of them takes 8 s. Red at the base, where the
+    /// wait was not declared: the dispatch returned at 5 s and the 8 s close never finished.
+    #[tokio::test(start_paused = true)]
+    async fn mcp640_a_teardown_longer_than_the_budget_runs_to_its_end() {
+        use cyrup_ext::{Dispatcher, NativeHandle, Subscriptions};
+
+        let closed: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
+        let owner = Arc::new(McpRuntimeOwner::new());
+        for (name, takes) in [("quick", 0), ("slow", 8)] {
+            let closed = Arc::clone(&closed);
+            owner.add_cleanup(Box::new(move || {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(takes)).await;
+                    closed.lock().unwrap().push(name);
+                    Ok(())
+                })
+            }));
+        }
+        let ext = extension().into_arc();
+        *ext.owner.lock().unwrap() = Some(owner);
+
+        let handle = Arc::new(NativeHandle::new(
+            Arc::clone(&ext) as Arc<dyn NativeExtension>,
+            Subscriptions::empty().with(cyrup_ext::EventKind::SessionShutdown),
+            event_ctx(),
+        ));
+        let dispatcher = Dispatcher::new();
+        dispatcher.add(handle).unwrap();
+
+        let started = tokio::time::Instant::now();
+        dispatcher
+            .dispatch_notify(&session_shutdown_event(), &cyrup_core::CancelToken::new())
+            .await;
+
+        let mut closed = closed.lock().unwrap().clone();
+        closed.sort_unstable();
+        assert_eq!(
+            closed,
+            ["quick", "slow"],
+            "every close runs, the 8 s one included"
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(8));
+    }
+
+    /// MCP-640 with real servers: through the real dispatcher (its budget shortened to 400 ms, as
+    /// `a_slow_teardown_of_the_previous_session_does_not_cost_the_next_one_its_build` does, so the
+    /// test takes about a second rather than five), a stdio child that needs a second to exit after
+    /// its stdin closes gets that second and exits by itself, and an HTTP session whose `DELETE`
+    /// takes a second is ended. Red at the base: the handler was cut at the budget, the child was
+    /// killed before it wrote `graceful`, and the `DELETE` was never answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mcp640_a_cut_shutdown_neither_kills_a_child_early_nor_leaves_a_session_open() {
+        use cyrup_ext::{Dispatcher, NativeHandle, Subscriptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let graceful = dir.path().join("graceful");
+        let remote = crate::runtime::connection_builder_tests::HttpFixture::start_with_slow_delete(
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        let child = serde_json::json!({
+            "command": "sh",
+            "args": [
+                "-c",
+                format!("{LIVE_MCP}\nsleep 1\n: > \"$3\""),
+                "sh",
+                rmcp::model::ProtocolVersion::LATEST.as_str(),
+                dir.path().join("child-started").to_string_lossy(),
+                graceful.to_string_lossy(),
+            ],
+            "lifecycle": "keep-alive",
+        });
+        let (ext, state) = start_and_settle(
+            dir.path(),
+            serde_json::json!({
+                "child": child,
+                "remote": { "url": remote.url, "lifecycle": "keep-alive" },
+            }),
+            "child",
+        )
+        .await;
+        assert!(
+            state.manager.get_connection("remote").is_some(),
+            "the precondition: the HTTP session is open"
+        );
+
+        let handle = Arc::new(NativeHandle::new(
+            Arc::clone(&ext) as Arc<dyn NativeExtension>,
+            Subscriptions::empty().with(cyrup_ext::EventKind::SessionShutdown),
+            event_ctx(),
+        ));
+        let dispatcher = Dispatcher::with_budget(std::time::Duration::from_millis(400));
+        dispatcher.add(handle).unwrap();
+        dispatcher
+            .dispatch_notify(&session_shutdown_event(), &cyrup_core::CancelToken::new())
+            .await;
+
+        assert!(
+            graceful.exists(),
+            "the child was killed before the end of its grace"
+        );
+        assert_eq!(
+            remote
+                .deletes_answered
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the HTTP session was not ended"
         );
     }
 

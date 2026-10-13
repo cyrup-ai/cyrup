@@ -55,11 +55,11 @@ class AreaCounts(unittest.TestCase):
         return json.loads(result.stdout)["per_area"]
 
     def test_area_13_reads_only_its_standard_item_tables(self):
-        # 53 rows across eight files; a table with `id | severity` but no
+        # 55 rows across eight files; a table with `id | severity` but no
         # `kind` (13-cyrup-mcp.md's "why it is a unit" table) is not an item
         # table and must not be counted.
         items = census.parse_area_13(LEDGER)
-        self.assertEqual(len(items), 53)
+        self.assertEqual(len(items), 55)
         self.assertEqual(sorted({i["file"] for i in items}), sorted(census.AREA_13_FILES))
 
     def test_area_15_skips_the_rerating_table(self):

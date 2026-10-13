@@ -7153,7 +7153,7 @@ mod wire_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod connection_builder_tests {
+pub(crate) mod connection_builder_tests {
     use super::*;
     use std::collections::HashMap;
 
@@ -7763,9 +7763,12 @@ done
 
     /// How many `initialize` POSTs to answer with 401 before answering with a real handshake.
     /// `usize::MAX` is the permanent-401 server.
-    struct HttpFixture {
-        url: String,
+    pub(crate) struct HttpFixture {
+        pub(crate) url: String,
         log: Arc<std::sync::Mutex<Vec<Recorded>>>,
+        /// How many session `DELETE`s the fixture has answered, counted after the answer is
+        /// written ([`FixtureOptions::slow_delete`]).
+        pub(crate) deletes_answered: Arc<std::sync::atomic::AtomicUsize>,
         _task: tokio::task::JoinHandle<()>,
     }
 
@@ -7808,6 +7811,9 @@ done
         /// Answer `initialize` with an SSE stream whose one event is a reply nested
         /// [`DEEP_REPLY_DEPTH`] levels deep, and keep the stream open after it.
         deep_initialize_sse: bool,
+        /// End the session on `DELETE`, answering `200` after this long, rather than refusing it
+        /// with `405` (MCP-640: a session's end that takes time).
+        slow_delete: Option<std::time::Duration>,
     }
 
     /// How [`FixtureOptions::deep_tool_call`] sends its reply.
@@ -7843,6 +7849,7 @@ done
                 require_bearer: None,
                 deep_tool_call: None,
                 deep_initialize_sse: false,
+                slow_delete: None,
             }
         }
     }
@@ -7873,6 +7880,15 @@ done
             .await
         }
 
+        /// A fixture that ends its session on `DELETE`, answering after `delay` (MCP-640).
+        pub(crate) async fn start_with_slow_delete(delay: std::time::Duration) -> Self {
+            Self::start_with(FixtureOptions {
+                slow_delete: Some(delay),
+                ..FixtureOptions::default()
+            })
+            .await
+        }
+
         async fn start_with(options: FixtureOptions) -> Self {
             let FixtureOptions {
                 unauthorized_initializes,
@@ -7884,7 +7900,10 @@ done
                 require_bearer,
                 deep_tool_call,
                 deep_initialize_sse,
+                slow_delete,
             } = options;
+            let deletes_answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let answered = Arc::clone(&deletes_answered);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind loopback");
@@ -7930,6 +7949,18 @@ done
                         }),
                     };
 
+                    if recorded.method == "DELETE"
+                        && let Some(delay) = slow_delete
+                    {
+                        tokio::time::sleep(delay).await;
+                        use tokio::io::AsyncWriteExt as _;
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let _ = socket.shutdown().await;
+                        answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        continue;
+                    }
                     let response = if recorded.method == "GET" || recorded.method == "DELETE" {
                         // No server-initiated stream and no session teardown: both are optional.
                         "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
@@ -8051,6 +8082,7 @@ done
             Self {
                 url: format!("http://{addr}/mcp"),
                 log,
+                deletes_answered,
                 _task: task,
             }
         }
