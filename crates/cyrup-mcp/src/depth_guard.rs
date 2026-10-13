@@ -10,15 +10,33 @@
 //!
 //! # Refused, not read [CYRUP-DELTA]
 //!
-//! A JavaScript client reads such a reply. This port could too: it owns the stdio reader (see
-//! [`crate::stdio_child`]) and the HTTP POST, and `serde_json::Deserializer::disable_recursion_limit`
-//! is a call away. It refuses instead, because the reply does not end at the transport: a tool's
-//! `structuredContent` goes into the session file and a tool's `inputSchema` into `mcp-cache.json`,
-//! and both are read back with serde_json's limit. The session loader skips a line it cannot parse
-//! (`cyrup-session` `manager/load.rs`, the `Entry` arm), so a result read here — nested deeper
-//! still inside its session entry — would vanish from the session on resume, without a word; and
-//! `load_metadata_cache` (`dirs.rs`) treats a cache it cannot parse as absent.
+//! A JavaScript client reads such a reply (`JSON.parse` has no depth limit). This port refuses it:
+//! 127 levels is the limit of every serde_json reader on a result's path, and of one that this crate
+//! cannot reach. Measured (MCP-637), reader by reader, transport to session to cache:
 //!
+//! | reader | nests the reply's JSON | limit |
+//! |---|---|---|
+//! | this guard, before any parse | as the reply | 127 ([`MAX_READ_DEPTH`]) |
+//! | rmcp's stdio line codec (`transport/async_rw.rs:164-172` @3.1.4) | as the reply | serde_json's 127 |
+//! | the HTTP JSON body, parsed here ([`read_json_body`]) | as the reply | serde_json's 127 |
+//! | an SSE event, parsed by rmcp (`common/client_side_sse.rs:409-417`) | as the reply | serde_json's 127, out of this crate's reach |
+//! | the session loader (`cyrup-session` `manager/load.rs`), on the tool result's line | the reply **+ 2** (`details.mcpResult`, measured by `cyrup-it`'s `deep_result`) | serde_json's 127; an unreadable line is skipped |
+//! | the cache readers (`dirs::load_metadata_cache`, `registration::load_metadata_cache`), on `mcp-cache.json` | a `tools/list` reply **+ 1** | serde_json's 127; an unreadable file is absent |
+//! | a codemode script (V8's `JSON.parse`, `prelude.js` `settle`) | the result | none |
+//!
+//! Nothing in the workspace disables the limit (`disable_recursion_limit` needs serde_json's
+//! `unbounded_depth`, which is off) or grows the stack under a deep parse (no `serde_stacker`).
+//! Reading past 127 would need all three: rmcp's SSE parse, which is not this crate's; a parse with
+//! no limit that does not overflow a worker's stack on a hostile reply, which aborts the process
+//! rather than failing one request; and a session loader that reads the entry.
+//!
+//! Within 127, what is read is persisted so that it reads back: the result's `details.mcpResult` is
+//! summarized past [`crate::renderers::MCP_RESULT_MAX_DEPTH`] (a reply nested 126 or 127 made a
+//! 128- or 129-level line, which the loader skipped, and the tool result vanished on resume), and
+//! a catalogue that would nest `mcp-cache.json` past 127 is not cached (a 127-level `tools/list`
+//! reply made a 128-level file, which neither reader parsed, and every server's catalogue went
+//! with it).
+
 //! # What a refusal does
 //!
 //! Each incoming message is measured before rmcp parses it ([`nesting_depth`], one pass, string

@@ -23,9 +23,21 @@
 //! A server whose tools the cache already holds is not in the set: they were registered before any
 //! server was contacted, so there is nothing to wait for. pi has no cache, which is why it waits for
 //! every server that declares tools.
+//!
+//! # A call through a server's own route (MCP-635)
+//!
+//! pi registers a server's tools from that server's own connection once it is ready
+//! (`registerTools`, `extensions/mcp/index.ts:368` @v1.0.4) and calls through that connection
+//! (`tools.ts:281-283`), so a call to a fast server is never held by a slow one. Here a direct call
+//! goes through a [`crate::proxy::ProxyCtx`], which the commit installs once every server has
+//! answered. The pass carries a context of its own over the generation's state as soon as the build
+//! has created that state ([`StartupPass::state_built`]) — the same `McpState` the commit installs,
+//! with the commit still to come — and [`StartupPass::route_for`] hands it to a call once the
+//! call's own server has settled, unless that server failed to connect, whose answer (the backoff the
+//! commit records) is the build's to give.
 
 use std::collections::BTreeSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -97,6 +109,11 @@ pub enum Waited {
 /// The surface sync the extension runs when a server's catalogue has been written.
 type Publisher = Box<dyn Fn() + Send + Sync>;
 
+/// What the extension builds a call's route from once the build has created the generation's state:
+/// the proxy context the commit would install, or `None` when the generation is no longer current.
+type Contextualizer =
+    Box<dyn Fn(&Arc<crate::state::McpState>) -> Option<Arc<crate::proxy::ProxyCtx>> + Send + Sync>;
+
 /// One build's startup pass, shared by the build that advances it and every wait on it.
 pub struct StartupPass {
     progress: watch::Sender<StartupProgress>,
@@ -108,6 +125,14 @@ pub struct StartupPass {
     /// process, and two surface syncs that interleave can each register against the other's stale
     /// view of what is already registered.
     publishing: Mutex<()>,
+    /// Builds [`Self::context`] from the state, installed by the extension (MCP-635).
+    contextualizer: OnceLock<Contextualizer>,
+    /// The route a direct call takes to its own server before the commit (MCP-635): a proxy
+    /// context over the state this build created.
+    context: OnceLock<Arc<crate::proxy::ProxyCtx>>,
+    /// The servers whose startup connect ended without a connection — failed, or needing
+    /// authentication. A call to one of them waits for the build, which records why.
+    unconnected: Mutex<BTreeSet<String>>,
 }
 
 impl Default for StartupPass {
@@ -124,7 +149,71 @@ impl StartupPass {
             progress: watch::Sender::new(StartupProgress::default()),
             publisher: OnceLock::new(),
             publishing: Mutex::new(()),
+            contextualizer: OnceLock::new(),
+            context: OnceLock::new(),
+            unconnected: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Install what [`Self::state_built`] builds a call's route with. The first one wins.
+    pub fn set_contextualizer(
+        &self,
+        contextualizer: impl Fn(&Arc<crate::state::McpState>) -> Option<Arc<crate::proxy::ProxyCtx>>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        let _ = self.contextualizer.set(Box::new(contextualizer));
+    }
+
+    /// The build has created the generation's state, before it contacts any server: build the
+    /// route a direct call takes before the commit.
+    pub fn state_built(&self, state: &Arc<crate::state::McpState>) {
+        if let Some(contextualize) = self.contextualizer.get()
+            && let Some(context) = contextualize(state)
+        {
+            let _ = self.context.set(context);
+        }
+    }
+
+    /// The route built by [`Self::state_built`], if there is one yet.
+    #[must_use]
+    pub fn context(&self) -> Option<Arc<crate::proxy::ProxyCtx>> {
+        self.context.get().cloned()
+    }
+
+    /// `server`'s startup connect ended without a connection. Recorded before it settles.
+    pub fn unconnected(&self, server: &str) {
+        if let Ok(mut unconnected) = self.unconnected.lock() {
+            unconnected.insert(server.to_string());
+        }
+    }
+
+    /// Wait until `server` has settled, with no bound of its own, and answer the route a call to
+    /// it takes before the commit (MCP-635).
+    ///
+    /// `None` when the pass ends first (the build has settled and its own answer stands), when the
+    /// server's startup connect ended without a connection (the build records why, and that is
+    /// the answer the call gets), or when the build created no route. Cancellation is the
+    /// caller's: the future holds no resource.
+    pub async fn route_for(&self, server: &str) -> Option<Arc<crate::proxy::ProxyCtx>> {
+        let mut progress = self.progress.subscribe();
+        let settled = progress
+            .wait_for(|progress| progress.finished || progress.pending([server]).is_empty())
+            .await
+            .ok()
+            .is_some_and(|progress| !progress.finished);
+        if !settled {
+            return None;
+        }
+        let unconnected = self
+            .unconnected
+            .lock()
+            .map_or(true, |unconnected| unconnected.contains(server));
+        if unconnected {
+            return None;
+        }
+        self.context()
     }
 
     /// Install what [`Self::publish`] runs after a server's catalogue is written. The first one
@@ -448,5 +537,90 @@ mod tests {
             Waited::Settled,
             "an empty wait is no wait"
         );
+    }
+
+    /// MCP-635 — a call gets the route to its own server once that server has settled, while the
+    /// others are still being discovered; a server whose startup connect failed gets none (the
+    /// build's answer is its), and neither does a call still waiting when the pass ends. A server
+    /// the plan leaves out (its tools came from the cache) is routed at once. Red at `83daabf4`,
+    /// where there was no route and a call waited for the commit.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_gets_its_servers_route_once_that_server_settles_and_not_otherwise() {
+        let (ctx, _env) = crate::proxy::testsupport::ctx_with(
+            crate::config::McpConfig::default(),
+            &[],
+            &[],
+            crate::proxy::testsupport::FakeEnv::default(),
+        );
+        let pass = Arc::new(StartupPass::new());
+        assert!(pass.context().is_none(), "no route before the state exists");
+        {
+            let ctx = Arc::clone(&ctx);
+            pass.set_contextualizer(move |_| Some(Arc::clone(&ctx)));
+        }
+        pass.state_built(&ctx.state);
+
+        // Before the plan any server may be one the pass discovers.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pass.route_for("fast"))
+                .await
+                .is_err(),
+            "a route before the plan"
+        );
+
+        pass.plan(["fast".to_string(), "slow".to_string(), "down".to_string()]);
+        let driver = {
+            let pass = Arc::clone(&pass);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                pass.unconnected("down");
+                pass.settle("down");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                pass.settle("fast");
+            })
+        };
+        let started = tokio::time::Instant::now();
+        let route = tokio::time::timeout(Duration::from_secs(10), pass.route_for("fast"))
+            .await
+            .expect("the route is handed out when its server settles")
+            .expect("a connected server has a route");
+        assert!(Arc::ptr_eq(&route, &ctx));
+        assert_eq!(started.elapsed(), Duration::from_millis(200));
+        driver.await.unwrap();
+
+        assert!(
+            pass.route_for("down").await.is_none(),
+            "a server that did not connect waits for the build's answer"
+        );
+        assert!(
+            pass.route_for("cached").await.is_some(),
+            "a server the plan leaves out is routed at once"
+        );
+
+        let waiter = {
+            let pass = Arc::clone(&pass);
+            tokio::spawn(async move { pass.route_for("slow").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        pass.finish();
+        assert!(
+            waiter.await.unwrap().is_none(),
+            "once the pass has ended the build's answer stands"
+        );
+    }
+
+    /// A contextualizer that declines (a generation no longer current) leaves no route.
+    #[test]
+    fn a_declined_route_is_no_route() {
+        let (ctx, _env) = crate::proxy::testsupport::ctx_with(
+            crate::config::McpConfig::default(),
+            &[],
+            &[],
+            crate::proxy::testsupport::FakeEnv::default(),
+        );
+        let pass = StartupPass::new();
+        pass.set_contextualizer(|_| None);
+        pass.state_built(&ctx.state);
+        assert!(pass.context().is_none());
     }
 }

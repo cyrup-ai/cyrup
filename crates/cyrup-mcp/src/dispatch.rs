@@ -92,12 +92,20 @@ impl McpDispatch {
     /// generation N against generation N+1's owner, which is active, and so would let the stale
     /// call through — the precise write the fence exists to refuse.
     ///
-    /// A build in flight is waited for until it settles, with no bound of its own, and the call's
-    /// own `cancel` ends the wait (MCP-631). Upstream's direct tool waits the same way —
-    /// `await ensureSessionRuntime(ctx)` before its executor runs (`index.ts:491` @v5.2.0), with no
-    /// bound — but observes no signal while it does; the gateway's wait is the bounded one
+    /// A build in flight is waited for, with no bound of its own, and the call's own `cancel` ends
+    /// the wait (MCP-631). Upstream's direct tool waits the same way — `await
+    /// ensureSessionRuntime(ctx)` before its executor runs (`index.ts:491` @v5.2.0), with no bound —
+    /// but observes no signal while it does; the gateway's wait is the bounded one
     /// ([`ProxyInitGate`]).
-    async fn gate(&self, cancel: &CancelToken) -> Gate {
+    ///
+    /// What it waits for is its own `server`, not the whole build (MCP-635): once that server has
+    /// settled in the startup pass, the call goes through the route the pass built over the
+    /// generation's state ([`crate::startup::StartupPass::route_for`]), while slower servers are
+    /// still connecting. pi's built-in extension holds no call on another server: it registers a
+    /// server's tools from that server's connection once ready (`registerTools`,
+    /// `extensions/mcp/index.ts:368` @v1.0.4) and calls through it (`tools.ts:281-283`). A server
+    /// whose startup connect failed, or a build that settles first, gets the build's own answer.
+    async fn gate(&self, server: &str, cancel: &CancelToken) -> Gate {
         let Some(extension) = self.extension.upgrade() else {
             return Gate {
                 owner: None,
@@ -125,7 +133,7 @@ impl McpDispatch {
                     outcome: GateOutcome::Aborted,
                 };
             }
-            settled = settle(&extension, &build) => settled,
+            settled = settle_for(&extension, &build, server) => settled,
         };
         let outcome = match settled {
             Settled::Ready(ctx) => GateOutcome::Ready(ctx),
@@ -216,6 +224,26 @@ async fn settle(extension: &Arc<McpExtension>, build: &Arc<Build>) -> Settled {
     }
 }
 
+/// What a direct call to `server` that joined the build in flight comes to: the route to its own
+/// server once that server has settled (MCP-635), or else what the build came to.
+///
+/// The build's answer wins a tie, so a call that finds both settled at once takes the committed
+/// context rather than the pass's.
+async fn settle_for(extension: &Arc<McpExtension>, build: &Arc<Build>, server: &str) -> Settled {
+    let own = async {
+        match build.startup().route_for(server).await {
+            Some(ctx) => ctx,
+            // The build's answer is the call's: wait for it alone.
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        settled = settle(extension, build) => settled,
+        ctx = own => Settled::Ready(ctx),
+    }
+}
+
 /// `index.ts:917` — the rejected-build envelope, reporting the message rather than throwing it.
 fn init_failed_result(message: &str) -> ToolResult {
     let mut map = JsonMap::new();
@@ -286,7 +314,7 @@ impl McpToolDispatch for McpDispatch {
         // began does not wait for anything.
         crate::abort::throw_if_aborted(&cancel, None)
             .map_err(|error| ToolError::new(error.to_string()))?;
-        let gate = self.gate(&cancel).await;
+        let gate = self.gate(&spec.server_name, &cancel).await;
         let ctx = match gate.outcome {
             GateOutcome::Ready(ctx) => ctx,
             // [CYRUP-DELTA, upward] The call's own cancel ends its wait for the build; upstream's

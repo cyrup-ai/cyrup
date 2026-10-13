@@ -745,6 +745,15 @@ pub fn load_metadata_cache(path: &Path) -> Option<MetadataCache> {
     Some(parsed)
 }
 
+/// How many arrays and objects deep a server's entry sits in `mcp-cache.json`: the file's object and
+/// its `servers` (MCP-637).
+pub const CACHE_ENTRY_DEPTH: usize = 2;
+
+/// How deep `entry` nests once serialized.
+fn nesting_depth_of(entry: &ServerCacheEntry) -> usize {
+    serde_json::to_vec(entry).map_or(0, |bytes| crate::depth_guard::nesting_depth(&bytes))
+}
+
 /// `saveMetadataCache(cache)` (`metadata-cache.ts:57`) — merge over whatever is on disk, then write
 /// atomically.
 ///
@@ -823,6 +832,23 @@ pub fn save_metadata_cache_with(
                 // Another process discovered the same config more recently; its catalogue wins.
                 continue;
             }
+        }
+        // MCP-637 — never write what the reader cannot read. An entry sits two levels into the file
+        // (the file's object, `servers`), and a file nested past serde_json's limit does not parse:
+        // both readers would take the whole cache for absent, every server's catalogue with it, and
+        // the next write would replace what it could not merge. The file holds a tool's
+        // `inputSchema` one level deeper than the `tools/list` reply that carried it (5 levels in,
+        // against 4), so a schema nested 123 levels arrives in a 127-level reply, which is read,
+        // and would make a 128-level file, which is not. Such a catalogue is left out instead, its
+        // old entry too, and the next startup discovers the server again as if it had no cache —
+        // which is all pi has.
+        if CACHE_ENTRY_DEPTH + nesting_depth_of(entry) > crate::depth_guard::MAX_READ_DEPTH {
+            tracing::warn!(
+                "MCP: {name}'s catalogue is nested too deep to be read back from {}; it is not cached",
+                path.display()
+            );
+            merged.servers.shift_remove(name);
+            continue;
         }
         merged.servers.insert(name.clone(), entry.clone());
     }
@@ -3010,6 +3036,75 @@ mod tests {
         );
         assert!(!is_server_cache_valid(&parsed.servers["bad"], "h", 0));
         assert!(is_server_cache_valid(&parsed.servers["good"], "h", 0));
+    }
+
+    /// A tool whose `inputSchema` nests `schema` levels: `{"v":[[…1…]]}`.
+    fn tool_with_schema_nested(schema: usize) -> CachedTool {
+        let arrays = schema - 1;
+        let text = format!(r#"{{"v":{}1{}}}"#, "[".repeat(arrays), "]".repeat(arrays));
+        CachedTool {
+            name: "deep".to_string(),
+            input_schema: Some(serde_json::from_str(&text).unwrap()),
+            ..CachedTool::default()
+        }
+    }
+
+    /// MCP-637 — the cache never holds what its reader cannot read. A tool schema nested 123
+    /// levels comes in a `tools/list` reply nested 127, which is read, and would make the file
+    /// nest 128, which neither reader parses: both took the whole cache for absent, the other
+    /// servers' catalogues with it. Measured here on the real writer and reader: 122 levels make a
+    /// 127-level file that reads back; 123 are left out, with the server's old entry, and the rest
+    /// of the cache stays readable. Red at `83daabf4`, where the 128-level file was written and
+    /// nothing read back.
+    #[test]
+    fn a_catalogue_nested_past_what_the_cache_reader_reads_is_left_out_of_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let path = dirs.metadata_cache();
+        let entry = |tools: Vec<CachedTool>| ServerCacheEntry {
+            config_hash: "h".to_string(),
+            tools,
+            cached_at: 1,
+            ..ServerCacheEntry::default()
+        };
+
+        let mut cache = MetadataCache::default();
+        cache.servers.insert(
+            "other".to_string(),
+            entry(vec![CachedTool {
+                name: "plain".to_string(),
+                ..CachedTool::default()
+            }]),
+        );
+        cache.servers.insert(
+            "deep".to_string(),
+            entry(vec![tool_with_schema_nested(122)]),
+        );
+        save_metadata_cache(&path, &cache).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(crate::depth_guard::nesting_depth(text.as_bytes()), 127);
+        let read = load_metadata_cache(&path).expect("a 127-level cache reads back");
+        assert!(read.servers.contains_key("deep") && read.servers.contains_key("other"));
+
+        let mut deeper = MetadataCache::default();
+        deeper.servers.insert(
+            "deep".to_string(),
+            entry(vec![tool_with_schema_nested(123)]),
+        );
+        save_metadata_cache(&path, &deeper).unwrap();
+        let read = load_metadata_cache(&path).expect("the cache is still readable");
+        assert!(
+            !read.servers.contains_key("deep"),
+            "the catalogue too deep to read back is not cached, nor is its old entry kept"
+        );
+        assert!(
+            read.servers.contains_key("other"),
+            "the other servers' catalogues survive"
+        );
+        assert!(
+            crate::registration::load_metadata_cache(&dirs).is_some(),
+            "and the lenient reader agrees"
+        );
     }
 
     #[test]

@@ -1228,25 +1228,47 @@ impl McpExtension {
     /// same reason: the env holds the committed state, so it cannot exist before the commit.
     /// Wave 2's MCP-011 commit tail calls the two together.
     pub fn install_runtime_env(&self, state: &Arc<McpState>) {
-        let Some(weak) = self.self_weak.get().cloned() else {
+        let Some(ctx) = self.runtime_ctx(state) else {
             // Built without `into_arc` — the in-crate unit tests hold the value directly. With no
             // self handle the env's `sync_tool_surface` could not call back, so install nothing
             // rather than a half-wired context.
             tracing::debug!("MCP: no self handle bound; runtime env not installed");
             return;
         };
+        if let Ok(mut slot) = self.proxy_ctx.lock() {
+            *slot = Some(ctx);
+        }
+    }
+
+    /// A [`crate::proxy::ProxyCtx`] over `state` and the one production
+    /// [`crate::proxy::ProxyEnv`] — what [`Self::install_runtime_env`] installs at the commit, and
+    /// what a direct call to a server that has settled uses before it (MCP-635). `None` without a
+    /// self handle.
+    fn runtime_ctx(&self, state: &Arc<McpState>) -> Option<Arc<crate::proxy::ProxyCtx>> {
+        let weak = self.self_weak.get().cloned()?;
         let env = Arc::new(crate::live::RuntimeEnv::new(
             Arc::clone(state),
             self.dirs.clone(),
             weak,
         ));
-        let ctx = Arc::new(crate::proxy::ProxyCtx::new(
+        Some(Arc::new(crate::proxy::ProxyCtx::new(
             Arc::clone(state),
             env as Arc<dyn crate::proxy::ProxyEnv>,
-        ));
-        if let Ok(mut slot) = self.proxy_ctx.lock() {
-            *slot = Some(ctx);
-        }
+        )))
+    }
+
+    /// The commit's steps 2b and 2c, which bind a generation's state to its dispatch: the context
+    /// a consent dialog takes its P-3 guard from (MCP-471), and the OAuth runtime the keep-alive
+    /// checks ask whether a sign-in is pending (MCP-334). Run when the build creates the state, so
+    /// a call that goes through it before the commit (MCP-635) has both, and again at the commit.
+    fn bind_generation(state: &Arc<McpState>, dispatch_ctx: &HostCtx) {
+        state.set_human_wait_ctx(dispatch_ctx);
+        let runtime = Arc::clone(&state.oauth_runtime);
+        state
+            .lifecycle
+            .set_pending_auth_check(Arc::new(move |server: &str| {
+                crate::oauth::has_pending_auth_sync(&runtime, server, None)
+            }));
     }
 
     /// This generation's proxy context, for the dispatcher (MCP-214).
@@ -1326,6 +1348,21 @@ impl McpExtension {
                 {
                     ext.sync_tool_surface();
                 }
+            });
+        }
+        // MCP-635 — the route a direct call takes to its own server before the commit. Built when
+        // the build has created its state, under the same staleness guards as the publisher.
+        {
+            let weak = Arc::downgrade(&strong);
+            let owner = Arc::clone(&owner);
+            let dispatch_ctx = dispatch_ctx.clone();
+            startup.set_contextualizer(move |state| {
+                let ext = weak.upgrade()?;
+                if !owner.is_active() || ext.generation() != generation {
+                    return None;
+                }
+                Self::bind_generation(state, &dispatch_ctx);
+                ext.runtime_ctx(state)
             });
         }
         let task: InitTask = {
@@ -1463,8 +1500,7 @@ impl McpExtension {
         // `SessionStart` is `None`: the build is spawned, so the handler has long returned by the
         // time the state exists. Without this line the generation's first consent dialog would run
         // with `with_human_wait(None)` and forfeit its P-3 budget forgiveness.
-        next_state.set_human_wait_ctx(dispatch_ctx);
-
+        //
         // 2c — MCP-334: bind `hasPendingAuth` to THIS generation's OAuth runtime.
         //
         // `initialize_mcp` step 7 builds the lifecycle manager before the state exists, so it can
@@ -1480,18 +1516,14 @@ impl McpExtension {
         // (`new McpLifecycleManager(manager, name => hasPendingAuth(name, undefined, oauthRuntime))`,
         // `init.ts:143`): the scan is by server name, which is what the lifecycle manager knows.
         //
-        // Installed HERE, from the committed state, rather than at construction, because
-        // `state.oauth_runtime` is the runtime this generation actually authenticates through — a
-        // predicate bound earlier could only have captured a runtime that a replacement might have
-        // superseded.
-        {
-            let runtime = Arc::clone(&next_state.oauth_runtime);
-            next_state
-                .lifecycle
-                .set_pending_auth_check(Arc::new(move |server: &str| {
-                    crate::oauth::has_pending_auth_sync(&runtime, server, None)
-                }));
-        }
+        // Installed from the state itself, rather than at the lifecycle manager's construction,
+        // because `state.oauth_runtime` is the runtime this generation actually authenticates
+        // through — a predicate bound earlier could only have captured a runtime that a replacement
+        // might have superseded.
+        //
+        // Both are bound already, when the build created the state (MCP-635); binding them again
+        // here keeps the commit whole for a build that had no startup pass to do it.
+        Self::bind_generation(&next_state, dispatch_ctx);
 
         // 3 — the proxy context, BEFORE the dispatcher is installed. Reversed, a tool call landing
         // in the window between the two would find an installed dispatcher whose `proxy_ctx()` is
@@ -1718,7 +1750,7 @@ impl McpExtension {
     /// cyrup dispatches `Input` as an awaited emission before the turn is built
     /// (`cyrup-session-svc`'s `emit_input_event`), so awaiting here has upstream's exact effect.
     ///
-    /// **One host difference, compensated for the build wait only.** `cyrup_ext::dispatch`'s
+    /// **One host difference, compensated for by declaring both waits.** `cyrup_ext::dispatch`'s
     /// `DEFAULT_INVOKE_BUDGET` caps every native handler at 5 s and, on expiry, skips it, logs a
     /// fault and shows `Extension error (mcp): extension timed out (epoch deadline)`; upstream's
     /// `await` has no such budget. A server that needs longer than 5 s to start (a cold `npx`
@@ -1726,12 +1758,15 @@ impl McpExtension {
     /// nothing. The server wait is declared ([`cyrup_ext::native::SanctionedWaitKind::ServerConnect`])
     /// and ends at its own bound, so the handler returns quietly before the budget could cut it.
     ///
-    /// The convergence pass after it is not declared, and keeps the budget: upstream awaits it with
-    /// no bound of its own, its reconnects bounded by their connect budgets and its refreshes by
-    /// `KEEP_ALIVE_REFRESH_TIMEOUT_MS` (`lifecycle.ts:127-137`, `server-manager.ts:704` @v5.2.0),
-    /// and holding a submission that long is a choice this port has not made (`MCP-636`). This
-    /// port has no `KEEP_ALIVE_REFRESH_TIMEOUT_MS`: its `refreshTools` is not wired (`MCP-120`).
-    /// A pass the budget cuts goes on detached
+    /// The convergence pass after it is declared too (MCP-636): upstream awaits it with no bound of
+    /// its own, its reconnects bounded by their connect budgets (`lifecycle.ts:127-137` @v5.2.0),
+    /// so a keep-alive server that died since the last tick is back before the request is built.
+    /// Its ceiling is derived from the same bounds
+    /// ([`crate::lifecycle::McpLifecycleManager::convergence_bound`]: 123 s for one stdio server at
+    /// the 60 s default, a reconnect being its handshake and its discovery plus the close of a
+    /// failed one), plus the dispatcher's 5 s for the handler's remainder. A pass that outlives it —
+    /// one held by a keyring read or an `auth.provider` token, which nothing here bounds — is cut
+    /// as before, and goes on detached
     /// ([`crate::lifecycle::McpLifecycleManager::ensure_converged`]), so the next submission joins
     /// it rather than a memo of one that never finished.
     async fn on_input(&self, ctx: &HostCtx) {
@@ -1771,6 +1806,21 @@ impl McpExtension {
             return;
         }
 
+        // Declared (MCP-636), so the dispatcher's 5 s budget does not cut the pass: upstream awaits
+        // it, and the bound is the pass's own — what its reconnects can take, added up from their
+        // request timeouts ([`crate::lifecycle::McpLifecycleManager::convergence_bound`]).
+        let global_ms = state
+            .config
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.request_timeout_ms);
+        let bound = state.lifecycle.convergence_bound(|definition| {
+            crate::runtime::resolve_request_timeout(Some(definition), global_ms)
+        });
+        let _wait = ctx.begin_sanctioned_wait(
+            cyrup_ext::native::SanctionedWaitKind::ServerConnect,
+            bound + cyrup_ext::dispatch::DEFAULT_INVOKE_BUDGET,
+        );
         if let Err(error) = state.lifecycle.ensure_converged(owner.token()).await {
             // `if (!isAbortError(error, inputOwner.signal))` — a cancelled pass is the expected
             // shape of a session ending mid-submission, not a fault worth a line.
@@ -3475,6 +3525,61 @@ mod tests {
         );
     }
 
+    /// MCP-636 — a keep-alive server that takes 8 s to reconnect is back before the submission goes
+    /// on, through the real dispatcher and its 5 s budget. Upstream awaits `ensureConverged` on
+    /// `input` (`lifecycle.ts:127-137` @v5.2.0); here the pass was undeclared, so the budget cut the
+    /// handler at 5 s with the reconnect still running and the turn went on without the server.
+    /// Red at `83daabf4`: the dispatch returned at 5 s with `connected:slow` not yet logged.
+    #[tokio::test(start_paused = true)]
+    async fn a_keep_alive_server_that_takes_eight_seconds_to_reconnect_is_back_before_the_turn() {
+        use cyrup_ext::{Dispatcher, NativeHandle, Subscriptions};
+
+        let supervisor = crate::lifecycle::tests::FakeSupervisor::arc();
+        *supervisor.connect_delay.lock().unwrap() = std::time::Duration::from_secs(8);
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let manager = Arc::new(crate::state::McpServerManager::default());
+        let lifecycle = Arc::new(crate::lifecycle::McpLifecycleManager::with_supervisor(
+            Arc::clone(&manager),
+            Arc::new(|_| false),
+            Arc::clone(&supervisor) as Arc<dyn crate::lifecycle::ConnectionSupervisor>,
+        ));
+        let state = state_over(Arc::clone(&owner), manager, lifecycle);
+        state.lifecycle.register_server(
+            "slow",
+            crate::config::ServerEntry {
+                lifecycle: Some(crate::config::ServerLifecycle::KeepAlive),
+                command: Some("slow-server".to_string()),
+                ..Default::default()
+            },
+            None,
+        );
+        state.lifecycle.mark_keep_alive("slow");
+
+        let ext = extension().into_arc();
+        *ext.owner.lock().unwrap() = Some(Arc::clone(&owner));
+        *ext.state.lock().unwrap() = Some(Arc::clone(&state));
+
+        let handle = Arc::new(NativeHandle::new(
+            Arc::clone(&ext) as Arc<dyn NativeExtension>,
+            Subscriptions::empty().with(cyrup_ext::EventKind::Input),
+            event_ctx(),
+        ));
+        let dispatcher = Dispatcher::new();
+        dispatcher.add(handle).unwrap();
+
+        let started = tokio::time::Instant::now();
+        dispatcher
+            .dispatch_notify(&input_event(), &cyrup_core::CancelToken::new())
+            .await;
+
+        assert_eq!(
+            supervisor.log(),
+            ["connect:slow", "connected:slow"],
+            "the submission went on before the keep-alive server was back"
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(8));
+    }
+
     /// The two guards that make the handler safe on a dead or unbuilt generation
     /// (`index.ts:490-491`, `:502`). Neither may panic, and neither may converge.
     #[tokio::test]
@@ -4155,6 +4260,94 @@ done
         (ext, state)
     }
 
+    /// A stdio server whose `tools/list` result is the file `$2` and whose `tools/call` result is
+    /// the file `$3`, verbatim: replies as deep as a test needs, measured rather than assumed.
+    const DEEP_MCP: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"deep","version":"1"}}}\n' "$id" "$1"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":' "$id"; tr -d '\n' < "$2"; printf '}\n'
+      ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":' "$id"; tr -d '\n' < "$3"; printf '}\n'
+      ;;
+    *'"method":"notifications/'*) : ;;
+    *)
+      if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi
+      ;;
+  esac
+done
+"#;
+
+    /// MCP-637, measured on the real connect and the real cache writer: a `tools/list` reply nested
+    /// 127 levels — the deepest the transport reads — whose tool schema the cache would hold at 128,
+    /// where neither cache reader parses. The reply is read and the server connects; its catalogue
+    /// is left out of `mcp-cache.json`, which stays readable. Red at `83daabf4`, where the 128-level
+    /// file was written and both readers took the whole cache for absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_catalogue_the_cache_could_not_read_back_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        // `{"tools":[{"name":"deep","inputSchema":{"v":[[…1…]]}}]}`: the schema nests 123 levels.
+        let arrays = 122;
+        let list = format!(
+            r#"{{"tools":[{{"name":"deep","inputSchema":{{"v":{}1{}}}}}]}}"#,
+            "[".repeat(arrays),
+            "]".repeat(arrays)
+        );
+        let reply = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{list}}}"#);
+        assert_eq!(crate::depth_guard::nesting_depth(reply.as_bytes()), 127);
+        let list_file = dir.path().join("list.json");
+        std::fs::write(&list_file, &list).unwrap();
+        let deep = serde_json::json!({
+            "command": "sh",
+            "args": [
+                "-c",
+                DEEP_MCP,
+                "sh",
+                rmcp::model::ProtocolVersion::LATEST.as_str(),
+                list_file.to_string_lossy(),
+                list_file.to_string_lossy(),
+            ],
+            "lifecycle": "keep-alive",
+        });
+        let (ext, state) =
+            start_and_settle(dir.path(), serde_json::json!({ "deep": deep }), "deep").await;
+        assert!(
+            state
+                .tool_metadata
+                .lock()
+                .unwrap()
+                .get("deep")
+                .is_some_and(|tools| !tools.is_empty()),
+            "the 127-level reply was read"
+        );
+        // The startup pass's one cache flush has run once the build has committed.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while ext.init_task().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let path = ext.dirs().metadata_cache();
+        let text = std::fs::read_to_string(&path).expect("the startup pass wrote the cache");
+        assert!(
+            crate::depth_guard::nesting_depth(text.as_bytes())
+                <= crate::depth_guard::MAX_READ_DEPTH,
+            "mcp-cache.json was written deeper than its readers read"
+        );
+        let cache = crate::dirs::load_metadata_cache(&path).expect("mcp-cache.json reads back");
+        assert!(
+            !cache.servers.contains_key("deep"),
+            "the catalogue its reader could not read back was cached"
+        );
+    }
+
     // --- the wait before a `codemode` script or a `tool_search` (`pi.on("tool_call")`) ----------
 
     /// [`fixture_server`] whose child takes `seconds` to start answering — a first `npx` download.
@@ -4409,14 +4602,180 @@ done
         // the failure that names that answer is the proof the call reached the server.
         assert!(
             result_text(&result).contains("answered `tools/call` for \"echo\""),
-            "the call reached the server once the build committed: {}",
+            "the call reached the server once it had come up: {}",
             result_text(&result)
         );
         assert!(
             started.elapsed() >= std::time::Duration::from_secs(1),
             "the call returned before the 2 s server could have come up"
         );
-        assert!(ext.proxy_ctx().is_some(), "the answer came from the commit");
+        // The answer comes through the server's own route once it has settled, which can be before
+        // the commit (MCP-635), so this no longer asserts that the commit had happened.
+    }
+
+    /// MCP-635 — a direct call to a fast server is answered while a slow server is still
+    /// connecting. Before, a direct call that landed mid-build waited for the build's commit, which
+    /// waits for every server, so a call to a server that had answered in milliseconds waited as
+    /// long as the slowest one (here 20 s). pi registers a server's tools from its own connection
+    /// once it is ready and calls through it (`registerTools`, `extensions/mcp/index.ts:368`
+    /// @v1.0.4; `tools.ts:281-283`). Red at `83daabf4`: the call returned only after the commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_direct_call_to_a_fast_server_is_answered_while_a_slow_one_is_still_connecting() {
+        use cyrup_core::Tool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut fast = fixture_server(&dir.path().join("fast-started"));
+        let mut slow = slow_fixture_server(&dir.path().join("slow-started"), 20);
+        for entry in [&mut fast, &mut slow] {
+            let entry = entry.as_object_mut().unwrap();
+            entry.insert("directTools".to_string(), serde_json::json!(true));
+            entry.insert("lifecycle".to_string(), serde_json::json!("keep-alive"));
+        }
+        let config: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": { "fast": fast, "slow": slow }
+        }))
+        .unwrap();
+        let ext = McpExtension::with_config(
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            Some(config),
+        )
+        .with_home(dir.path().to_path_buf())
+        .into_arc();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
+        assert!(
+            ext.proxy_ctx().is_none() && ext.init_task().is_some(),
+            "the precondition: the build is in flight"
+        );
+
+        let direct = crate::registration::DirectTool::new(
+            crate::registration::DirectToolSpec {
+                server_name: "fast".to_string(),
+                original_name: "request".to_string(),
+                prefixed_name: "fast_request".to_string(),
+                description: "answers with the request it read".to_string(),
+                input_schema: None,
+                resource_uri: None,
+                lazy: false,
+            },
+            cyrup_core::ToolRenderKind::SelfRendered,
+            ext.dispatch()
+                .expect("`init` stashed the generation's executor slot"),
+            None,
+        );
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            direct.execute(
+                cyrup_core::ToolCallId::from("c1"),
+                serde_json::json!({}),
+                cyrup_core::CancelToken::new(),
+                Box::new(|_| {}),
+            ),
+        )
+        .await
+        .expect("the call is answered")
+        .expect("a direct call reports through its result");
+        let elapsed = started.elapsed();
+        let still_building = ext.proxy_ctx().is_none() && ext.init_task().is_some();
+
+        // The fixture's `request` tool answers with the `tools/call` line it read: the call reached
+        // the fast server's own process.
+        assert!(
+            result_text(&result).contains(r#""method":"tools/call""#),
+            "the call reached the fast server: {}",
+            result_text(&result)
+        );
+        assert!(
+            still_building,
+            "the call was answered after the commit, so it waited for the slow server ({elapsed:?})"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "the call waited {elapsed:?}, as long as the 20 s server"
+        );
+    }
+
+    /// MCP-635's other half, a guard (green at `83daabf4`, where every mid-build call waited for the
+    /// commit): a server whose startup connect failed is not given its own route. Its call waits for
+    /// the build, which records the failure, and gets that answer; it does not spawn the server a
+    /// second time while the build is still running. Red when the pass does not record the failed
+    /// connect (the call retried at once, and the child ran twice).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_direct_call_to_a_server_that_failed_to_start_waits_for_the_builds_answer() {
+        use cyrup_core::Tool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let spawns = dir.path().join("down-spawns");
+        let down = serde_json::json!({
+            "command": "sh",
+            "args": ["-c", "echo spawned >> \"$1\"; exit 1", "sh", spawns.to_string_lossy()],
+            "directTools": true,
+            "lifecycle": "keep-alive",
+        });
+        let mut slow = slow_fixture_server(&dir.path().join("slow-started"), 3);
+        slow.as_object_mut()
+            .unwrap()
+            .insert("directTools".to_string(), serde_json::json!(true));
+        let config: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": { "down": down, "slow": slow }
+        }))
+        .unwrap();
+        let ext = McpExtension::with_config(
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            Some(config),
+        )
+        .with_home(dir.path().to_path_buf())
+        .into_arc();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
+
+        let direct = crate::registration::DirectTool::new(
+            crate::registration::DirectToolSpec {
+                server_name: "down".to_string(),
+                original_name: "echo".to_string(),
+                prefixed_name: "down_echo".to_string(),
+                description: "echo".to_string(),
+                input_schema: None,
+                resource_uri: None,
+                lazy: false,
+            },
+            cyrup_core::ToolRenderKind::SelfRendered,
+            ext.dispatch()
+                .expect("`init` stashed the generation's executor slot"),
+            None,
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            direct.execute(
+                cyrup_core::ToolCallId::from("c1"),
+                serde_json::json!({}),
+                cyrup_core::CancelToken::new(),
+                Box::new(|_| {}),
+            ),
+        )
+        .await
+        .expect("the call is answered")
+        .expect("a direct call reports through its result");
+
+        assert_eq!(
+            error_code(&result).as_deref(),
+            Some("server_backoff"),
+            "{}",
+            result_text(&result)
+        );
+        assert!(
+            ext.proxy_ctx().is_some(),
+            "the answer is the committed build's, which recorded the failure"
+        );
+        let spawned = std::fs::read_to_string(&spawns).unwrap_or_default();
+        assert_eq!(
+            spawned.lines().count(),
+            1,
+            "the failed server was spawned again by the call"
+        );
     }
 
     /// **MCP-609 on the direct route, ungated.** A `DirectTool` call hands its own tool-call id to
@@ -6278,13 +6637,22 @@ done
     }
 
     fn input_state(owner: Arc<McpRuntimeOwner>) -> Arc<McpState> {
-        use futures::FutureExt;
-
         let manager = Arc::new(crate::state::McpServerManager::default());
         let lifecycle = Arc::new(crate::lifecycle::McpLifecycleManager::new(
             Arc::clone(&manager),
             Arc::new(|_| false),
         ));
+        state_over(owner, manager, lifecycle)
+    }
+
+    /// A state over `manager` and `lifecycle`, everything else defaulted.
+    fn state_over(
+        owner: Arc<McpRuntimeOwner>,
+        manager: Arc<crate::state::McpServerManager>,
+        lifecycle: Arc<crate::lifecycle::McpLifecycleManager>,
+    ) -> Arc<McpState> {
+        use futures::FutureExt;
+
         Arc::new(McpState::new(crate::state::McpStateParts {
             owner,
             manager,

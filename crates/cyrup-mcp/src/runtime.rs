@@ -546,6 +546,13 @@ pub async fn initialize_mcp(
     // and BEFORE step 11's connect pass, so no hook can observe a half-built generation.
     session.bind(&state);
 
+    // MCP-635 — the route a direct call takes to its own server before the commit: built over this
+    // state now, before any server is contacted, so a call to a server that has settled does not
+    // wait for the others.
+    if let Some(pass) = options.startup.as_ref() {
+        pass.state_built(&state);
+    }
+
     // Steps 10, 11 and 12. The two cleanups are registered in this order so the LIFO run order is
     // `gracefulShutdown` -> `shutdownOAuth`, and step 11 sits BETWEEN them — the position this
     // function's own wiring list gives it and the position `init.ts:198-207` has.
@@ -802,6 +809,9 @@ pub async fn initialize_mcp(
                                 );
                             }
                         });
+                    }
+                    if result.connection.is_none() {
+                        pass.unconnected(&result.name);
                     }
                     pass.settle(&result.name);
                 }
@@ -4209,9 +4219,10 @@ fn handshake_timeout_error(server: &str, stderr: Option<&StderrPump>) -> McpErro
 /// ([`UnauthorizedProbe`]) alike, and its request fails at once with
 /// [`crate::depth_guard::refusal_message`] — a `tools/list` fails the connect, a `tools/call`
 /// rejects. Before, rmcp dropped it as unparsable and the request ran to this budget. It is refused
-/// rather than read, although this port now owns the reader that could disable the limit, because
-/// the session file and `mcp-cache.json` would carry the reply on, deeper still, to readers that
-/// cannot (see [`crate::depth_guard`]).
+/// rather than read, although this port now owns the stdio and HTTP-body readers that could disable
+/// the limit, because rmcp's own SSE parse, which this crate cannot reach, stops at the same 127,
+/// and the session file holds a tool result 2 levels deeper than its reply for a loader with the
+/// same limit (MCP-637; [`crate::depth_guard`] measures each reader).
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `normalizeRequestTimeoutMs` (`server-manager.ts:1249-1253`): finite **and** strictly positive,

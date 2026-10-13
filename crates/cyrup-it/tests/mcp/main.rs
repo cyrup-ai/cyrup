@@ -24,6 +24,7 @@
 mod support;
 
 mod activation;
+mod deep_result;
 mod default_timeout;
 mod http_oauth;
 mod live_tool_call;
