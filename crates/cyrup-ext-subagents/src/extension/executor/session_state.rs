@@ -50,7 +50,9 @@ impl SubagentExecutor {
     /// former; only forwarding wants the latter.
     ///
     /// `None`/empty (headless, unpersisted, or no host services bound) means "no session identity",
-    /// which every consumer treats as pi treats a falsy `sessionId`: no filter, no stamp.
+    /// and each consumer decides what that means, as pi's do with a falsy `sessionId`: a listing
+    /// or a stamp goes unscoped, `bg_wait` refuses (`subagent-wait.ts:665-667` @ad11b7ab), and the
+    /// `agent_end` drain skips.
     #[must_use]
     pub fn current_session_id(&self) -> Option<String> {
         self.host_services()

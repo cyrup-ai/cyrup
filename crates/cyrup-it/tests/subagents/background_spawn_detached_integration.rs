@@ -1105,11 +1105,19 @@ async fn detached_runner_process_inherits_the_published_parent_session_anchor() 
         if exec_done {
             let environ =
                 std::fs::read(format!("/proc/{pid}/environ")).expect("read child environ");
-            break environ
-                .split(|b| *b == 0)
-                .filter(|chunk| !chunk.is_empty())
-                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                .collect();
+            // `exe` is not the whole discriminator: mid-`execve` the kernel has already switched
+            // the process to the new image's mm (so `exe` resolves to the spawned binary) while
+            // that mm's environment range is still unset — `create_elf_tables` sets
+            // `env_start`/`env_end` only after the new stack is laid out — so the read comes back
+            // EMPTY. Observed once under a full `xtask it` (`got: []`). Empty is "not yet", never
+            // the answer: a real environment always carries at least the overlay asserted below.
+            if !environ.is_empty() {
+                break environ
+                    .split(|b| *b == 0)
+                    .filter(|chunk| !chunk.is_empty())
+                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                    .collect();
+            }
         }
         assert!(
             std::time::Instant::now() < deadline,
