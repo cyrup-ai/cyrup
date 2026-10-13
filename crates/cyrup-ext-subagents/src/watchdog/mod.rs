@@ -49,6 +49,7 @@ pub mod change_signature;
 pub mod child_status;
 pub mod diff_tool;
 pub mod emission_guard;
+pub mod guidance;
 pub mod lsp_diagnostics;
 pub mod model_selection;
 pub mod permission_arbiter;

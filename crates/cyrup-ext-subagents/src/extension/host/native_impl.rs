@@ -435,6 +435,10 @@ impl NativeExtension for SubagentsExtension {
                     // scope record. Queued onto the live run, such a message never reaches
                     // `before_agent_start`, so this is the only edge either can see it on.
                     cyrup_ext::EventKind::Input,
+                    // SUBA-234 — pi `pi.on("model_select", () => runtime.handleModelChange())`
+                    // (`register-main.ts:407` @ad11b7ab): with clarification on, a session model
+                    // change aborts an in-flight watchdog review.
+                    cyrup_ext::EventKind::ModelSelect,
                     // R-SA-132/134 — the packaged-resources contribution. Upstream declares it
                     // statically in `package.json`'s `pi` block (`"skills": ["./skills"]`,
                     // `"prompts": ["./prompts"]`, `pi-subagents/package.json:52-62` @v0.34.0), which
@@ -1004,12 +1008,20 @@ impl NativeExtension for SubagentsExtension {
             // history, not the prompts that authorized the work in progress, so the next review's
             // `Current scope:` block still carries them (SUBA-235). An older upstream passed
             // `clearScope` here (`register-main.ts:433`), which is what this arm used to port.
-            // `clearActivity` has nothing to clear in cyrup: there is no delivered-orchestration
-            // activity collection yet (SUBA-234). The reset itself (pending deltas, the in-flight
-            // review, the emission guard) still runs, as upstream's does.
+            // `clearActivity` drops the delivered-orchestration activity tail (SUBA-234): the
+            // results it quoted were compacted away, so they are no longer evidence the reviewer
+            // can check against the transcript. The reset itself (pending deltas, the in-flight
+            // review, the emission guard) runs as upstream's does.
             HostEvent::SessionCompact { .. } => {
                 self.watchdog
-                    .reset(crate::watchdog::runtime::WatchdogResetOptions::default());
+                    .reset(crate::watchdog::runtime::WatchdogResetOptions {
+                        clear_activity: true,
+                        ..crate::watchdog::runtime::WatchdogResetOptions::default()
+                    });
+            }
+            // SUBA-234 — `handleModelChange()` (`register-main.ts:407` @ad11b7ab).
+            HostEvent::ModelSelect { .. } => {
+                self.watchdog.handle_model_change();
             }
             // R-SA-132/134: contribute this crate's BUNDLED packaged resources — the
             // `skills/pi-subagents/SKILL.md` operational skill and the seven `prompts/*.md`

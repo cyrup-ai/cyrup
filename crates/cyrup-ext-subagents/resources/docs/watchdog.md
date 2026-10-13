@@ -40,6 +40,9 @@ that configures the watchdog changes nothing on disk unless the caller explicitl
 - The turn delta — the messages, tool calls and file edits since the last review.
 - A change signature over the edited files, so an unchanged turn does not pay for a review.
 - LSP diagnostics for the edited files, where a language server is available.
+- **`WATCHDOG.md`** standing instructions, read fresh on every review: `<project>/.cyrup/WATCHDOG.md`
+  first, then `WATCHDOG.md` in the agent directory, capped at 8,000 characters. Set
+  `guidance.watchdogMd: false` to ignore them.
 
 An emission guard sits in front of the output so the same concern is not repeated turn after turn.
 
@@ -66,6 +69,37 @@ on.
 ```
 
 `/subagents-watchdog` shows the current state and toggles it for this session.
+
+## Optional main-session clarification
+
+Off by default. Turn it on alongside the watchdog:
+
+```json
+{ "subagents": { "watchdog": { "enabled": true, "clarification": true } } }
+```
+
+It applies **only to the main watchdog**, never to child watchdogs (`children.clarification` is
+rejected as an unknown key). With it on:
+
+- **The reviewer may ask.** At a boundary review it may call `watchdog_ask` with one focused question
+  and the concrete evidence behind it, when missing task status or intent prevents a concrete
+  judgment. The question *yields and ends* that review: it is shown as a
+  `subagent_watchdog_clarification` message that steers the session into one continuation, and
+  nothing waits for an answer. At most one question per user prompt, none after a warning, none
+  during a cadence review or a stalemate. Questions and evidence are capped at 1,000 and 2,000
+  characters. A question is **not approval, permission, or a warning**.
+- **It sees delivered orchestration.** Completed turns keep a bounded tail of *paired* orchestration
+  calls and their results — `subagent` dispatches and `status`/`resume`/`interrupt`/`steer`/`stop`,
+  `bg_wait`, and `subagent_supervisor` `pending`/`list`/`reply` — each entry bounded to 3,000
+  characters, the tail to its newest 6,000. The review input shows it as *Recent delivered
+  orchestration activity*. New activity admits one extra review per user prompt even with no edit.
+  Turning clarification or the watchdog off, a compaction, or a session switch clears it.
+- **Your message wins.** Any message you send while a review is running — idle or mid-run — aborts
+  that review, so a stale warning or question is never shown. A session model change does too, and
+  so does turning clarification off or changing the reviewer's model.
+
+With it off, none of this runs: no activity is collected, no question is offered, and your messages
+leave reviews alone.
 
 ## Model selection
 

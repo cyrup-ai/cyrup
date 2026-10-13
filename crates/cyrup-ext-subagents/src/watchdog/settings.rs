@@ -82,6 +82,8 @@ pub fn default_watchdog_config() -> ResolvedWatchdogConfig {
     };
     ResolvedWatchdogConfig {
         enabled: false,
+        // SUBA-234 — `clarification: false` (`settings.ts:65` @ad11b7ab).
+        clarification: false,
         delivery: WatchdogDeliveryMode::Held,
         show_during_run: false,
         sync_backlog: WatchdogSyncBacklog::Off,
@@ -141,6 +143,9 @@ pub fn default_watchdog_config() -> ResolvedWatchdogConfig {
 
 const WATCHDOG_FIELDS: &[&str] = &[
     "enabled",
+    // SUBA-234 — `settings.ts:97` @ad11b7ab. Top level only: `CHILDREN_FIELDS` does not name it, so
+    // `children.clarification` is an unknown-field error, as upstream's is.
+    "clarification",
     "delivery",
     "showDuringRun",
     "syncBacklog",
@@ -586,6 +591,11 @@ fn parse_watchdog_patch(value: &Value, field: &str, meta: &ParseMeta) -> Result<
     let mut patch = Map::new();
     take(input, &mut patch, "enabled", |v| {
         parse_boolean(v, &format!("{field}.enabled"), meta).map(Value::from)
+    })?;
+    // SUBA-234 — `if ("clarification" in input) patch.clarification = parseBoolean(…)`
+    // (`settings.ts:309` @ad11b7ab).
+    take(input, &mut patch, "clarification", |v| {
+        parse_boolean(v, &format!("{field}.clarification"), meta).map(Value::from)
     })?;
     take(input, &mut patch, "delivery", |v| {
         let values: Vec<&str> = WatchdogDeliveryMode::ALL
@@ -1886,6 +1896,36 @@ mod tests {
                 .any(|s| s.scope == WatchdogSettingsScope::Session && s.exists),
             "{:?}",
             result.sources
+        );
+    }
+
+    /// SUBA-234 — `clarification` defaults off, accepts only a boolean, and exists at the TOP
+    /// level only (upstream `watchdog-settings.test.ts` @ad11b7ab, "accepts only a boolean
+    /// clarification opt-in"). RED at HEAD: the key is unknown, so `{ clarification: true }` is a
+    /// parse failure that disables the watchdog.
+    #[test]
+    fn clarification_is_a_default_off_top_level_boolean() {
+        let fx = fixture();
+        assert!(!default_watchdog_config().clarification);
+        assert!(
+            !resolve_watchdog_config(&fx.project, None)
+                .config
+                .clarification
+        );
+        let on = resolve_watchdog_config(&fx.project, Some(&json!({ "clarification": true })));
+        assert!(on.ok, "{:?}", on.errors);
+        assert!(on.config.clarification);
+        assert!(
+            !resolve_watchdog_config(&fx.project, Some(&json!({ "clarification": "true" }))).ok,
+            "a string is not a boolean"
+        );
+        assert!(
+            !resolve_watchdog_config(
+                &fx.project,
+                Some(&json!({ "children": { "clarification": true } }))
+            )
+            .ok,
+            "children never take it"
         );
     }
 

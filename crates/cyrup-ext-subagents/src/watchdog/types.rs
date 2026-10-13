@@ -32,6 +32,11 @@ use std::fmt;
 /// warning message carries, and the key the main-session renderer registers against.
 pub const SUBAGENT_WATCHDOG_WARNING_TYPE: &str = "subagent_watchdog_warning";
 
+/// SUBA-234 — the `customType` a main-watchdog question is delivered as
+/// (`register-main.ts:382` @ad11b7ab). No renderer is registered for it, upstream or here: it is a
+/// plain displayed message.
+pub const SUBAGENT_WATCHDOG_CLARIFICATION_TYPE: &str = "subagent_watchdog_clarification";
+
 /// Declare a fieldless enum over an upstream string-literal union: `ALL` in upstream order,
 /// `as_str`, and a `parse` that is exactly `ALL.includes(value)`.
 macro_rules! watchdog_str_enum {
@@ -650,6 +655,14 @@ pub struct WatchdogLspRuntimeSnapshot {
 pub struct ResolvedWatchdogConfig {
     /// Master switch.
     pub enabled: bool,
+    /// SUBA-234 — `clarification` (`types.ts` @ad11b7ab, `6c1af3a2`): *"Main-only, bounded boundary
+    /// clarification; never enabled for child reviews."* Off by default (`settings.ts:65`). With it
+    /// on, the MAIN watchdog's reviewer may ask one focused question (`watchdog_ask`) instead of
+    /// ruling, keeps a bounded tail of delivered orchestration activity as review evidence, and an
+    /// operator's message during a review aborts it. A child never sees it on: the children layer
+    /// rejects the key, and a child runtime is built without the clarification sink.
+    #[serde(default)]
+    pub clarification: bool,
     /// How warnings reach the transcript.
     pub delivery: WatchdogDeliveryMode,
     /// Render warnings while a run is still in flight.
