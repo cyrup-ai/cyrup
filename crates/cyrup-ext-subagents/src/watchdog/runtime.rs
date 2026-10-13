@@ -188,6 +188,10 @@ pub struct WatchdogReviewRequest {
     pub emit_warning: WatchdogWarningEmitter,
     /// Upstream's `AbortSignal` (`:43`): cancelled on timeout and on supersession.
     pub cancel: CancelToken,
+    /// The session's Git baseline for `watchdog_diff` (SUBA-233), captured when the session bound
+    /// — upstream's `options.diffBaseline` (`review.ts:59`,`:293` @ad11b7ab), which the review
+    /// awaits. Empty when nothing started a capture; the review is then given no diff tool.
+    pub diff_baseline: super::diff_tool::WatchdogDiffBaselineSlot,
 }
 
 /// `WatchdogReviewFunction` (`runtime.ts:45`) — the model call that actually reviews a delta.
@@ -515,6 +519,10 @@ pub struct MainWatchdogRuntime {
     review_changes_only: bool,
     lsp_diagnostics: Arc<dyn WatchdogLspDiagnostics>,
     repo_change_signature: Arc<dyn WatchdogRepoChangeSource>,
+    /// `let diffBaseline` (`register-main.ts:372`, `register-child.ts:60` @ad11b7ab) — kept on the
+    /// runtime so the main and the child watchdog, which both bind through [`Self::bind_session`],
+    /// capture it the same way (SUBA-233).
+    diff_baseline: super::diff_tool::WatchdogDiffBaselineSlot,
 }
 
 impl std::fmt::Debug for MainWatchdogRuntime {
@@ -625,6 +633,7 @@ impl MainWatchdogRuntime {
             review_changes_only: options.review_changes_only,
             lsp_diagnostics,
             repo_change_signature,
+            diff_baseline: super::diff_tool::WatchdogDiffBaselineSlot::default(),
         };
         // `:183-184` — the constructor takes the repo baseline immediately, so the first
         // `agent_end` compares against the tree as it was when the session opened.
@@ -649,6 +658,11 @@ impl MainWatchdogRuntime {
     /// `bindSession(ctx)` (`runtime.ts:187-193`) — a new session drops every session-scoped
     /// override and resets everything, including the scope artifact and the auto-follow counters.
     pub fn bind_session(&self, cwd: &Path) {
+        // `diffBaseline = startWatchdogDiffBaselineCapture(ctx.cwd)`, immediately before
+        // `runtime.bindSession(ctx)` in both registrations (`register-main.ts:395`,
+        // `register-child.ts:101` @ad11b7ab): `HEAD` as the session opens, so commits made later
+        // still show in the reviewer's diff (SUBA-233).
+        self.diff_baseline.start(cwd);
         {
             let mut inner = self.lock();
             inner.cwd = cwd.to_path_buf();
@@ -1389,6 +1403,7 @@ impl MainWatchdogRuntime {
                 config: inner.config_result.config.clone(),
                 emit_warning: self.warning_emitter(review_epoch, review_id),
                 cancel: cancel.clone(),
+                diff_baseline: self.diff_baseline.clone(),
             };
             (review_epoch, review_id, cancel, request)
         };

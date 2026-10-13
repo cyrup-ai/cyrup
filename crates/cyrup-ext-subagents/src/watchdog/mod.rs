@@ -47,6 +47,7 @@
 pub mod agent_turn;
 pub mod change_signature;
 pub mod child_status;
+pub mod diff_tool;
 pub mod emission_guard;
 pub mod lsp_diagnostics;
 pub mod model_selection;

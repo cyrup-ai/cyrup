@@ -61,9 +61,20 @@ use super::types::{
 };
 use crate::exec::split_known_thinking_suffix;
 
-/// `WATCHDOG_ALLOWED_TOOL_NAMES` (`review.ts:20`) — read, search, list, and the warn tool. Nothing
-/// that writes, executes or delegates.
-pub const WATCHDOG_ALLOWED_TOOL_NAMES: [&str; 5] = ["read", "grep", "find", "ls", "watchdog_warn"];
+/// `WATCHDOG_ALLOWED_TOOL_NAMES` (`review.ts:20`; `:23` @ad11b7ab) — read, search, list, the warn
+/// tool and `watchdog_diff` (SUBA-233). Nothing that writes, executes or delegates.
+///
+/// This is the one list that names `watchdog_diff`: like `watchdog_warn` it is never in the
+/// read-only EXPOSE list ([`WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES`]), because it is built per review
+/// over the session's baseline, and only when there is one ([`WatchdogReviewTurn::diff_baseline`]).
+pub const WATCHDOG_ALLOWED_TOOL_NAMES: [&str; 6] = [
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "watchdog_warn",
+    super::diff_tool::WATCHDOG_DIFF_TOOL_NAME,
+];
 
 /// The name of the one tool a review may use to report anything (`review.ts:182`).
 pub const WATCHDOG_WARN_TOOL_NAME: &str = "watchdog_warn";
@@ -533,9 +544,10 @@ impl std::fmt::Debug for WatchdogWarnTool<'_> {
 }
 
 /// `buildWatchdogSystemPrompt` (`review.ts:207-220`) — the reviewer's whole instruction set, lines
-/// in upstream's order, with the scope line included only when the delta carries a scope block.
+/// in upstream's order, with the scope line included only when the delta carries a scope block, and
+/// `watchdog_diff` named only when the reviewer has it (`hasDiff`, `review.ts:231` @ad11b7ab).
 #[must_use]
-pub fn build_watchdog_system_prompt(cwd: &str, has_scope: bool) -> String {
+pub fn build_watchdog_system_prompt(cwd: &str, has_scope: bool, has_diff: bool) -> String {
     let mut lines = vec![
         "You are the main-session subagent watchdog for Pi.".to_string(),
         format!("Working directory: {cwd}"),
@@ -552,10 +564,17 @@ pub fn build_watchdog_system_prompt(cwd: &str, has_scope: bool) -> String {
                 .to_string(),
         );
     }
+    let tools = if has_diff {
+        "read, grep, find, ls, and watchdog_diff (the full repo diff since the session baseline; \
+         pass a path to narrow it)"
+    } else {
+        "read, grep, find, and ls"
+    };
     lines.extend([
-        "You are read-only. You may use read, grep, find, and ls. Do not edit files, run shell \
-         commands, spawn agents, or mutate state."
-            .to_string(),
+        format!(
+            "You are read-only. You may use {tools}. Do not edit files, run shell commands, spawn \
+             agents, or mutate state."
+        ),
         "Emit warnings only by calling watchdog_warn. Freeform assistant text is ignored and must \
          not be used to report warnings."
             .to_string(),
@@ -675,6 +694,11 @@ pub struct WatchdogReviewTurn<'a> {
     /// `createWatchdogWarnTool(request)` (`review.ts:273`) — name, label, description, parameters
     /// and the executing body, already bound to this request's emitter.
     pub warn_tool: WatchdogWarnTool<'a>,
+    /// The session's Git baseline, when there is one: the reviewer is then given `watchdog_diff`
+    /// over it (`...(diffBaseline ? [createWatchdogDiffTool(diffBaseline)] : [])`, `review.ts:306`
+    /// @ad11b7ab). `None` — no repository, or no `HEAD` yet — gives no diff tool, and the system
+    /// prompt does not name one.
+    pub diff_baseline: Option<super::diff_tool::WatchdogDiffBaseline>,
     /// `toolExecution: "sequential"` (`review.ts:288`) — the Agent-wide setting, distinct from the
     /// warn tool's own [`WatchdogWarnTool::SEQUENTIAL`] (`:190`). A review's read tools must not
     /// interleave, so a warning's evidence names a file state the reviewer actually observed.
@@ -858,8 +882,14 @@ impl WatchdogReview for MainWatchdogReview {
                 stop_reason: Some(ReviewStopReason::Aborted),
             }));
         }
-        let system_prompt =
-            build_watchdog_system_prompt(&self.cwd.to_string_lossy(), request.has_scope);
+        // `const diffBaseline = await options.diffBaseline?.()` (`review.ts:293` @ad11b7ab) — after
+        // the model is resolved, as upstream orders it.
+        let diff_baseline = request.diff_baseline.get().await;
+        let system_prompt = build_watchdog_system_prompt(
+            &self.cwd.to_string_lossy(),
+            request.has_scope,
+            diff_baseline.is_some(),
+        );
         let prompt = build_review_prompt(&request, &selection);
         let messages = self
             .agent
@@ -873,6 +903,7 @@ impl WatchdogReview for MainWatchdogReview {
                 // upstream builds it, so `name`/`label`/`description`/`parameters` reach a bound
                 // agent instead of being re-derived by it.
                 warn_tool: WatchdogWarnTool::new(&request.emit_warning),
+                diff_baseline,
                 tool_execution_sequential: true,
                 emit_warning: &request.emit_warning,
                 cancel: request.cancel.clone(),
@@ -895,11 +926,10 @@ impl WatchdogReview for MainWatchdogReview {
 /// `review_description` — "real model review" — true.
 ///
 /// [CYRUP-DELTA] this file is a v0.43.0 port; THIS type is pinned to **v0.68.0** and every citation
-/// on it says so. The three v0.68.0 features that live in the same upstream block are deliberately
-/// NOT adopted here, because this crate has no port of any of them and building one is a different
-/// task: `watchdog_diff` (`:10,:294,:307`), `watchdog_ask`/the clarification yield
-/// (`:295,:298-323,:338`), and `loadWatchdogGuidance`/`WATCHDOG.md` (`:11,:234,:328`). The turn
-/// UW-4 names needs none of them.
+/// on it says so. Of the three features that live in the same upstream block, `watchdog_diff` is
+/// ported (SUBA-233, `review.ts:293`,`:306` @ad11b7ab: the tool is added when the session has a Git
+/// baseline); `watchdog_ask`/the clarification yield and `loadWatchdogGuidance`/`WATCHDOG.md` are
+/// not, and are `SUBA-234`.
 pub struct ModelTurnReviewAgent {
     cwd: std::path::PathBuf,
     turn: super::agent_turn::WatchdogAgentTurn,
@@ -981,6 +1011,14 @@ impl ModelTurnReviewAgent {
         tools.push(Arc::new(super::agent_turn::WatchdogWarnAgentTool::new(
             turn.emit_warning.clone(),
         )));
+        // `...(diffBaseline ? [createWatchdogDiffTool(diffBaseline)] : [])` (`review.ts:306`
+        // @ad11b7ab, SUBA-233) — the diff since the session's baseline, only when there is one.
+        if let Some(baseline) = turn.diff_baseline {
+            tools.push(Arc::new(super::diff_tool::WatchdogDiffAgentTool::new(
+                Some(baseline),
+                false,
+            )));
+        }
         super::agent_turn::WatchdogTurnRequest {
             system_prompt: turn.system_prompt,
             prompt: turn.prompt,
@@ -1319,13 +1357,73 @@ mod tests {
         assert!(to_watchdog_warning(&json!("string")).is_err());
     }
 
+    /// SUBA-233 — the reviewer is told about `watchdog_diff` only when it has it, in upstream's
+    /// words (`review.ts:231` @ad11b7ab); otherwise the read-only line is unchanged.
+    #[test]
+    fn the_system_prompt_names_watchdog_diff_only_when_the_reviewer_has_it() {
+        let with = build_watchdog_system_prompt("/repo", false, true);
+        assert!(with.contains(
+            "You are read-only. You may use read, grep, find, ls, and watchdog_diff (the full repo \
+             diff since the session baseline; pass a path to narrow it). Do not edit files, run \
+             shell commands, spawn agents, or mutate state."
+        ));
+        let without = build_watchdog_system_prompt("/repo", false, false);
+        assert!(without.contains(
+            "You are read-only. You may use read, grep, find, and ls. Do not edit files, run shell \
+             commands, spawn agents, or mutate state."
+        ));
+        assert!(!without.contains("watchdog_diff"));
+    }
+
+    /// SUBA-233 — with a baseline the production turn offers `watchdog_diff`, described verbatim;
+    /// without one it does not (the control is
+    /// `the_production_review_turn_installs_the_expose_list_and_the_execution_time_policy`).
+    #[test]
+    fn with_a_baseline_the_production_turn_offers_watchdog_diff() {
+        let emitter = WatchdogWarningEmitter::inert();
+        let selection = WatchdogReviewModelSelection {
+            model: WatchdogModelInfo::new("anthropic", "claude-opus-4-8"),
+            thinking_level: "off".to_string(),
+            auth: WatchdogReviewAuth::default(),
+            explicit: true,
+        };
+        let agent = ModelTurnReviewAgent::new(std::env::temp_dir(), Arc::new(|| None));
+        let request = agent.turn_request(WatchdogReviewTurn {
+            selection: &selection,
+            system_prompt: "system".to_string(),
+            prompt: "prompt".to_string(),
+            allowed_tools: &WATCHDOG_ALLOWED_TOOL_NAMES,
+            read_only_tools: &WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES,
+            warn_tool: WatchdogWarnTool::new(&emitter),
+            diff_baseline: Some(super::super::diff_tool::WatchdogDiffBaseline {
+                root: "/repo".to_string(),
+                reference: "0123456789abcdef".to_string(),
+            }),
+            tool_execution_sequential: true,
+            emit_warning: &emitter,
+            cancel: CancelToken::new(),
+        });
+        let diff = request
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "watchdog_diff")
+            .expect("the reviewer is given watchdog_diff");
+        assert_eq!(
+            diff.description(),
+            "Show the repository diff since the review baseline, plus untracked file paths, \
+             including edits by other sessions in this checkout. Optional path narrows it; \
+             stat:true returns per-file counts only."
+        );
+        assert_eq!((request.block_reason)("watchdog_diff"), None);
+    }
+
     #[test]
     fn the_system_prompt_includes_the_scope_line_only_when_there_is_scope() {
-        let without = build_watchdog_system_prompt("/repo", false);
+        let without = build_watchdog_system_prompt("/repo", false, false);
         assert!(!without.contains("Use the Current scope record"));
         assert!(without.contains("Working directory: /repo"));
         assert_eq!(without.lines().count(), 9);
-        let with = build_watchdog_system_prompt("/repo", true);
+        let with = build_watchdog_system_prompt("/repo", true, false);
         // The pin's line (`review.ts:230` @ad11b7ab), verbatim.
         assert!(with.contains(
             "Use the Current scope record alongside supplied activity evidence; an unrelated user \
@@ -1379,6 +1477,7 @@ mod tests {
             config: default_watchdog_config(),
             emit_warning: WatchdogWarningEmitter::inert(),
             cancel: CancelToken::new(),
+            diff_baseline: Default::default(),
         };
         let prompt = build_review_prompt(&request, &selection);
         assert!(prompt.contains(
@@ -1410,10 +1509,15 @@ mod tests {
     /// is what keeps them from drifting into one.
     #[test]
     fn the_expose_list_is_the_permit_list_minus_the_warn_tool() {
+        // Minus `watchdog_diff` too: like the warn tool it is built per review, over the session's
+        // baseline, and only when there is one (SUBA-233).
         let mut expected: Vec<&str> = WATCHDOG_ALLOWED_TOOL_NAMES
             .iter()
             .copied()
-            .filter(|name| *name != WATCHDOG_WARN_TOOL_NAME)
+            .filter(|name| {
+                *name != WATCHDOG_WARN_TOOL_NAME
+                    && *name != super::super::diff_tool::WATCHDOG_DIFF_TOOL_NAME
+            })
             .collect();
         expected.sort_unstable();
         let mut actual: Vec<&str> = WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES.to_vec();
@@ -1459,6 +1563,7 @@ mod tests {
             allowed_tools: &WATCHDOG_ALLOWED_TOOL_NAMES,
             read_only_tools: &WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES,
             warn_tool: WatchdogWarnTool::new(&emitter),
+            diff_baseline: None,
             tool_execution_sequential: true,
             emit_warning: &emitter,
             cancel: CancelToken::new(),
@@ -1633,6 +1738,7 @@ mod tests {
                     true
                 })),
                 cancel: CancelToken::new(),
+                diff_baseline: Default::default(),
             })
             .await
             .unwrap();
@@ -1649,7 +1755,14 @@ mod tests {
         assert_eq!(seen.read_only_tools, vec!["read", "grep", "find", "ls"]);
         assert_eq!(
             seen.allowed_tools,
-            vec!["read", "grep", "find", "ls", "watchdog_warn"]
+            vec![
+                "read",
+                "grep",
+                "find",
+                "ls",
+                "watchdog_warn",
+                "watchdog_diff"
+            ]
         );
         // `toolExecution: "sequential"` (`:288`), and the warn tool's own `executionMode`
         // (`:190`) — the turn must carry the SAME answer the descriptor's constant gives.
@@ -1677,6 +1790,7 @@ mod tests {
                 config: default_watchdog_config(),
                 emit_warning: WatchdogWarningEmitter::inert(),
                 cancel,
+                diff_baseline: Default::default(),
             })
             .await
             .unwrap()
@@ -1702,6 +1816,7 @@ mod tests {
                 config: default_watchdog_config(),
                 emit_warning: WatchdogWarningEmitter::inert(),
                 cancel: CancelToken::new(),
+                diff_baseline: Default::default(),
             })
             .await
             .unwrap()
@@ -1725,6 +1840,7 @@ mod tests {
             config: default_watchdog_config(),
             emit_warning: WatchdogWarningEmitter::inert(),
             cancel: CancelToken::new(),
+            diff_baseline: Default::default(),
         }
     }
 

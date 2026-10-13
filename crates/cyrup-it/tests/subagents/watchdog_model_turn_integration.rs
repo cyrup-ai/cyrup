@@ -363,3 +363,193 @@ async fn a_review_that_names_a_write_tool_is_refused_at_execution_time() {
          reviewer's probe means nothing"
     );
 }
+
+/// Run `git` in `dir`, asserting it succeeds.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {args:?}");
+}
+
+/// **SUBA-233.** In a Git checkout, a review over a turn that edited `src/lib.rs` is given
+/// `watchdog_diff` — described in upstream's words, which are the only place the reviewer learns
+/// that other sessions' edits are in the diff — and a `watchdog_diff({ path: "src/lib.rs" })` call
+/// answers the real diff since the session's baseline. Red at the base: the reviewer was offered
+/// the read-only four and `watchdog_warn` only, and its call came back "Tool watchdog_diff not
+/// found".
+///
+/// The repository is created in the session cwd, and the session is then announced as a host
+/// announces it (`bind_extensions`, which emits `session_start`): that is when the baseline is
+/// captured, with `HEAD` at `pub fn one`. The scripted turn then writes `pub fn two`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_review_in_a_checkout_reads_the_turns_diff_through_watchdog_diff() {
+    let (harness, extension, _dirs) = armed_harness_writing(
+        "src/lib.rs",
+        "pub fn two() {}\n",
+        vec![
+            FauxResponse::tool_call("watchdog_diff", serde_json::json!({ "path": "src/lib.rs" })),
+            FauxResponse::text("review complete"),
+        ],
+        |cwd| {
+            git(cwd, &["init", "-q"]);
+            git(cwd, &["config", "user.email", "t@example.invalid"]);
+            git(cwd, &["config", "user.name", "t"]);
+            git(cwd, &["config", "commit.gpgsign", "false"]);
+            std::fs::create_dir_all(cwd.join("src")).unwrap();
+            std::fs::write(cwd.join("src/lib.rs"), "pub fn one() {}\n").unwrap();
+            git(cwd, &["add", "src/lib.rs"]);
+            git(cwd, &["commit", "-q", "-m", "init"]);
+        },
+    )
+    .await;
+
+    harness
+        .run("please change lib.rs")
+        .await
+        .expect("the turn completes");
+    let snapshot = extension.watchdog().get_snapshot(None);
+    assert_eq!(snapshot.failed_reviews, 0, "{snapshot:#?}");
+
+    let contexts = review_contexts(&harness);
+    let first = contexts
+        .first()
+        .unwrap_or_else(|| panic!("no nested review request reached the provider"));
+    let diff_tool = first
+        .tools
+        .iter()
+        .find(|tool| tool.name == "watchdog_diff")
+        .unwrap_or_else(|| {
+            panic!(
+                "the reviewer was not given watchdog_diff; offered: {:?}",
+                first.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        diff_tool.description,
+        "Show the repository diff since the review baseline, plus untracked file paths, including \
+         edits by other sessions in this checkout. Optional path narrows it; stat:true returns \
+         per-file counts only."
+    );
+    assert!(
+        first
+            .system_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains(
+                "You may use read, grep, find, ls, and watchdog_diff (the full repo diff since the \
+             session baseline; pass a path to narrow it)."
+            )),
+        "the system prompt names the tool (`review.ts:231` @ad11b7ab)"
+    );
+
+    // The tool's answer, read off the next request the reviewer made: the real diff.
+    let wire = serde_json::to_string(&contexts).expect("the captured contexts serialize");
+    assert!(
+        wire.contains(r#""toolName":"watchdog_diff""#)
+            && wire.contains(r"-pub fn one() {}\n+pub fn two() {}"),
+        "the reviewer's watchdog_diff call must answer the diff since the baseline; wire: {wire}"
+    );
+}
+
+/// [`armed_harness`], with the main turn writing `content` to `path` instead of the probe file, and
+/// `prepare` run on the session cwd before the session is announced (`session_start`, which binds
+/// the watchdog and captures its diff baseline). Armed after the announce, which would otherwise
+/// clear the session override (`runtime.ts:187-193`).
+async fn armed_harness_writing(
+    path: &str,
+    content: &str,
+    review_script: Vec<FauxResponse>,
+    prepare: impl FnOnce(&std::path::Path),
+) -> (Harness, Arc<SubagentsExtension>, TempDirs) {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let work_dir = tempfile::tempdir().expect("extension cwd");
+    let extension = Arc::new(SubagentsExtension::with_config_and_cwd(
+        SubagentExtensionConfig {
+            async_by_default: false,
+            roots: Roots::sandboxed(home.path()),
+            ..SubagentExtensionConfig::default()
+        },
+        work_dir.path().to_path_buf(),
+    ));
+    let mut responses = vec![
+        FauxResponse::tool_call(
+            "write",
+            serde_json::json!({ "path": path, "content": content }),
+        ),
+        FauxResponse::text("changed it"),
+    ];
+    responses.extend(review_script);
+    let harness = create_harness_with_extensions(HarnessOptions {
+        native_extensions: vec![extension.clone() as Arc<dyn NativeExtension>],
+        responses,
+        queue_responses: true,
+        ..HarnessOptions::default()
+    })
+    .await
+    .expect("a real, fully-wired AgentSession with the real SubagentsExtension");
+    prepare(harness.cwd());
+    harness.session().bind_extensions().await;
+    let ctx =
+        cyrup_ext::native::HostCtx::command(ExtMode::Json, false, work_dir.path().to_path_buf());
+    extension
+        .execute_command("subagents-watchdog", "session on", &ctx)
+        .await
+        .expect("the watchdog command handles `session on`");
+    (
+        harness,
+        extension,
+        TempDirs {
+            work_dir,
+            _home: home,
+        },
+    )
+}
+
+/// **SUBA-233, the no-baseline case.** Outside a Git checkout there is no baseline, so the reviewer
+/// is not given `watchdog_diff` and its system prompt does not name it — upstream's
+/// `...(diffBaseline ? [createWatchdogDiffTool(diffBaseline)] : [])` and `hasDiff` (`review.ts:306`,
+/// `:231`,`:326` @ad11b7ab). A reviewer that calls it anyway is told the tool is not there, as a
+/// tool result it can read, and the review completes rather than failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_git_baseline_the_reviewer_is_not_offered_watchdog_diff() {
+    let (harness, extension, _dirs) = armed_harness_writing(
+        "notes.txt",
+        "written outside any repository\n",
+        vec![
+            FauxResponse::tool_call("watchdog_diff", serde_json::json!({})),
+            FauxResponse::text("review complete"),
+        ],
+        |_| {},
+    )
+    .await;
+    harness
+        .run("please write the notes")
+        .await
+        .expect("the turn completes");
+    let snapshot = extension.watchdog().get_snapshot(None);
+    assert_eq!(snapshot.failed_reviews, 0, "{snapshot:#?}");
+
+    let contexts = review_contexts(&harness);
+    let first = contexts
+        .first()
+        .unwrap_or_else(|| panic!("no nested review request reached the provider"));
+    let mut offered: Vec<&str> = first.tools.iter().map(|t| t.name.as_str()).collect();
+    offered.sort_unstable();
+    assert_eq!(offered, vec!["find", "grep", "ls", "read", "watchdog_warn"]);
+    let prompt = first.system_prompt.as_deref().unwrap_or_default();
+    assert!(
+        prompt.contains("You may use read, grep, find, and ls."),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("watchdog_diff"), "{prompt}");
+    let wire = serde_json::to_string(&contexts).expect("the captured contexts serialize");
+    assert!(
+        wire.contains(
+            r#""toolName":"watchdog_diff","content":[{"type":"text","text":"Tool watchdog_diff not found"}]"#
+        ),
+        "the call comes back as a tool result the reviewer reads; wire: {wire}"
+    );
+}
