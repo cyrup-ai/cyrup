@@ -169,6 +169,10 @@ const STEER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// pi `formatSteerMessage` (`subagent-prompt-runtime.ts:271-304` @v0.43.0) — the exact text the
 /// child's model sees. Kept verbatim (including the trailing "do not restart" instruction, which is
 /// what stops a steered child from throwing away the work it has already done).
+///
+/// `[CYRUP-DELTA]` stale against the pin: upstream now heads a follow-up `Queued follow-up from
+/// the parent orchestrator:` (`request.mode === "follow_up"`, `subagent-prompt-runtime.ts:362-370`
+/// @ad11b7ab); this always says "Mid-run steering". Filed as `SUBA-242`.
 #[must_use]
 pub fn format_steer_message(request: &crate::background::control::SteerRequest) -> String {
     format!(
@@ -1800,6 +1804,24 @@ pub struct SubagentPromptRuntime {
     /// `subagent-prompt-runtime.ts:532-550` @v0.71.0). `Some` when the parent handed this child a
     /// readable session name or an intercom routing name.
     session_identity: Option<Arc<ChildSessionIdentity>>,
+    /// SUBA-232 — pi `registerWaitTool(pi, waitState, …, { nestedRootRunId })`
+    /// (`subagent-prompt-runtime.ts:520` @ad11b7ab): the child's own `bg_wait`. `Some` in every
+    /// real subagent child ([`crate::spawn::nested_events::CHILD_ENV`] = `"1"`, which the parent
+    /// writes on every spawn) and `None` in any other process, so a top-level session — whose
+    /// `bg_wait` is the subagents extension's — can never be handed a second one.
+    wait_tool: Option<Arc<crate::extension::wait_tool::WaitTool>>,
+    /// The user-input set [`Self::wait_tool`]'s calls register in, fed from this runtime's `input`
+    /// subscription — upstream's `wait-tool.ts:31-35` listener, which a child's `bg_wait` installs
+    /// exactly as the root's does. `Some` exactly when `wait_tool` is.
+    user_input_waits: Option<crate::background::wait::UserInputWaits>,
+    /// The child wait's source, kept so every event can record the session's cwd on it
+    /// ([`crate::extension::wait_tool::ChildWaitSource::observe_session_cwd`]). `Some` exactly when
+    /// `wait_tool` is.
+    wait_source: Option<crate::extension::wait_tool::ChildWaitSource>,
+    /// SUBA-232 — the roots this child lists its own async runs under: its `bg_wait`'s and its
+    /// `agent_end` drain's, one value so the two cannot disagree. `None` (a runtime assembled from
+    /// parts) falls back to the process's own, [`crate::paths::Roots::from_env`].
+    roots: Option<crate::paths::Roots>,
 }
 
 /// SUBA-134 — pi's `intercomSessionName` / `sessionName` pair and the `intercomIdClaimed` latch
@@ -2020,6 +2042,10 @@ impl SubagentPromptRuntime {
             runtime_acknowledgements: None,
             placed_resources: None,
             session_identity: None,
+            wait_tool: None,
+            user_input_waits: None,
+            wait_source: None,
+            roots: None,
         }
     }
 
@@ -2048,6 +2074,10 @@ impl SubagentPromptRuntime {
             runtime_acknowledgements: None,
             placed_resources: None,
             session_identity: None,
+            wait_tool: None,
+            user_input_waits: None,
+            wait_source: None,
+            roots: None,
         }
     }
 
@@ -2169,6 +2199,29 @@ impl SubagentPromptRuntime {
         self
     }
 
+    /// SUBA-232 — attach the child's `bg_wait` and the user-input set its calls register in (the
+    /// set this runtime's `input` handler ends). `None` registers no wait.
+    #[must_use]
+    pub fn with_wait_tool(mut self, wait: Option<ChildWait>) -> Self {
+        if let Some(wait) = wait {
+            self.wait_tool = Some(wait.tool);
+            self.user_input_waits = Some(wait.waits);
+            self.wait_source = Some(wait.source);
+        } else {
+            self.wait_tool = None;
+            self.user_input_waits = None;
+            self.wait_source = None;
+        }
+        self
+    }
+
+    /// SUBA-232 — the roots this child's `bg_wait` and `agent_end` drain list under.
+    #[must_use]
+    pub fn with_roots(mut self, roots: crate::paths::Roots) -> Self {
+        self.roots = Some(roots);
+        self
+    }
+
     /// SUBA-045 — arm the tool-availability diagnostic from the parent's two env vars (pi
     /// `refreshChildToolDiagnostic`'s `filePath`/`required` pair, `subagent-prompt-runtime.ts:99-101`).
     ///
@@ -2254,6 +2307,13 @@ impl SubagentPromptRuntime {
         self.watchdog.as_ref()
     }
 
+    /// SUBA-232 — the user-input set this child's `bg_wait` calls register in, exposed (like
+    /// [`Self::watchdog`]) so a test can see a wait open and watch the `input` edge end it.
+    #[must_use]
+    pub fn child_user_input_waits(&self) -> Option<&crate::background::wait::UserInputWaits> {
+        self.user_input_waits.as_ref()
+    }
+
     /// Attach the child-side permission gate (pi `registerPermissionGate`,
     /// `subagent-prompt-runtime.ts:281-305`, called at `:475`).
     ///
@@ -2330,6 +2390,10 @@ impl SubagentPromptRuntime {
             && self.placed_resources.is_none()
             // SUBA-134: naming the child's own session is a real job.
             && self.session_identity.is_none()
+            // SUBA-232: a child's `bg_wait` is a real job — and since every real child carries
+            // one, no real child is inert any more, which is upstream's own shape (it loads the
+            // runtime into every child unconditionally).
+            && self.wait_tool.is_none()
     }
 
     /// Attach the parent-supplied tool budget (pi `registerToolBudget`,
@@ -2382,6 +2446,12 @@ impl NativeExtension for SubagentPromptRuntime {
         // first): the primary tool must exist before a tool whose description tells the model to
         // "prefer contact_supervisor when available" is offered.
         if let Some(tool) = &self.intercom_fallback {
+            api.register_tool(tool.clone());
+        }
+        // SUBA-232 — pi `subagent-prompt-runtime.ts:520` @ad11b7ab, `registerWaitTool(…)` in every
+        // child. This runtime is the ONLY place a child registers it: the fan-out child's
+        // `ChildSafe` subagents arm deliberately does not (see `WaitTool`'s doc).
+        if let Some(tool) = &self.wait_tool {
             api.register_tool(tool.clone());
         }
         // `context` is subscribed unconditionally, exactly as pi registers its handler
@@ -2452,6 +2522,13 @@ impl NativeExtension for SubagentPromptRuntime {
                 EventKind::AgentEnd,
                 EventKind::SessionShutdown,
             ]);
+        }
+        // SUBA-232 / SUBA-231 — the child's `input` edge. Upstream's child has it for `bg_wait`
+        // alone (`wait-tool.ts:31-35`, registered by `spr.ts:520`), so it is subscribed whenever
+        // the wait is registered — every real child. An armed watchdog wants it too (the
+        // `[CYRUP-DELTA]` at the `Input` arm in `on_event`).
+        if self.wait_tool.is_some() || self.watchdog.is_some() {
+            kinds.push(EventKind::Input);
         }
         // SUBA-045 / pi `onRuntimeEvent("agent_start", () => { refreshChildToolDiagnostic(pi); })`
         // (`subagent-prompt-runtime.ts:514-516`). Subscribed only when the parent armed the
@@ -2538,6 +2615,10 @@ impl NativeExtension for SubagentPromptRuntime {
     }
 
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        // SUBA-232 — the child wait lists under the SESSION's cwd, which only an event carries.
+        if let Some(source) = &self.wait_source {
+            source.observe_session_cwd(&_ctx.cwd);
+        }
         // SUBA-063 — pi's `finalize` on `agent_end` / `session_shutdown`
         // (`subagent-prompt-runtime.ts:127-137` @v0.64.0), registered FIRST in
         // `registerSubagentPromptRuntime` (`:451` @v0.68.0), so it runs ahead of this runtime's
@@ -2559,6 +2640,43 @@ impl NativeExtension for SubagentPromptRuntime {
             return HookOutcome::Mutate(EventPatch::ProviderRequest(
                 rewrite_fast_mode_provider_request(payload),
             ));
+        }
+        // SUBA-232 / SUBA-231 — an operator's (or a parent's) message sent while this child streams.
+        // Observe-only and synchronous, as the orchestrator's `Input` arm
+        // (`extension/host/native_impl.rs`): it ends this child's open waits, joins an armed
+        // watchdog's scope, and falls through, so the submission is queued unchanged. Both callees
+        // apply the ONE admission rule, [`crate::mid_run_input::admits`] — not extension-sourced,
+        // carrying a streaming behavior — so neither re-derives it here.
+        //
+        // A parent's steer reaches this arm through the steering inbox's
+        // `services.send_user_message(…, Some(Steer|FollowUp))`, which the host labels interactive
+        // and, while this child streams, carries the behavior — pi's `ChildSession.steer`/`followUp`
+        // (`run-child-session.ts:694-706`, `child-session.ts:579-580` @ad11b7ab), whose source
+        // defaults to `interactive` (`agent-session.ts:2211-2232` @f1b2e77f5). That holds only
+        // while the inbox keeps a non-extension source (`SEAM-172`'s Fix says so).
+        if let HostEvent::Input {
+            text,
+            source,
+            streaming_behavior,
+            ..
+        } = ev
+        {
+            // pi `wait-tool.ts:31-35`: the child's `bg_wait` listener.
+            if let Some(waits) = &self.user_input_waits {
+                waits.on_input(*source, *streaming_behavior);
+            }
+            // `[CYRUP-DELTA]` SUBA-231 — beyond upstream, on purpose. pi's child watchdog
+            // subscribes no `input` (`register-child.ts:99-134` @ad11b7ab makes seven
+            // `onRuntimeEvent` registrations, none of them `input`), so a child steered mid-run
+            // keeps only its launch task in scope, and its next boundary review can flag the work
+            // the steer asked for as scope drift — pushing the child to drop the change the
+            // operator wanted. cyrup records the steer as the orchestrator's watchdog records the
+            // operator's (SUBA-198, pi `register-main.ts:406`, `runtime.ts:514-516`).
+            if let Some(watchdog) = &self.watchdog {
+                watchdog
+                    .runtime()
+                    .handle_user_input(text, *source, *streaming_behavior);
+            }
         }
         // G90 / pi `registerSteeringInbox`'s handlers (`subagent-prompt-runtime.ts:441-469`). Run
         // FIRST and always fall through: every one of these events also has (or may later grow) a
@@ -2653,7 +2771,10 @@ impl NativeExtension for SubagentPromptRuntime {
                     .as_deref(),
             );
             if let Some(session_id) = session_id {
-                let roots = crate::paths::Roots::from_env();
+                let roots = self
+                    .roots
+                    .clone()
+                    .unwrap_or_else(crate::paths::Roots::from_env);
                 let artifact_roots = crate::background::run_artifact_roots_in(&roots, &_ctx.cwd);
                 let probe = crate::background::auto_drain::FsDrainProbe {
                     async_root: artifact_roots.async_root,
@@ -2901,7 +3022,9 @@ impl NativeExtension for SubagentPromptRuntime {
 ///   reads and parses;
 /// * the prompt rewrite needs at least ONE of the three child flags to be DEFINED (`:333`).
 ///
-/// A process with neither gets `None` and carries no extra surface whatsoever. A malformed schema
+/// Every subagent child (`CYRUP_SUBAGENT_CHILD=1`) also gets the runtime for its own `bg_wait`
+/// (SUBA-232, pi `subagent-prompt-runtime.ts:520` @ad11b7ab), so a child is never `None`; a process
+/// that is not a child and arms no half gets `None` and carries no extra surface. A malformed schema
 /// is deliberately not a hard failure: the parent already validated it, so an unreadable file
 /// child-side means the private temp dir is gone, and failing the child over it would turn a
 /// recoverable "structured output missing" into an unexplained startup crash.
@@ -2910,7 +3033,13 @@ impl NativeExtension for SubagentPromptRuntime {
 /// CFG-080: a [`crate::exec::tool_budget::TOOL_BUDGET_ENV`] payload that fails to decode is
 /// refused rather than dropped — see [`prompt_runtime_from_env`].
 pub fn prompt_runtime_extension_for_env() -> Result<Option<Arc<dyn NativeExtension>>, String> {
-    prompt_runtime_extension_from(&|key| std::env::var(key).ok())
+    // The roots are read with `var_os`, as the executor's (`Roots::from_config_dirs`) are: a
+    // `String` lookup would drop a non-UTF-8 `CYRUP_HOME` and list a different partition.
+    Ok(prompt_runtime_from_env_with_roots(
+        &|key| std::env::var(key).ok(),
+        crate::paths::Roots::from_env(),
+    )?
+    .map(|runtime| Arc::new(runtime) as Arc<dyn NativeExtension>))
 }
 
 /// The env-injected form of [`prompt_runtime_extension_for_env`] — the whole decision as a pure
@@ -2933,6 +3062,22 @@ pub fn prompt_runtime_extension_from(
 /// budget is a construction failure here too — the message is pi's own, and no runtime is built.
 pub fn prompt_runtime_from_env(
     get: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<SubagentPromptRuntime>, String> {
+    prompt_runtime_from_env_with_roots(
+        get,
+        crate::paths::Roots::from_lookup(&|key| get(key).map(std::ffi::OsString::from)),
+    )
+}
+
+/// [`prompt_runtime_from_env`] with the child's run roots handed in: production passes
+/// [`crate::paths::Roots::from_env`] ([`prompt_runtime_extension_for_env`]), a test the roots its
+/// lookup names. They are the roots the child's `bg_wait` and its `agent_end` drain list under.
+///
+/// # Errors
+/// As [`prompt_runtime_from_env`].
+pub fn prompt_runtime_from_env_with_roots(
+    get: &dyn Fn(&str) -> Option<String>,
+    roots: crate::paths::Roots,
 ) -> Result<Option<SubagentPromptRuntime>, String> {
     let non_empty = |key: &str| get(key).filter(|value| !value.trim().is_empty());
 
@@ -3135,6 +3280,7 @@ pub fn prompt_runtime_from_env(
     let arbiter_session_registry = Arc::clone(&arbiter_registry);
     let arbiter_services = Arc::clone(&services);
     let arbiter_session_services = Arc::clone(&services);
+    let child_wait_services = Arc::clone(&services);
 
     let runtime = SubagentPromptRuntime::from_parts(tool, rewrite, fanout_child == Some(true))
         .with_supervisor_tool(supervisor_tool)
@@ -3181,12 +3327,65 @@ pub fn prompt_runtime_from_env(
         .with_runtime_acknowledgements(get)
         .with_placed_resources(placed_resources)
         // SUBA-134 — pi `config.intercomSessionName` / `config.sessionName`.
-        .with_session_identity(ChildSessionIdentity::from_env(get));
+        .with_session_identity(ChildSessionIdentity::from_env(get))
+        // SUBA-232 — pi `subagent-prompt-runtime.ts:520` @ad11b7ab. Every real child — and only a
+        // real child: the parent writes `CHILD_ENV = "1"` on every spawn, and a process without it
+        // is a top-level session whose `bg_wait` is the subagents extension's `Full` arm (which
+        // loads first, so a second registration here would be a first-wins conflict).
+        .with_wait_tool(child_wait_tool(
+            get,
+            &cwd,
+            &child_wait_services,
+            roots.clone(),
+        ))
+        .with_roots(roots);
 
     if runtime.is_inert() {
         return Ok(None);
     }
     Ok(Some(runtime))
+}
+
+/// SUBA-232 — the child's `bg_wait` and the user-input set it registers in, or `None` outside a
+/// real subagent child. `services` is the runtime's late-bound slot (the session id is read off it
+/// per call); `cwd` is the child session's own, the partition its async launches land under.
+fn child_wait_tool(
+    get: &dyn Fn(&str) -> Option<String>,
+    cwd: &Path,
+    services: &Arc<std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>>,
+    roots: crate::paths::Roots,
+) -> Option<ChildWait> {
+    if get(crate::spawn::nested_events::CHILD_ENV).as_deref() != Some("1") {
+        return None;
+    }
+    let waits = crate::background::wait::UserInputWaits::default();
+    // `roots` is the runtime's one value, which its `agent_end` drain lists under too
+    // ([`SubagentPromptRuntime::with_roots`]).
+    let source = crate::extension::wait_tool::ChildWaitSource::new(
+        Arc::clone(services),
+        roots,
+        waits.clone(),
+    );
+    let enabled = crate::extension::wait_tool::WaitTool::resolve_child_enabled(
+        get(crate::background::wait::WAIT_TOOL_ENABLED_ENV).as_deref(),
+    );
+    Some(ChildWait {
+        tool: Arc::new(crate::extension::wait_tool::WaitTool::new_child(
+            source.clone(),
+            cwd.to_path_buf(),
+            enabled,
+        )),
+        waits,
+        source,
+    })
+}
+
+/// SUBA-232 — the child's `bg_wait`, the user-input set its calls register in, and the source it
+/// reads the session's cwd and id from: the three handles the runtime keeps.
+pub struct ChildWait {
+    tool: Arc<crate::extension::wait_tool::WaitTool>,
+    waits: crate::background::wait::UserInputWaits,
+    source: crate::extension::wait_tool::ChildWaitSource,
 }
 
 /// `createMainWatchdogReview(() => currentContext, { getThinkingLevel: () => pi.getThinkingLevel()

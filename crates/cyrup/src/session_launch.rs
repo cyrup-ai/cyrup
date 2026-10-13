@@ -98,10 +98,13 @@ fn codemode_sandbox_factory() -> Arc<dyn cyrup_codemode_runtime::tool::SandboxFa
 ///    independent: it builds for a step that actually declared an `outputSchema`, i.e. when the
 ///    parent passed both structured-output env vars — `CYRUP_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA`
 ///    naming a schema DOCUMENT on disk, not carrying one inline — and it also builds for a
-///    fan-out-authorized child that passed neither. Both observed by
-///    [`tests::llama_child_probe`], whose `plain` arm loads exactly `[llama.cpp, mcp]`, whose
-///    `fanout` arm adds `subagents` AND `subagent-prompt-runtime`, and whose `structured` arm adds
-///    `subagent-prompt-runtime` alone (EXT-101). Every other process attaches nothing.
+///    fan-out-authorized child that passed neither. Since SUBA-232 it builds for EVERY subagent
+///    child (`CYRUP_SUBAGENT_CHILD=1`), whose own `bg_wait` it registers (pi
+///    `subagent-prompt-runtime.ts:520` @ad11b7ab loads the runtime into every child). All observed
+///    by [`tests::llama_child_probe`]: its `plain` arm loads `[llama.cpp, subagent-prompt-runtime,
+///    mcp]`, its `fanout` arm adds `subagents`, and its `structured` arm adds the
+///    `structured_output` tool instead (EXT-101). A process that is not a subagent child attaches
+///    this only when it carries one of the other halves' variables.
 /// 4. **Intercom itself**, now that its channels have been handed out.
 /// 5. **The MCP adapter** (gap-analysis 13a, MCP-001, the `pi-mcp-adapter` port). Attached
 ///    UNCONDITIONALLY — upstream is an installed npm package present in every session of every
@@ -1288,6 +1291,20 @@ mod tests {
     struct Loaded {
         loaded: Vec<String>,
         listed: Vec<String>,
+        /// Whether the registry holds the child-side `structured_output` tool — the one thing a
+        /// structured-output child has that every other child does not.
+        structured_output: bool,
+    }
+
+    /// Whether `session`'s registry holds the `structured_output` tool.
+    fn has_structured_output(session: &AgentSession) -> bool {
+        session
+            .services()
+            .ext_host
+            .registry()
+            .tool("structured_output")
+            .unwrap()
+            .is_some()
     }
 
     /// The factory a mode arm would build over `agent_dir` + `cwd`, and the target to build it at.
@@ -1381,7 +1398,12 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let listed = cyrup_tui::StartupReport::from_session(&session, false).extensions;
-        Loaded { loaded, listed }
+        let structured_output = has_structured_output(&session);
+        Loaded {
+            loaded,
+            listed,
+            structured_output,
+        }
     }
 
     /// [`session_through_build_factory`] (no `--no-extensions`) with `extensions` passed as `-e`.
@@ -1410,7 +1432,12 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let listed = cyrup_tui::StartupReport::from_session(&session, false).extensions;
-        Loaded { loaded, listed }
+        let structured_output = has_structured_output(&session);
+        Loaded {
+            loaded,
+            listed,
+            structured_output,
+        }
     }
 
     /// The position of `id` in `ids`, failing loudly (with the whole list) when absent.
@@ -1446,7 +1473,7 @@ mod tests {
     /// breath proves the list is not simply empty.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn llama_is_loaded_but_absent_from_the_startup_extensions_list() {
-        let Loaded { loaded, listed } = session_through_build_factory(true, false).await;
+        let Loaded { loaded, listed, .. } = session_through_build_factory(true, false).await;
         assert!(
             loaded.iter().any(|i| i == LLAMA_ID),
             "llama.cpp is in loaded_ids; got {loaded:?}"
@@ -1485,7 +1512,7 @@ mod tests {
             .iter()
             .map(|id| format!("builtin:{id}"))
             .collect();
-        for (form, Loaded { loaded, listed }) in [
+        for (form, Loaded { loaded, listed, .. }) in [
             ("default", session_through_build_factory(true, false).await),
             (
                 "-e builtin:<name>",
@@ -2033,7 +2060,11 @@ mod tests {
             (true, true) => panic!("one orchestrator environment per probe run"),
         };
         let no_extensions = probe == "no-extensions";
-        let Loaded { loaded, .. } = session_through_build_factory(false, no_extensions).await;
+        let Loaded {
+            loaded,
+            structured_output,
+            ..
+        } = session_through_build_factory(false, no_extensions).await;
         let llama = loaded.iter().any(|i| i == LLAMA_ID);
         let mcp = loaded.iter().any(|i| i == MCP_ID);
         assert_eq!(
@@ -2045,36 +2076,37 @@ mod tests {
             llama, mcp,
             "child {flavour}: llama.cpp follows the MCP adapter's ambient treatment; got {loaded:?}"
         );
+        // SUBA-232: EVERY subagent child attaches the prompt runtime — at minimum for its own
+        // `bg_wait` (pi `subagent-prompt-runtime.ts:520` @ad11b7ab, which loads the runtime into
+        // every child) — so its presence is common to all three arms and proves none of them.
+        let runtime = cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID;
+        assert!(
+            loaded.iter().any(|i| i == runtime),
+            "child {flavour}, no_extensions={no_extensions}: every subagent child carries \
+             `{runtime}` for its bg_wait; got {loaded:?}"
+        );
         // The orchestrator environment DID reach this launch, so neither extra arm is a silent
         // copy of `plain`: a fan-out child attaches the subagents extension off its authorization
-        // alone, and a child carrying the structured-output pair attaches the prompt runtime —
-        // neither of which a `plain` child has (`plain` loads exactly `[llama.cpp, mcp]`). A
-        // misspelled or renamed variable therefore fails HERE instead of quietly re-running the
-        // `plain` case three times.
+        // alone, and a child carrying the structured-output pair registers the `structured_output`
+        // tool — neither of which a `plain` child has. A misspelled or renamed variable therefore
+        // fails HERE instead of quietly re-running the `plain` case three times.
         //
-        // Both companions are install-gated, not ambient, so `--no-extensions` does NOT drop them:
-        // that is the contrast this test is about. llama.cpp goes with the flag, these stay.
-        let companion = match flavour {
-            "fanout" => Some(cyrup_ext_subagents::extension::EXTENSION_ID),
-            "structured" => Some(cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID),
-            _ => None,
-        };
-        if let Some(companion) = companion {
-            assert!(
-                loaded.iter().any(|i| i == companion),
-                "child {flavour}, no_extensions={no_extensions}: `{companion}` proves the \
-                 orchestrator environment reached this launch; got {loaded:?}"
-            );
-        } else {
-            assert!(
-                !loaded
-                    .iter()
-                    .any(|i| i == cyrup_ext_subagents::extension::EXTENSION_ID
-                        || i == cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID),
-                "child plain: neither orchestrator extension may be present, or the two arms \
-                 above prove nothing; got {loaded:?}"
-            );
-        }
+        // Both are install-gated, not ambient, so `--no-extensions` does NOT drop them: that is the
+        // contrast this test is about. llama.cpp goes with the flag, these stay.
+        let subagents = loaded
+            .iter()
+            .any(|i| i == cyrup_ext_subagents::extension::EXTENSION_ID);
+        assert_eq!(
+            (subagents, structured_output),
+            match flavour {
+                "fanout" => (true, false),
+                "structured" => (false, true),
+                _ => (false, false),
+            },
+            "child {flavour}, no_extensions={no_extensions}: (subagents extension, \
+             structured_output tool) must be exactly the flavour's own, or the arms prove \
+             nothing; got {loaded:?}"
+        );
         println!("llama-probe-ok:{flavour}:{probe}");
     }
 
