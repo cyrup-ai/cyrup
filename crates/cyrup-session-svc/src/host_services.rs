@@ -5045,8 +5045,8 @@ mod tests {
     }
 
     /// The notices held for a mode that has not attached its drain yet are bounded: the oldest are
-    /// kept, and a session that says more drops the rest instead of growing for as long as it runs
-    /// (whether that silent drop is right is `SEAM-163`).
+    /// kept, and a session that says more drops the rest instead of growing for as long as it runs —
+    /// but not in silence (`SEAM-163`): one further notice says how many were not kept.
     #[test]
     fn the_notices_held_for_an_unattached_mode_are_bounded() {
         let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
@@ -5060,8 +5060,13 @@ mod tests {
         while let Ok(UiEffect::Notify { message, .. }) = rx.try_recv() {
             held.push(message);
         }
-        assert_eq!(held.len(), MAX_EARLY_NOTICES);
+        assert_eq!(held.len(), MAX_EARLY_NOTICES + 1);
         assert_eq!(held.first().map(String::as_str), Some("notice 0"));
+        assert_eq!(
+            held.get(MAX_EARLY_NOTICES - 1).map(String::as_str),
+            Some("notice 31")
+        );
+        assert_eq!(held.last(), Some(&dropped_notices_message(10)));
     }
 
     /// SEAM-160 — a session whose mode never attaches an effect drain (`-p`, `--mode json`) holds
