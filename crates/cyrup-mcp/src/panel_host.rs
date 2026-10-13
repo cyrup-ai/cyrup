@@ -426,6 +426,8 @@ impl SetupPanelCallbacks for SetupCallbacks {
             Ok(AddServerOutcome {
                 path: written,
                 server_name,
+                // Upstream's `addRepoPrompt` returns `{ path, serverName }` with no re-read; kept.
+                ignored_because: None,
             })
         })
     }
@@ -447,9 +449,11 @@ impl SetupPanelCallbacks for SetupCallbacks {
             )
             .map_err(|error| error.to_string())?;
             changed.store(true, Ordering::Release);
+            let ignored_because = ignored_because(&context, &preset);
             Ok(AddServerOutcome {
                 path,
                 server_name: preset.name.to_string(),
+                ignored_because,
             })
         })
     }
@@ -470,6 +474,71 @@ impl SetupPanelCallbacks for SetupCallbacks {
             tracing::debug!("MCP: could not record setup completion: {error}");
         }
     }
+}
+
+/// `ignoredBecause` (`commands.ts:670-676` @ pi-mcp-adapter `c362b08`, unchanged at `2ccf648`) —
+/// MCP-611. Re-reads the merged config through the same ladder the write went into and answers why
+/// `preset.id`'s entry will not be the one cyrup runs, or `None` when it will.
+///
+/// Three arms, in upstream's order, first match wins:
+///
+/// 1. **The merged config has no entry for the id.** Upstream words this `the current config mode
+///    doesn't read <path>`, and in upstream the arm is reached by `PI_MCP_CONFIG_MODE=exclusive`
+///    (`config.ts:674`, `:880` @ v5.0.0; `:685`, `:890` @ `2ccf648`), which reads only the global override file. **cyrup has no config
+///    mode**, so that sentence could never be true here and is not ported. The one way a written
+///    `.mcp.json` entry is absent from cyrup's merged load is
+///    `crate::config::ConfigContext::load`'s `strip_project_provider_auth`: another file (a
+///    lower-precedence global layer, for a preset that sets no `auth`, or `.cyrup/mcp.json` above
+///    it) gives the id an object-form `auth`, and a project-defined server may not carry one. The
+///    project trust gate (`ConfigContext::with_project_trusted`) would be a second route, but
+///    [`SetupCallbacks::context`] never sets it, so it cannot fire from this panel.
+///    `[CYRUP-DELTA]`: the arm says the true cause rather than upstream's config-mode sentence,
+///    which upstream itself prints for this same strip.
+/// 2. **A field the preset sets has a different merged value** — `another config file also defines
+///    <id> and takes precedence`. Merging is per field (`crate::config::merge_entry`), so only the
+///    preset's own fields are compared, exactly as upstream iterates `Object.entries(preset.entry)`.
+/// 3. **The merged entry is disabled** — `another config file disables <id>`.
+fn ignored_because(
+    context: &crate::config::ConfigContext,
+    preset: &KnownServerPreset,
+) -> Option<String> {
+    let loaded = context.load();
+    let Some(active) = loaded.config.mcp_servers.get(preset.id) else {
+        return Some(format!(
+            "another config file gives {} an auth.provider, which is only allowed in user-global \
+             config",
+            preset.id
+        ));
+    };
+    if preset_fields_differ(&preset.entry, active) {
+        return Some(format!(
+            "another config file also defines {} and takes precedence",
+            preset.id
+        ));
+    }
+    active
+        .is_disabled()
+        .then(|| format!("another config file disables {}", preset.id))
+}
+
+/// `Object.entries(preset.entry).some(([field, value]) => !isDeepStrictEqual(active[field], value))`.
+///
+/// Compared through the serialized config shape, so "a field the preset sets" means exactly a key
+/// the preset would write (every `ServerEntry` field skips `None` on serialize).
+fn preset_fields_differ(
+    preset: &crate::config::ServerEntry,
+    active: &crate::config::ServerEntry,
+) -> bool {
+    let (Ok(serde_json::Value::Object(preset)), Ok(serde_json::Value::Object(active))) =
+        (serde_json::to_value(preset), serde_json::to_value(active))
+    else {
+        // Unreachable for a derived `Serialize` on a struct; a failure says nothing about the
+        // config, so it must not invent a warning.
+        return false;
+    };
+    preset
+        .iter()
+        .any(|(field, value)| active.get(field) != Some(value))
 }
 
 // =================================================================================================
@@ -506,4 +575,205 @@ pub(crate) fn shared_config_notice(
         ],
         Some(summary.fingerprint.clone()),
     )
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    //! MCP-611 — the setup panel's `addKnownServer` notice, driven end to end: the real
+    //! [`SetupCallbacks`] writes `<cwd>/.mcp.json` into a temp ladder and re-reads it, and the real
+    //! [`crate::ui::McpSetupPanelModel`] renders the settled job.
+
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::ui::{NoticeTone, SetupJobResult, SetupPanelCallbacks};
+
+    struct Ladder {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        agent: PathBuf,
+        cwd: PathBuf,
+    }
+
+    impl Ladder {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let agent = root.path().join("agent");
+            let cwd = root.path().join("repo");
+            for dir in [&home, &agent, &cwd] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            Self {
+                _root: root,
+                home,
+                agent,
+                cwd,
+            }
+        }
+
+        fn write(path: &Path, servers: &serde_json::Value) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let doc = serde_json::json!({ "mcpServers": servers });
+            std::fs::write(path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        }
+
+        fn dirs(&self) -> McpDirs {
+            McpDirs::new(self.agent.clone(), self.cwd.clone())
+        }
+
+        /// `<agent_dir>/mcp.json` — the global override, BELOW the project's `.mcp.json`.
+        fn global_override(&self) -> PathBuf {
+            self.dirs().user_config(None)
+        }
+
+        /// `<cwd>/.cyrup/mcp.json` — the project override, ABOVE the project's `.mcp.json`.
+        fn project_override(&self) -> PathBuf {
+            self.dirs().project_agent_config()
+        }
+
+        /// Add the `deepwiki` preset through the real callbacks and return the panel's notice.
+        fn add_deepwiki(&self) -> (AddServerOutcome, String, NoticeTone) {
+            let callbacks = Arc::new(SetupCallbacks::new(
+                self.dirs(),
+                Some(self.home.clone()),
+                "fp".into(),
+                false,
+                None,
+            ));
+            let preset = crate::config::known_server_presets()
+                .into_iter()
+                .find(|preset| preset.id == "deepwiki")
+                .unwrap();
+            let outcome = futures::executor::block_on(callbacks.add_known_server(preset)).unwrap();
+            let mut diagnostics = Vec::new();
+            let discovery = callbacks
+                .context()
+                .mcp_discovery_summary(false, &mut diagnostics);
+            let mut model = crate::ui::McpSetupPanelModel::new(
+                discovery,
+                crate::onboarding::OnboardingState::default(),
+                Arc::clone(&callbacks) as Arc<dyn SetupPanelCallbacks>,
+                crate::ui::SetupScreen::Setup,
+                crate::ui::PanelKeys::default(),
+            );
+            model.finish_job(SetupJobResult::AddKnownServer(Ok(outcome.clone())));
+            let (text, tone) = model.notice().unwrap();
+            (outcome, text.to_string(), tone)
+        }
+    }
+
+    /// Upstream reason 2, "another config file also defines <id> and takes precedence".
+    ///
+    /// RED at HEAD: `AddServerOutcome` had no `ignored_because` and the notice was always the
+    /// `Success` "Added … Pi will reload" text (does not compile at HEAD; under the mutation
+    /// `preset_fields_differ -> false` it fails on the notice text).
+    #[test]
+    fn a_preset_outranked_by_the_project_override_warns_that_it_takes_precedence() {
+        let ladder = Ladder::new();
+        Ladder::write(
+            &ladder.project_override(),
+            &serde_json::json!({ "deepwiki": { "url": "https://elsewhere.example/mcp" } }),
+        );
+        let (outcome, text, tone) = ladder.add_deepwiki();
+        let written = ladder.dirs().project_shared_config();
+        assert_eq!(outcome.path, written);
+        assert_eq!(
+            text,
+            format!(
+                "Added DeepWiki to {}. Pi won't use it: another config file also defines deepwiki \
+                 and takes precedence. Pi will reload after this panel closes.",
+                written.display()
+            )
+        );
+        assert_eq!(tone, NoticeTone::Warning);
+    }
+
+    /// Upstream reason 3, "another config file disables <id>" — from a LOWER layer: the preset
+    /// sets no `disabled`, so the global override's `true` survives the per-field merge.
+    ///
+    /// RED: under the mutation that drops the `is_disabled` arm the notice is the success text.
+    #[test]
+    fn a_preset_disabled_by_another_layer_warns_that_it_is_disabled() {
+        let ladder = Ladder::new();
+        Ladder::write(
+            &ladder.global_override(),
+            &serde_json::json!({
+                "deepwiki": { "url": "https://mcp.deepwiki.com/mcp", "disabled": true }
+            }),
+        );
+        let (_, text, tone) = ladder.add_deepwiki();
+        assert_eq!(
+            text,
+            format!(
+                "Added DeepWiki to {}. Pi won't use it: another config file disables deepwiki. \
+                 Pi will reload after this panel closes.",
+                ladder.dirs().project_shared_config().display()
+            )
+        );
+        assert_eq!(tone, NoticeTone::Warning);
+    }
+
+    /// `[CYRUP-DELTA]` — the absent-entry arm. Upstream reaches it through
+    /// `PI_MCP_CONFIG_MODE=exclusive`, which cyrup does not have; cyrup reaches it through the
+    /// project provider-auth strip, and says so.
+    ///
+    /// RED: under the mutation that returns `None` for an absent entry the notice is the success
+    /// text, for a server cyrup will not load at all.
+    #[test]
+    fn a_preset_stripped_for_a_project_provider_auth_warns_with_the_strip_reason() {
+        let ladder = Ladder::new();
+        Ladder::write(
+            &ladder.global_override(),
+            &serde_json::json!({
+                "deepwiki": {
+                    "url": "https://mcp.deepwiki.com/mcp",
+                    "auth": { "provider": "github-copilot" }
+                }
+            }),
+        );
+        let (_, text, tone) = ladder.add_deepwiki();
+        assert_eq!(
+            text,
+            format!(
+                "Added DeepWiki to {}. Pi won't use it: another config file gives deepwiki an \
+                 auth.provider, which is only allowed in user-global config. Pi will reload after \
+                 this panel closes.",
+                ladder.dirs().project_shared_config().display()
+            )
+        );
+        assert_eq!(tone, NoticeTone::Warning);
+    }
+
+    /// Control: nothing else defines the id, so the add takes effect and the notice is the
+    /// success text, unchanged from HEAD.
+    ///
+    /// GUARD (green at HEAD in behaviour): fails under the mutation that makes
+    /// `ignored_because` always `Some`, and pins that an agreeing lower layer is not "precedence".
+    #[test]
+    fn a_preset_nothing_overrides_still_reports_success() {
+        let ladder = Ladder::new();
+        // A lower layer that defines the same id with the same url agrees with the preset.
+        Ladder::write(
+            &ladder.global_override(),
+            &serde_json::json!({ "deepwiki": { "url": "https://mcp.deepwiki.com/mcp" } }),
+        );
+        let (outcome, text, tone) = ladder.add_deepwiki();
+        assert_eq!(outcome.ignored_because, None);
+        assert_eq!(
+            text,
+            format!(
+                "Added DeepWiki to {}. Pi will reload after this panel closes.",
+                ladder.dirs().project_shared_config().display()
+            )
+        );
+        assert_eq!(tone, NoticeTone::Success);
+    }
 }

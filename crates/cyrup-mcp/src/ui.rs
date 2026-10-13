@@ -1195,6 +1195,22 @@ pub struct ServerState {
     /// pi-mcp-adapter `2ccf648`, `MCP-592`): the configured description, else the first line of the
     /// valid cache entry's instructions. Shown under the server row while it is expanded.
     pub summary: Option<String>,
+    /// Live, user-editable: the server is in `directTools: "search"` mode (MCP-613). While set,
+    /// every tool also reads `is_direct`, because the panel shows search-activated tools as direct
+    /// (`mcp-panel.ts:503`).
+    pub search: bool,
+    /// The baseline [`Self::search`] is compared against — `true` when the effective
+    /// `directTools` (the server's own, else the global) read `"search"` at construction.
+    pub was_search: bool,
+}
+
+impl ServerState {
+    /// Whether this server's direct-tools selection differs from its baseline: a tool flipped, or
+    /// search mode entered or left (MCP-613).
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        self.search != self.was_search || self.tools.iter().any(|t| t.is_direct != t.was_direct)
+    }
 }
 
 /// `mcp-panel.ts:63-64` `serverDescription(definition, entry)` @ pi-mcp-adapter `2ccf648` —
@@ -1242,7 +1258,8 @@ impl VisibleItem {
     }
 }
 
-/// `buildResult`'s tri-state, serialising to `true` / `false` / an array.
+/// `buildResult`'s tri-state, serialising to `true` / `false` / an array — plus, since MCP-613,
+/// `"search"`.
 ///
 /// Emitting [`Self::Named`] where upstream emits [`Self::All`] silently rewrites a user's
 /// `directTools: true` into a brittle name list that stops matching on the next server update — that
@@ -1255,6 +1272,13 @@ pub enum DirectToolsChange {
     None,
     /// A partial selection: write the raw names, in list order.
     Named(Vec<String>),
+    /// Search mode: write the literal `"search"` (MCP-613). The server's tools stay registered but
+    /// undeclared until `mcp({ search })` or a successful call activates them.
+    ///
+    /// `[CYRUP-DELTA]`: upstream's panel reads `"search"` (`mcp-panel.ts:503` @ `2ccf648`) but its
+    /// `buildResult` can only emit `true` / `false` / a list, so neither pi-mcp-adapter nor pi
+    /// offers a way to choose search mode from a panel.
+    Search,
 }
 
 /// `types.ts` `McpPanelResult`.
@@ -1280,6 +1304,7 @@ impl DirectToolsChange {
             DirectToolsChange::Named(names) => {
                 crate::config::DirectToolsSetting::Named(names.clone())
             }
+            DirectToolsChange::Search => crate::config::DirectToolsSetting::Search,
         }
     }
 }
@@ -1644,6 +1669,7 @@ impl McpPanelModel {
                 .direct_tools
                 .clone()
                 .or_else(|| global_direct.map(crate::config::DirectToolsSetting::from));
+            let was_search = selected == Some(crate::config::DirectToolsSetting::Search);
             // `mcp-panel.ts:503`: search-activated tools are still direct tools for the panel.
             let tool_filter = match selected {
                 Some(crate::config::DirectToolsSetting::Search) => {
@@ -1751,6 +1777,8 @@ impl McpPanelModel {
                 tools,
                 has_cached_data: server_cache.is_some(),
                 summary: server_summary(Some(definition), server_cache.as_ref()),
+                search: was_search,
+                was_search,
             });
         }
 
@@ -1928,10 +1956,7 @@ impl McpPanelModel {
 
     /// `updateDirty()`.
     fn update_dirty(&mut self) {
-        self.dirty = self
-            .servers
-            .iter()
-            .any(|s| s.tools.iter().any(|t| t.is_direct != t.was_direct));
+        self.dirty = self.servers.iter().any(ServerState::changed);
     }
 
     /// The import notice, at all three of upstream's identical sites. Note the fallback here is
@@ -1949,11 +1974,15 @@ impl McpPanelModel {
     pub fn build_result(&self) -> McpPanelResult {
         let mut changes: IndexMap<String, DirectToolsChange> = IndexMap::new();
         for server in &self.servers {
-            if !server.tools.iter().any(|t| t.is_direct != t.was_direct) {
+            if !server.changed() {
                 continue;
             }
             let direct: Vec<&ToolState> = server.tools.iter().filter(|t| t.is_direct).collect();
-            let change = if direct.len() == server.tools.len() && !server.tools.is_empty() {
+            // MCP-613: search mode is checked first — its tools all read `is_direct`, so without
+            // this arm it would serialise as `true`.
+            let change = if server.search {
+                DirectToolsChange::Search
+            } else if direct.len() == server.tools.len() && !server.tools.is_empty() {
                 DirectToolsChange::All
             } else if direct.is_empty() {
                 DirectToolsChange::None
@@ -2045,15 +2074,32 @@ impl McpPanelModel {
         let mut notice = None;
         match item {
             VisibleItem::Server { .. } => {
-                let new_state = !server.tools.iter().all(|t| t.is_direct);
+                // MCP-613 — the server row cycles three states, not two:
+                // none/partial -> all -> search -> none. The first press is upstream's "all on
+                // unless already all on"; `all -> search` is the inserted step, so `all -> none`
+                // now takes two presses. `[CYRUP-DELTA]`: upstream has no third state to cycle to
+                // (see `DirectToolsChange::Search`). A server with no tools stays a no-op.
+                let all_direct = server.tools.iter().all(|t| t.is_direct);
+                let (new_state, new_search) = if server.tools.is_empty() {
+                    (false, server.search)
+                } else if server.search {
+                    (false, false)
+                } else if all_direct {
+                    (true, true)
+                } else {
+                    (true, false)
+                };
                 if source == SourceKind::Import && new_state {
                     notice = Some(Self::import_notice_text(import_kind.as_deref()));
                 }
+                server.search = new_search;
                 for tool in &mut server.tools {
                     tool.is_direct = new_state;
                 }
             }
             VisibleItem::Tool { tool_index, .. } => {
+                // Picking single tools is a named selection, which search mode is not.
+                server.search = false;
                 let Some(tool) = server.tools.get_mut(tool_index) else {
                     return;
                 };
@@ -2177,6 +2223,8 @@ impl McpPanelModel {
                     let Some(server) = self.servers.get_mut(index) else {
                         return PanelInputOutcome::Ignored;
                     };
+                    // As in `toggle_item`: a single-tool toggle leaves search mode (MCP-613).
+                    server.search = false;
                     let Some(tool) = server.tools.get_mut(tool_index) else {
                         return PanelInputOutcome::Ignored;
                     };
@@ -3037,6 +3085,10 @@ impl McpPanelModel {
                     .sum();
                 tool_info.push_str(&format!("  ~{}", to_locale_string(tokens)));
             }
+            // MCP-613: search mode reads as all-direct, so the count alone cannot tell them apart.
+            if server.search {
+                tool_info.push_str("  search");
+            }
             row.push(t.description, tool_info);
         }
         row.extend(status_label);
@@ -3540,6 +3592,10 @@ pub struct AddServerOutcome {
     pub path: PathBuf,
     /// What the success notice reports.
     pub server_name: String,
+    /// `ignoredBecause` (`commands.ts:672-677` @ pi-mcp-adapter `c362b08`/#755, MCP-611): why the
+    /// entry just written will not take effect once the merged config is re-read, or `None` when it
+    /// will. Set only by `addKnownServer`; `addRepoPrompt` does not check, upstream or here.
+    pub ignored_because: Option<String>,
 }
 
 /// `SetupPanelCallbacks` (`mcp-setup-panel.ts`).
@@ -4088,13 +4144,21 @@ impl McpSetupPanelModel {
             SetupJobResult::AddRepoPrompt(Ok(outcome))
             | SetupJobResult::AddKnownServer(Ok(outcome)) => {
                 self.callbacks.mark_setup_completed();
+                // `mcp-setup-panel.ts:950-959` @ `c362b08` (MCP-611): an entry the merged config
+                // will not honour gets ` Pi won't use it: <reason>.` and the `warning` tone instead
+                // of the success notice. The `reachable` half of that block is not owed — no cyrup
+                // preset has a `desktopApp`.
+                let (status, tone) = match outcome.ignored_because.as_deref() {
+                    Some(reason) => (format!(" Pi won't use it: {reason}."), NoticeTone::Warning),
+                    None => (String::new(), NoticeTone::Success),
+                };
                 self.notice = Some((
                     format!(
-                        "Added {} to {}. Pi will reload after this panel closes.",
+                        "Added {} to {}.{status} Pi will reload after this panel closes.",
                         outcome.server_name,
                         outcome.path.display()
                     ),
-                    NoticeTone::Success,
+                    tone,
                 ));
             }
             SetupJobResult::OpenPath(path, Ok(())) => {
@@ -5908,6 +5972,11 @@ mod tests {
     // MCP-355 / MCP-357 / MCP-358 — dispatch, the discard modal, the tri-state
     // ---------------------------------------------------------------------------------------
 
+    /// MCP-613 changed the second press: `all -> search` was inserted between `all` and `none`, so
+    /// the baseline is now three presses away, not two.
+    ///
+    /// RED at HEAD: the second press produced no change (back to `none`) rather than `Search`, and
+    /// `DirectToolsChange::Search` did not exist.
     #[test]
     fn space_toggles_a_whole_server_and_build_result_is_tri_state() {
         let mut model = fixture_panel(false);
@@ -5919,9 +5988,26 @@ mod tests {
             "all on"
         );
         model.handle_key(key(OverlayKeyCode::Char(' ')));
+        assert_eq!(
+            model.build_result().changes.get("atlassian"),
+            Some(&DirectToolsChange::Search),
+            "all -> search"
+        );
+        let frame: Vec<String> = model
+            .render(82)
+            .iter()
+            .map(OverlayLine::plain_text)
+            .collect();
+        assert!(
+            frame
+                .iter()
+                .any(|l| l.contains("atlassian") && l.contains("2/2") && l.contains("search")),
+            "the row says search, not just 2/2: {frame:#?}"
+        );
+        model.handle_key(key(OverlayKeyCode::Char(' ')));
         assert!(
             model.build_result().changes.is_empty(),
-            "back to the baseline: no change at all"
+            "search -> none: back to the baseline, no change at all"
         );
 
         // A partial selection: expand, move to the first tool, toggle it.
@@ -5931,6 +6017,134 @@ mod tests {
         assert_eq!(
             model.build_result().changes.get("atlassian"),
             Some(&DirectToolsChange::Named(vec!["search_issues".into()]))
+        );
+    }
+
+    /// MCP-613 — cycling a server to search mode and saving writes the literal `"search"` into
+    /// the server's config file, through the same `to_config_changes` ->
+    /// `write_direct_tools_config` path `/mcp`'s panel arm runs (`commands.rs`).
+    ///
+    /// RED at HEAD: no state of the cycle produced `"search"`; the second press reverted to the
+    /// baseline and the save wrote nothing. Under the mutation that drops `build_result`'s
+    /// `server.search` arm the file holds `true`.
+    #[test]
+    fn cycling_a_server_to_search_and_saving_writes_search_to_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{ "mcpServers": { "atlassian": { "command": "echo", "keep": 1 } } }"#,
+        )
+        .unwrap();
+
+        let mut model = fixture_panel(false);
+        model.handle_key(key(OverlayKeyCode::Char(' '))); // none -> all
+        model.handle_key(key(OverlayKeyCode::Char(' '))); // all -> search
+        assert_eq!(
+            model.handle_key(OverlayKey::ctrl(OverlayKeyCode::Char('s'))),
+            PanelInputOutcome::Close
+        );
+        let changes = model.result().unwrap().to_config_changes();
+        assert_eq!(changes.get("atlassian"), Some(&DirectToolsSetting::Search));
+
+        let mut provenance = IndexMap::new();
+        provenance.insert(
+            "atlassian".to_string(),
+            crate::config::ServerProvenance {
+                path: path.clone(),
+                kind: SourceKind::User,
+                import_kind: None,
+            },
+        );
+        crate::config::write_direct_tools_config(&changes, &provenance, &McpConfig::default())
+            .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["mcpServers"]["atlassian"]["directTools"],
+            serde_json::json!("search")
+        );
+        assert_eq!(
+            written["mcpServers"]["atlassian"]["keep"],
+            serde_json::json!(1),
+            "the raw entry is patched, not replaced"
+        );
+    }
+
+    /// MCP-613 NON-REGRESSION GUARD (green at HEAD in what HEAD could express): a config already
+    /// holding `"search"` — per server, or inherited from the global — reads back as search mode,
+    /// its tools show as direct (`mcp-panel.ts:503`), and an untouched save writes nothing, so the
+    /// value is never silently rewritten to `true`. The new legs: the row is marked `search`, one
+    /// press leaves search for `none`, and a single-tool toggle leaves it for a named list.
+    #[test]
+    fn a_config_already_in_search_mode_reads_back_as_search() {
+        let build = |per_server: Option<DirectToolsSetting>,
+                     global: Option<crate::config::GlobalDirectTools>| {
+            let definition = ServerEntry {
+                command: Some("echo".into()),
+                direct_tools: per_server,
+                ..ServerEntry::default()
+            };
+            let mut config = McpConfig::default();
+            config
+                .mcp_servers
+                .insert("atlassian".into(), definition.clone());
+            config.settings = Some(McpSettings {
+                direct_tools: global,
+                ..McpSettings::default()
+            });
+            let mut cache = MetadataCache::default();
+            cache.servers.insert(
+                "atlassian".into(),
+                valid_cache_entry(&definition, &["search_issues", "create"]),
+            );
+            McpPanelModel::new(
+                &config,
+                Some(cache),
+                &IndexMap::new(),
+                Arc::new(StubCallbacks::default()),
+                PanelOptions::default(),
+            )
+        };
+
+        for mut model in [
+            build(Some(DirectToolsSetting::Search), None),
+            build(None, Some(crate::config::GlobalDirectTools::Search)),
+        ] {
+            let server = &model.servers()[0];
+            assert!(server.search && server.was_search);
+            assert!(server.tools.iter().all(|t| t.is_direct));
+            assert!(
+                model.build_result().changes.is_empty(),
+                "untouched: no write"
+            );
+            let frame: Vec<String> = model
+                .render(82)
+                .iter()
+                .map(OverlayLine::plain_text)
+                .collect();
+            assert!(
+                frame
+                    .iter()
+                    .any(|l| l.contains("2/2") && l.contains("search"))
+            );
+
+            model.handle_key(key(OverlayKeyCode::Char(' ')));
+            assert_eq!(
+                model.build_result().changes.get("atlassian"),
+                Some(&DirectToolsChange::None),
+                "search -> none"
+            );
+        }
+
+        let mut model = build(Some(DirectToolsSetting::Search), None);
+        model.handle_key(key(OverlayKeyCode::Enter)); // expand
+        model.handle_key(key(OverlayKeyCode::Down));
+        model.handle_key(key(OverlayKeyCode::Char(' ')));
+        assert_eq!(
+            model.build_result().changes.get("atlassian"),
+            Some(&DirectToolsChange::Named(vec!["create".into()])),
+            "a single-tool toggle leaves search mode for a named list"
         );
     }
 
@@ -6858,6 +7072,7 @@ mod tests {
         model.finish_job(SetupJobResult::AddKnownServer(Ok(AddServerOutcome {
             path: PathBuf::from("/repo/.mcp.json"),
             server_name: "Chrome DevTools".into(),
+            ignored_because: None,
         })));
         assert_eq!(
             model.notice().map(|(text, _)| text.to_string()),

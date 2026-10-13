@@ -1,8 +1,8 @@
 //! cyrup — the CLI binary (arch-11 §2.4). The sole `anyhow` boundary and the only binary in the
 //! workspace.
 //!
-//! This file holds three things and nothing else: the entry point, the process-identity syscall,
-//! and [`run`] — the **ordered startup sequence**. Every phase of that sequence is a call into the
+//! This file holds four things and nothing else: the entry point, the process-identity syscall,
+//! one boot-order predicate ([`reports_models_json_pre_ui`]), and [`run`] — the **ordered startup sequence**. Every phase of that sequence is a call into the
 //! `cyrup` library, so the whole boot reads as one page:
 //!
 //! | phase | module |
@@ -97,6 +97,22 @@ fn set_process_name(name: &str) {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = c_name;
+}
+
+/// CFG-115 — whether the `models.json` load warnings go to stderr before any UI starts.
+///
+/// pi's `main.ts` prints no `models.json` error before the UI (@f1b2e77f5); its interactive mode
+/// shows it once, in the transcript (`interactive-mode.ts:1211-1214`), which cyrup reproduces as
+/// `App::show_models_json_error` from `cyrup::interactive` (SEAM-150). That transcript line reads
+/// `AgentSession::model_runtime_error`, which carries the session builder's own `models.json`
+/// LOAD error as well as the composition errors — the same two sources `bootstrap::load_models_json`
+/// warns about here. So the interactive TUI run skips this pre-UI report, or the user sees the
+/// error flash on stderr where the first frame paints and then again in the transcript.
+///
+/// Every other run keeps it, because nothing else would show it: print, JSON, RPC and ACP have no
+/// transcript, and an interactive-mode `--help` / `--list-models` exits before the TUI starts.
+fn reports_models_json_pre_ui(mode: AppMode, exits_after_runtime: bool) -> bool {
+    mode != AppMode::Interactive || exits_after_runtime
 }
 
 /// The live-keyboard probe `cyrup_tui::native_modifiers` cannot host: reading it needs `unsafe`, and
@@ -497,7 +513,7 @@ async fn run() -> anyhow::Result<i32> {
     // HERE, before provider selection and runtime creation, or a declared provider is unlistable and
     // unlaunchable. Never fatal (pi model-config.ts:251).
     let (models_json, models_json_warnings) = bootstrap::load_models_json(&dirs);
-    if !models_json_warnings.is_empty() {
+    if reports_models_json_pre_ui(mode, cli.exits_after_runtime()) {
         diagnostics::report(&models_json_warnings);
     }
 
@@ -1033,5 +1049,36 @@ async fn run() -> anyhow::Result<i32> {
         // ACP-002 — the ACP host is served by its own arm above, for `ACP-021`'s reason: it must
         // never reach `session_launch::launch`'s modelless hard stop, which runs before this match.
         AppMode::Acp => unreachable!("ACP mode is handled before this match"),
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    /// CFG-115: the interactive TUI run does not print the `models.json` warnings before the UI
+    /// (the transcript shows them once); every transcript-less run still does.
+    ///
+    /// RED at HEAD: `main.rs` reported them unconditionally, in every mode (the predicate did not
+    /// exist); under the mutation `reports_models_json_pre_ui -> true` the first assertion fails.
+    #[test]
+    fn only_a_transcript_less_run_reports_models_json_before_the_ui() {
+        assert!(
+            !reports_models_json_pre_ui(AppMode::Interactive, false),
+            "interactive: the transcript line is the one report"
+        );
+        assert!(
+            reports_models_json_pre_ui(AppMode::Interactive, true),
+            "interactive --help / --list-models exits before the TUI, so stderr is the only report"
+        );
+        for mode in [AppMode::Print, AppMode::Json, AppMode::Rpc, AppMode::Acp] {
+            assert!(reports_models_json_pre_ui(mode, false), "{mode:?}");
+        }
     }
 }
