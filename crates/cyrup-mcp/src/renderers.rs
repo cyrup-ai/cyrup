@@ -3294,8 +3294,8 @@ mod tests {
 
     /// MCP-637's residual, closed: with the guard off (`MCP_OUTPUT_GUARD=0`) a raw result keeps its
     /// size but not a nesting its session entry cannot be read back at — 125 levels is summarized,
-    /// 124 kept verbatim. Red at the first round of this fix, where the kill switch passed the raw
-    /// result through untouched.
+    /// 124 kept verbatim. Red under C3, the kill switch passing the raw result through untouched
+    /// (as at `83daabf4`).
     #[test]
     fn the_kill_switch_still_summarizes_a_result_too_deep_for_its_session_entry() {
         let mut options = guard_options();

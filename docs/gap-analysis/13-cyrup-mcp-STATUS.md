@@ -19,7 +19,7 @@
 > dependency on pi's in-monorepo `packages/mcp`, and every citation in `13-cyrup-mcp.md` and
 > `13a`–`13i` resolves at that tag. `MCP-587` records the rule.
 >
-> Numbering resumes from **`MCP-641`** (it read `MCP-640` until 2026-10-13, when `MCP-640` was filed in `13e`; it read `MCP-634` until 2026-10-12, when `MCP-634`…`MCP-639` were filed in `13e`; it read `MCP-633` until 2026-10-11, one short: `MCP-633` is taken, filed with `MCP-622`…`MCP-632` on 2026-10-10; it read `MCP-616` when written; `MCP-616` was filed 2026-10-07, `MCP-618`…`MCP-621` on 2026-10-09 and `MCP-622`…`MCP-633` on 2026-10-10; table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
+> Numbering resumes from **`MCP-642`** (it read `MCP-640` until 2026-10-13, when `MCP-640` and `MCP-641` were filed in `13e`; it read `MCP-634` until 2026-10-12, when `MCP-634`…`MCP-639` were filed in `13e`; it read `MCP-633` until 2026-10-11, one short: `MCP-633` is taken, filed with `MCP-622`…`MCP-632` on 2026-10-10; it read `MCP-616` when written; `MCP-616` was filed 2026-10-07, `MCP-618`…`MCP-621` on 2026-10-09 and `MCP-622`…`MCP-633` on 2026-10-10; table F, *Fourth pass*, took `MCP-587`–`MCP-608`; table G,
 > *Post-pin triage 2026-10-03*, took `MCP-609`–`MCP-611`; `MCP-586` was never allocated and is still free).
 > **2026-10-09:** numbering now resumes from **`MCP-618`** (`MCP-612`–`MCP-616` were filed 2026-10-06 and 2026-10-07;
 > `MCP-617` by the pi v1.1.0 drift triage, §*Additions — 2026-10-09*). The `pi-mcp-adapter` pin is now **`2ccf648`**
@@ -697,7 +697,7 @@ before the change (see the rows in `13e`): `implemented` 375 + 2 = **377**; `mis
 
 ### Closures and additions — 2026-10-13 (the MCP waits, second round)
 
-Three rows in `13e` closed and one filed, on `claude/zealous-bell-x0u1h0` off `main` @ `83daabf4`
+Three rows in `13e` closed and two filed, on `claude/zealous-bell-x0u1h0` off `main` @ `83daabf4`
 (uncommitted at closure). The closure records — what each fix counted or measured first, its
 bound or its numbers, and the pins with their red-proofs — are on the rows; the table rows above
 are left as filed.
@@ -708,6 +708,7 @@ are left as filed.
 | `MCP-636` | ~~low~~ | 13e | `port-divergence` | **implemented** *(CLOSED 2026-10-13)* | S | the convergence pass before a request is declared, bounded by its reconnects (123 s for one stdio server at the default; delta overturned) |
 | `MCP-637` | ~~low~~ | 13e | `port-divergence` | **implemented** *(CLOSED 2026-10-13)* | M | refusal kept past 127, measured (session line = reply + 2, cache = reply + 1); within 127 what is read is read back |
 | `MCP-640` | low | 13e | `port-divergence` | **missing** | S | the `session_shutdown` teardown is not a declared wait, so the 5 s budget can cut it |
+| `MCP-641` | low | 13e | `cyrup-original` | **missing** | S | a direct call routed before the commit fails when a second build in the generation supersedes the first (introduced by `MCP-635`'s route) |
 
 **The wait census, second round.** The first round's census filed six rows from waits it found
 bounded by something other than their own work (`MCP-634`…`MCP-639`); three were this round's
@@ -718,13 +719,13 @@ convergence pass, `MCP-636`) and `on_tool_call` (120 s or the script's `timeout_
 one remains bounded by the dispatcher's 5 s budget rather than by its own work, the
 `session_shutdown` teardown, filed as `MCP-640`.
 
-**Mutation proofs:** R1–R9 (`MCP-635`, `MCP-636`) and C1–C2 (`MCP-637`), each applied, the pins
+**Mutation proofs:** R1–R9 (`MCP-635`, `MCP-636`) and C1–C3 (`MCP-637`), each applied, the pins
 run and the file restored; all turn their pins red.
 
 Arithmetic on the 2026-10-12 census (576: `implemented` 377, `partial` 70, `missing` 95,
-`not-applicable` 34): +1 row = **577**; `implemented` 377 + 3 = **380**; `partial` 70 − 3
-(`MCP-635`…`MCP-637`) = **67**; `missing` 95 + 1 (`MCP-640`) = **96**; `not-applicable` **34**.
-380 + 67 + 96 + 34 = 577. Severity of the new row: low. Next free id: `MCP-641`. Area 13 is counted
+`not-applicable` 34): +2 rows = **578**; `implemented` 377 + 3 = **380**; `partial` 70 − 3
+(`MCP-635`…`MCP-637`) = **67**; `missing` 95 + 2 (`MCP-640`, `MCP-641`) = **97**; `not-applicable` **34**.
+380 + 67 + 97 + 34 = 578. Severity of the new rows: 2 low. Next free id: `MCP-642`. Area 13 is counted
 in this file by the standing rule, so `scripts/count_open_items.py` does not see this change.
 
 ### Additions — 2026-10-07 (area 18's pi `v1.0.1..v1.0.4` triage)
