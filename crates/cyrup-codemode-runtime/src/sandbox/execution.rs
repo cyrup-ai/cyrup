@@ -349,11 +349,15 @@ impl Run {
             self.complete(id, Err(format!("Unknown {kind} \"{name}\"")));
             return;
         };
-        let args = match args
+        // The text goes as soon as it is read: the callback's first poll below can run the whole
+        // nested pipeline, and the text kept alive across it was one more copy of the arguments for
+        // as long as the call ran (CODE-053).
+        let parsed = args
             .as_deref()
             .map(serde_json::from_str::<Value>)
-            .transpose()
-        {
+            .transpose();
+        drop(args);
+        let args = match parsed {
             Ok(args) => args,
             Err(error) => {
                 self.complete(id, Err(error.to_string()));

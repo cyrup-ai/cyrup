@@ -12,6 +12,7 @@ use std::io::{self, BufRead, Read, Write};
 use cyrup_codemode::types::OutputItem;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 use super::protocol::{CallTarget, HostReply, IsolateInit, ScriptSettled, WorkerMessage};
 
@@ -21,6 +22,9 @@ pub(super) const FRAME_MARKER: &str = "\u{1}cyrup-codemode-sandbox\u{1}";
 /// Largest frame either side accepts. A script's return value is bounded by the isolate's heap
 /// (256 MiB in the tool) and JSON escaping at most doubles the characters it can hold.
 pub(super) const MAX_FRAME_BYTES: usize = 512 * 1024 * 1024;
+
+/// The most a frame buffer keeps between frames; one that grew past it is released after its frame.
+const KEPT_SCRATCH_BYTES: usize = 1024 * 1024;
 
 /// Supervisor to sandbox process.
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,7 +43,7 @@ pub(super) enum FromProcess {
         id: u32,
         target: CallTarget,
         name: String,
-        args: Option<String>,
+        args: Option<CallArgs>,
     },
     Text(String),
     /// One `console.*` line (`OutputItem::Console`, pi `eb326d265` @v1.1.0).
@@ -57,6 +61,39 @@ pub(super) enum FromProcess {
     ActiveLimit,
 }
 
+/// A call's arguments on the pipe: the JSON text the prelude wrote, carried as JSON inside the frame
+/// rather than as a string of it (CODE-053). A string would be escaped on one side and unescaped on
+/// the other, which the reader does in a buffer of its own before it copies the result out: three
+/// copies of the arguments at once in the host (the frame, that buffer and the text), where JSON
+/// inside the frame is copied out once, as it is. `Text` carries what is not one JSON value, which
+/// the prelude never writes; the host then refuses the call as it always did.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) enum CallArgs {
+    Json(Box<RawValue>),
+    Text(String),
+}
+
+impl CallArgs {
+    fn new(text: String) -> Self {
+        if serde_json::from_str::<&RawValue>(&text).is_ok() {
+            match RawValue::from_string(text) {
+                Ok(json) => Self::Json(json),
+                // Not reached: the same text was just read as one JSON value.
+                Err(error) => Self::Text(error.to_string()),
+            }
+        } else {
+            Self::Text(text)
+        }
+    }
+
+    fn into_text(self) -> String {
+        match self {
+            Self::Json(json) => Box::<str>::from(json).into_string(),
+            Self::Text(text) => text,
+        }
+    }
+}
+
 impl From<WorkerMessage> for FromProcess {
     fn from(message: WorkerMessage) -> Self {
         match message {
@@ -69,7 +106,7 @@ impl From<WorkerMessage> for FromProcess {
                 id,
                 target,
                 name,
-                args,
+                args: args.map(CallArgs::new),
             },
             WorkerMessage::Output(OutputItem::Text(text)) => Self::Text(text),
             WorkerMessage::Output(OutputItem::Console(text)) => Self::Console(text),
@@ -96,7 +133,7 @@ impl From<FromProcess> for WorkerMessage {
                 id,
                 target,
                 name,
-                args,
+                args: args.map(CallArgs::into_text),
             },
             FromProcess::Text(text) => Self::Output(OutputItem::Text(text)),
             FromProcess::Console(text) => Self::Output(OutputItem::Console(text)),
@@ -151,15 +188,27 @@ fn read_frame_bounded<T: DeserializeOwned>(
         let Some(body) = scratch.strip_prefix(FRAME_MARKER.as_bytes()) else {
             continue;
         };
-        return serde_json::from_slice(body.strip_suffix(b"\n").unwrap_or(body))
+        let frame = serde_json::from_slice(body.strip_suffix(b"\n").unwrap_or(body))
             .map(Some)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+        // A buffer grown by one large frame (a call's arguments, a reply) would otherwise keep its
+        // size for as long as the pipe is read: a copy of that frame for the rest of the execution
+        // (CODE-053).
+        if scratch.capacity() > KEPT_SCRATCH_BYTES {
+            *scratch = Vec::new();
+        }
+        return frame;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
 
     use super::*;
 
@@ -214,6 +263,68 @@ mod tests {
             read_frame_bounded::<FromProcess>(&mut pipe.as_slice(), &mut scratch, exact - 1)
                 .is_err()
         );
+    }
+
+    /// `CODE-053`: a call's arguments cross as JSON inside the frame, not as a JSON string of their
+    /// text. As a string they were escaped by the process and unescaped by the host into a buffer
+    /// of the reader's own before being copied out, three copies at once in the host; as JSON they
+    /// are copied out once. Text that is not one JSON value still crosses, as text.
+    #[test]
+    fn a_calls_arguments_cross_as_json_and_arrive_as_their_text() {
+        for (text, carried) in [
+            (
+                r#"{"a":"x\"y","b":[1,2.5]}"#,
+                r#""args":{"Json":{"a":"x\"y","b":[1,2.5]}}"#,
+            ),
+            ("{not json", r#""args":{"Text":"{not json"}"#),
+        ] {
+            let mut pipe = Vec::new();
+            let call = WorkerMessage::Call {
+                id: 3,
+                target: CallTarget::Tool,
+                name: String::from("t"),
+                args: Some(text.to_owned()),
+            };
+            write_frame(&mut pipe, &FromProcess::from(call)).unwrap();
+            let line = String::from_utf8(pipe.clone()).unwrap();
+            assert!(line.contains(carried), "{line}");
+            let mut scratch = Vec::new();
+            let read = read_frame::<FromProcess>(&mut pipe.as_slice(), &mut scratch).unwrap();
+            let Some(WorkerMessage::Call { args, .. }) = read.map(WorkerMessage::from) else {
+                panic!("not a call: {line}");
+            };
+            assert_eq!(args.as_deref(), Some(text));
+        }
+    }
+
+    /// `CODE-053`: the reader's buffer does not keep the size one large frame gave it; it held a
+    /// copy of a call's arguments for the rest of the execution.
+    #[test]
+    fn a_buffer_grown_by_a_large_frame_is_released_after_it() {
+        let mut pipe = Vec::new();
+        write_frame(
+            &mut pipe,
+            &FromProcess::Text("x".repeat(4 * KEPT_SCRATCH_BYTES)),
+        )
+        .unwrap();
+        write_frame(&mut pipe, &FromProcess::OutOfMemory).unwrap();
+        let mut input = pipe.as_slice();
+        let mut scratch = Vec::new();
+        assert!(matches!(
+            read_frame::<FromProcess>(&mut input, &mut scratch),
+            Ok(Some(FromProcess::Text(_)))
+        ));
+        assert!(
+            scratch.capacity() <= KEPT_SCRATCH_BYTES,
+            "the buffer kept {} bytes",
+            scratch.capacity()
+        );
+        // A small frame keeps its buffer, which is reused.
+        assert!(matches!(
+            read_frame::<FromProcess>(&mut input, &mut scratch),
+            Ok(Some(FromProcess::OutOfMemory))
+        ));
+        assert!(scratch.capacity() > 0);
     }
 
     #[test]

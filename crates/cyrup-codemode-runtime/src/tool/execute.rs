@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use cyrup_codemode::declarations::render_tool_sample;
 use cyrup_codemode::identifier::IdentifierTable;
-use cyrup_codemode::js::json_stringify;
+use cyrup_codemode::js::json_stringify_to;
 use cyrup_codemode::output::{
     DEFAULT_MAX_OUTPUT_TOKENS, format_output, join_adjacent_text, label_images, save_image_output,
     spill_output, truncate_output,
@@ -155,10 +155,55 @@ fn to_script_value(tool: &dyn Tool, outcome: &NestedOutcome) -> Result<Option<Va
 
 /// Compact JSON of a call's arguments, truncated for display (`previewArgs`, `execute.ts:40-48`);
 /// empty for `undefined`.
+///
+/// The JSON is written into a [`PreviewSink`] that keeps the first [`ARGS_PREVIEW_CHARS`] units and
+/// stops the walk past them (CODE-053): building the whole text and then its UTF-16 units, as
+/// `truncate_text(&json_stringify(args), ..)` did, held about five times the arguments' size for a
+/// preview of 200 characters. The result is the same text, unit for unit.
 fn preview_args(args: Option<&Value>) -> String {
     args.map_or_else(String::new, |args| {
-        truncate_text(&json_stringify(args), ARGS_PREVIEW_CHARS)
+        let mut sink = PreviewSink::default();
+        // An error is the sink saying it has seen enough.
+        let _ = json_stringify_to(args, &mut sink);
+        let units = sink.units;
+        if units.len() <= ARGS_PREVIEW_CHARS {
+            return String::from_utf16_lossy(&units);
+        }
+        // `truncate_text`'s cut, on the units it would have cut from.
+        let kept = units
+            .get(..ARGS_PREVIEW_CHARS.saturating_sub(3))
+            .unwrap_or_default();
+        format!("{}...", String::from_utf16_lossy(kept))
     })
+}
+
+/// Collects the UTF-16 units of the text written to it until it holds one more than
+/// [`ARGS_PREVIEW_CHARS`], which is enough to tell that the text is longer, and then refuses more.
+#[derive(Default)]
+struct PreviewSink {
+    units: Vec<u16>,
+}
+
+impl std::io::Write for PreviewSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let full = || std::io::Error::other("preview complete");
+        if self.units.len() > ARGS_PREVIEW_CHARS {
+            return Err(full());
+        }
+        // `json_stringify_to` writes whole characters; a lossy decode keeps this total.
+        let text = String::from_utf8_lossy(bytes);
+        for unit in text.encode_utf16() {
+            if self.units.len() > ARGS_PREVIEW_CHARS {
+                return Err(full());
+            }
+            self.units.push(unit);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// `Tool calls made before the failure …` (`formatCallSummary`, `execute.ts:241-245`).

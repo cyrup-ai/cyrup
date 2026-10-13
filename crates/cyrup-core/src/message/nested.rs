@@ -117,6 +117,20 @@ pub struct NestedCallRecorder {
     usage: Option<Usage>,
 }
 
+/// Counts the bytes written to it and keeps none of them.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl NestedCallRecorder {
     pub fn new() -> Self {
         Self::default()
@@ -143,8 +157,11 @@ impl NestedCallRecorder {
             error: None,
         };
         let arguments: &Map<String, Value> = &call.arguments;
+        // Counted as it is written, not written out: a serialization the size of the arguments only
+        // to take its length was a copy of a script's arguments for every nested call (CODE-053).
         // `Map` serialization cannot fail; the fallback keeps the arm total without a panic path.
-        let bytes = serde_json::to_vec(arguments).map_or(0, |json| json.len());
+        let mut counter = ByteCount(0);
+        let bytes = serde_json::to_writer(&mut counter, arguments).map_or(0, |()| counter.0);
         if bytes > NESTED_CALL_LIMITS.max_argument_bytes_per_call
             || self.argument_bytes.saturating_add(bytes)
                 > NESTED_CALL_LIMITS.max_argument_bytes_total

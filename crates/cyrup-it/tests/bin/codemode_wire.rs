@@ -179,6 +179,55 @@ impl<'a> Wire<'a> {
         }
     }
 
+    /// [`Self::run_in`] in a fresh [`Home`], also returning the peak resident memory of the `cyrup`
+    /// process alone, in bytes (`VmHWM`, read every few milliseconds while it runs). The sandbox
+    /// process is a child of its own and is not counted: this is what the host holds.
+    #[cfg(target_os = "linux")]
+    fn run_measured(self) -> (Outcome, u64) {
+        let home = Home::new();
+        let (mut cmd, server) = self.command(&home, true);
+        let started = Instant::now();
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cyrup");
+        let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                if let Some(mut stream) = stream {
+                    drop(stream.read_to_string(&mut text));
+                }
+                text
+            })
+        };
+        let stdout = drain(child.stdout.take().map(|s| Box::new(s) as _));
+        let stderr = drain(child.stderr.take().map(|s| Box::new(s) as _));
+        let status = format!("/proc/{}/status", child.id());
+        let mut peak_kib = 0;
+        let code = loop {
+            if let Some(kib) = std::fs::read_to_string(&status).ok().and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("VmHWM:"))
+                    .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+            }) {
+                peak_kib = std::cmp::max(peak_kib, kib);
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status.code().unwrap_or(-1);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let outcome = Outcome {
+            code,
+            stdout: stdout.join().unwrap(),
+            stderr: stderr.join().unwrap(),
+            requests: server.requests(),
+            elapsed: started.elapsed(),
+        };
+        (outcome, peak_kib * 1024)
+    }
+
     /// The configured `Command` and the server it talks to. `print` adds `-p go`; without it the
     /// caller drives the process itself (`--mode rpc`).
     fn command(self, home: &Home, print: bool) -> (Command, FakeOpenAi) {
@@ -801,6 +850,66 @@ fn a_loop_of_calls_with_large_arguments_ends_at_the_argument_limit() {
         o.elapsed < Duration::from_secs(60),
         "the loop was not stopped by the limit: {:?}",
         o.elapsed
+    );
+}
+
+/// `glibc`'s allocator with a fixed threshold for serving an allocation from a mapping of its own,
+/// for a measurement of what the host holds rather than of what its allocator kept. By default the
+/// threshold follows the largest block freed (up to 32 MiB), after which a block of 30 MB is served
+/// from a thread's heap and stays resident once freed, often in another thread's heap than the one
+/// that next wants as much: the same run of the same binary then peaks one or two blocks higher.
+/// Measured on the CODE-053 call: 3.0, 4.0 or 5.1 bytes per character by default, run to run, and
+/// 2.93 to 2.99 with this.
+const LIVE_MEMORY: (&str, &str) = ("GLIBC_TUNABLES", "glibc.malloc.mmap_threshold=1048576");
+
+/// What one running call costs the host for each character of a large string argument (CODE-053):
+/// the peak resident memory of `cyrup` with a `chars`-character `pad` in a `tools.read` call, less
+/// its peak with an empty one, over `chars`. The real binary, a scripted model, the host process
+/// alone, as the CODE-042 lane measured its "+204 MB, 6.8 times its text", with the allocator held
+/// to what is live ([`LIVE_MEMORY`]).
+#[cfg(target_os = "linux")]
+fn host_cost_per_argument_character(chars: usize) -> f64 {
+    let measure = |n: usize| {
+        let (o, peak) = Wire::script(&format!(
+            "const r = await tools.read({{ path: 'a.txt', pad: 'x'.repeat({n}) }}); return r.length"
+        ))
+        .args(&["--tools", "read,codemode"])
+        .files(&[("a.txt", "hello\n")])
+        .env(&[LIVE_MEMORY])
+        .run_measured();
+        o.assert_survived();
+        assert!(
+            o.tool_result(1).starts_with("Script completed\n"),
+            "{}",
+            o.context()
+        );
+        peak
+    };
+    let idle = measure(0);
+    let loaded = measure(chars);
+    let ratio = loaded.saturating_sub(idle) as f64 / chars as f64;
+    eprintln!(
+        "host peak: idle {} MB, with a {chars}-character argument {} MB; {ratio:.2} bytes per character",
+        idle / 1_000_000,
+        loaded / 1_000_000
+    );
+    ratio
+}
+
+/// A running call's arguments are held by the host about three times at once, not seven
+/// (CODE-053): a 30-million-character argument cost it 7.1 to 7.9 times its text, from a copy at
+/// every stage between the sandbox's pipe and the tool. Three is the floor the pipeline outside the
+/// sandbox leaves: the call's own arguments, plus the copy each `tool_execution_start` event and
+/// each extension hook is handed. The contract is a ratio to the argument's size, not a number of
+/// megabytes: the idle host's size depends on the machine and the build, what each character of
+/// an argument costs does not.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_running_call_with_a_large_string_argument_is_held_by_the_host_about_three_times() {
+    let ratio = host_cost_per_argument_character(30_000_000);
+    assert!(
+        ratio < 3.5,
+        "a 30M-character argument cost the host {ratio:.2} times its text"
     );
 }
 
@@ -2480,5 +2589,86 @@ fn a_ui_withdraws_a_no_ui_marker_a_headless_run_left_on_its_session_mid_session(
     assert!(
         left.is_empty(),
         "the process with the UI withdrew the marker: {left:?} (rpc session {session_id})"
+    );
+}
+
+/// A stdio MCP server with one tool, `big`, whose every result is the text of the file named by its
+/// first argument (a `CallToolResult` of one text block): a tool whose results are as large as a
+/// test needs. The built-in tools cut their own output at 50 KB; an MCP tool's result reaches a
+/// script whole.
+const BIG_RESULT_SERVER: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      pv=$(printf '%s' "$line" | sed -n 's/.*"protocolVersion":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"bigs","version":"1"}}}\n' "$id" "$pv" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"big","description":"a large result","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"' "$id"
+      cat "$1"
+      printf '"}],"isError":false}}\n' ;;
+    *) if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi ;;
+  esac
+done
+"#;
+
+/// Characters of each `bigs_big` result.
+const BIG_RESULT_CHARS: usize = 10_000_000;
+
+/// Runs `code` with `bigs_big` callable, returning the outcome and the host's peak.
+#[cfg(target_os = "linux")]
+fn run_with_big_results(code: &str) -> (Outcome, u64) {
+    let payload = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(payload.path(), "y".repeat(BIG_RESULT_CHARS)).unwrap();
+    let mcp = json!({ "mcpServers": { "bigs": {
+        "command": "sh",
+        "args": ["-c", BIG_RESULT_SERVER, "sh", payload.path()],
+        "directTools": true,
+        "lifecycle": "keep-alive",
+    } } })
+    .to_string();
+    // The MCP adapter spills every large result to a file of its own in the temp directory: here, a
+    // directory that goes with the test.
+    let spill = TempDir::new().unwrap();
+    let spill_dir = spill.path().to_str().unwrap();
+    Wire::script(code)
+        .args(&["--tools", "read,codemode,bigs_*"])
+        .agent_files(&[("mcp.json", &mcp)])
+        .env(&[("TMPDIR", spill_dir), LIVE_MEMORY])
+        .run_measured()
+}
+
+/// A loop that starts calls with 10 MB results and awaits none of them ends with a `RangeError` and a
+/// bounded peak (CODE-054's check, which holds without a change of its own): the loop is stopped by
+/// the limit of 10000 calls in flight (`CODE-033`) 0.3 s in, long before their results could pile
+/// up, and the results that did arrive were handed to the sandbox process and dropped. Measured on
+/// a debug build: 274 to 289 MB against an idle 155 to 160 by default, 253 against 157 with the
+/// allocator held to what is live ([`LIVE_MEMORY`]), which is 9.5 results. What a result costs on
+/// its way through the host, and the replies that can queue for the sandbox process's pipe when
+/// results arrive faster than it reads them, are `CODE-056`. The contract is a ratio to the size
+/// of one result.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unawaited_loop_of_calls_with_large_results_ends_with_a_range_error_and_a_bounded_peak() {
+    let (idle, idle_peak) = run_with_big_results("return 1");
+    idle.assert_survived();
+    let (o, peak) = run_with_big_results("for (;;) tools.bigs_big({});");
+    o.assert_survived();
+    let result = o.tool_result(1);
+    assert!(
+        result.contains("RangeError: More than 10000 tool calls are in flight at once."),
+        "{result:.600}"
+    );
+    let ratio = peak.saturating_sub(idle_peak) as f64 / BIG_RESULT_CHARS as f64;
+    eprintln!(
+        "host peak: idle {} MB, the loop {} MB; {ratio:.1} times one result",
+        idle_peak / 1_000_000,
+        peak / 1_000_000
+    );
+    assert!(
+        ratio < 20.0,
+        "the loop took the host {ratio:.1} times one result past idle"
     );
 }

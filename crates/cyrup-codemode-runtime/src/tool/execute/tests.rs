@@ -20,12 +20,13 @@ use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, 
 use serde_json::{Value, json};
 
 use super::{
-    MAX_CONCURRENT_NESTED_CALLS, format_call_summary, format_error, preview_args, to_fixed_1,
+    MAX_CONCURRENT_NESTED_CALLS, PreviewSink, format_call_summary, format_error, preview_args,
+    to_fixed_1,
 };
 use crate::testkit::{
     RecordingHost, Script, ScriptEnv, ScriptedSandboxFactory, StubTool, completed, failed,
 };
-use crate::tool::recorder::{MAX_LIVE_ROWS, truncate_text};
+use crate::tool::recorder::{ARGS_PREVIEW_CHARS, MAX_LIVE_ROWS, truncate_text};
 use crate::tool::{
     CodemodeHostSlot, CodemodeNestedCall, CodemodeNestedCallStatus, CodemodeTool,
     CodemodeToolDetails, CodemodeToolOptions, UnavailableSandboxFactory,
@@ -1464,6 +1465,50 @@ fn arguments_are_previewed_as_truncated_compact_json() {
     let preview = preview_args(Some(&long));
     assert_eq!(preview.chars().count(), 200);
     assert!(preview.ends_with("..."));
+}
+
+/// `CODE-053`: the preview is written into a sink that keeps the first units and refuses the rest,
+/// rather than built whole and cut, which held about five times the arguments for a 200-character
+/// preview. It is the same text as `truncate_text(&json_stringify(args), 200)` unit for unit,
+/// across the cut: lengths either side of it, a pair of surrogates the cut splits, escapes, JS key
+/// and number order.
+#[test]
+fn the_bounded_preview_is_the_cut_of_the_whole_text() {
+    let mut corpus = vec![
+        json!(null),
+        json!("x".repeat(196)),
+        json!("x".repeat(197)),
+        json!("x".repeat(198)),
+        json!("x".repeat(199)),
+        json!({ "2": 1, "1": [1.0, 0.5, 1e21], "b": "q\"\n\u{1}", "a": true }),
+        json!(["😀".repeat(120)]),
+        json!({ "k": format!("{}😀tail", "x".repeat(193)) }),
+        json!({ "k": format!("{}😀tail", "x".repeat(194)) }),
+    ];
+    corpus.extend((150..260).map(|n| json!({ "t": "é".repeat(n) })));
+    for args in &corpus {
+        assert_eq!(
+            preview_args(Some(args)),
+            truncate_text(
+                &cyrup_codemode::js::json_stringify(args),
+                ARGS_PREVIEW_CHARS
+            ),
+            "{args}"
+        );
+    }
+}
+
+/// `CODE-053`: the preview sink stops the walk once it has one unit more than it shows, so a
+/// call's arguments are never written out whole for it.
+#[test]
+fn the_preview_sink_refuses_text_past_the_preview() {
+    use std::io::Write;
+
+    let mut sink = PreviewSink::default();
+    let refused = sink.write_all("x".repeat(1 << 20).as_bytes());
+    assert!(refused.is_err(), "the sink took the whole megabyte");
+    assert_eq!(sink.units.len(), ARGS_PREVIEW_CHARS + 1);
+    assert!(sink.write(b"y").is_err());
 }
 
 #[test]
