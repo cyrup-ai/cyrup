@@ -491,6 +491,93 @@ pub fn watchdog_turn_end_event(
     })
 }
 
+/// SUBA-234 — the `subagent` actions whose result is delivered orchestration evidence
+/// (`turn-delta.ts` @ad11b7ab, `formatWatchdogOrchestrationActivity`).
+const ACTIVITY_SUBAGENT_ACTIONS: [&str; 5] = ["status", "resume", "interrupt", "steer", "stop"];
+/// The `subagent_supervisor` actions that are (same function).
+const ACTIVITY_SUPERVISOR_ACTIONS: [&str; 3] = ["pending", "list", "reply"];
+
+/// Whether one tool call is orchestration a reviewer may treat as delivered evidence: `bg_wait`;
+/// `subagent_supervisor` with `pending`/`list`/`reply`; `subagent` with one of
+/// [`ACTIVITY_SUBAGENT_ACTIONS`], or a DISPATCH — no `action` key at all, and an `agent` string or
+/// a `workflow` key (`turn-delta.ts` @ad11b7ab). Everything else — the watchdog's own management
+/// actions included — is not, so a reply to the watchdog can never feed it fresh evidence.
+fn is_orchestration_call(name: &str, args: &serde_json::Map<String, Value>) -> bool {
+    let action = args.get("action");
+    let action_is = |set: &[&str]| {
+        action
+            .and_then(Value::as_str)
+            .is_some_and(|a| set.contains(&a))
+    };
+    match name {
+        "bg_wait" => true,
+        "subagent_supervisor" => action_is(&ACTIVITY_SUPERVISOR_ACTIONS),
+        "subagent" => {
+            action_is(&ACTIVITY_SUBAGENT_ACTIONS)
+                // `args.action === undefined`: an ABSENT key. A JSON `null` is not `undefined`.
+                || (action.is_none()
+                    && (args.get("agent").is_some_and(Value::is_string)
+                        // `args.workflow !== undefined` — present, whatever its value.
+                        || args.contains_key("workflow")))
+        }
+        _ => false,
+    }
+}
+
+/// SUBA-234 — `formatWatchdogOrchestrationActivity(event)` (`turn-delta.ts` @ad11b7ab, `6c1af3a2`):
+/// *"Only completed, exactly paired native orchestration calls are activity evidence."*
+///
+/// From a `turn_end` (the shape [`watchdog_turn_end_event`] builds), every tool call in the
+/// assistant message that [`is_orchestration_call`] admits AND that has a result with the SAME
+/// tool name and the EXACT tool-call id is rendered as its call followed by its result; a call
+/// without its result (still running, cut off, or mismatched) contributes nothing, as does a
+/// result with no call. Anything that is not a `turn_end` is the empty string.
+#[must_use]
+pub fn format_watchdog_orchestration_activity(event: &Value) -> String {
+    let Some(turn) = event.as_object() else {
+        return String::new();
+    };
+    if turn.get("type").and_then(Value::as_str) != Some("turn_end") {
+        return String::new();
+    }
+    let (Some(content), Some(results)) = (
+        turn.get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array),
+        turn.get("toolResults").and_then(Value::as_array),
+    ) else {
+        return String::new();
+    };
+    let mut sections: Vec<String> = Vec::new();
+    for call in content {
+        if call.get("type").and_then(Value::as_str) != Some("toolCall") {
+            continue;
+        }
+        let (Some(id), Some(name)) = (
+            call.get("id").and_then(Value::as_str),
+            call.get("name").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let Some(args) = call.get("arguments").and_then(Value::as_object) else {
+            continue;
+        };
+        if !is_orchestration_call(name, args) {
+            continue;
+        }
+        let paired = results.iter().find(|result| {
+            result.get("role").and_then(Value::as_str) == Some("toolResult")
+                && result.get("toolCallId").and_then(Value::as_str) == Some(id)
+                && result.get("toolName").and_then(Value::as_str) == Some(name)
+        });
+        if let Some(result) = paired {
+            sections.push(format_tool_call(call.get("name"), call.get("arguments")));
+            sections.push(format_watchdog_review_message(result).unwrap_or_default());
+        }
+    }
+    sections.join("\n\n")
+}
+
 /// The section separator (`turn-delta.ts:160`), also the runtime's own delta separator.
 pub const WATCHDOG_DELTA_SECTION_SEPARATOR: &str = "\n\n---\n\n";
 
@@ -869,6 +956,70 @@ mod tests {
                 "Tool result: bash\nError: {}",
                 format_value(&json!({ "code": 2 }), "")
             )
+        );
+    }
+
+    /// SUBA-234 — `formatWatchdogOrchestrationActivity` (`turn-delta.ts` @ad11b7ab): which calls
+    /// are orchestration evidence, and that each needs its exact result. RED at HEAD: does not
+    /// compile (the function does not exist).
+    #[test]
+    fn orchestration_activity_is_exactly_paired_and_only_for_orchestration_calls() {
+        let turn = |name: &str, args: Value, result_id: &str, result_name: &str| {
+            json!({
+                "type": "turn_end",
+                "message": { "role": "assistant", "content": [
+                    { "type": "toolCall", "id": "c1", "name": name, "arguments": args }
+                ]},
+                "toolResults": [{ "role": "toolResult", "toolCallId": result_id,
+                    "toolName": result_name, "content": [{ "type": "text", "text": "RESULT" }] }],
+            })
+        };
+        let admitted = |name: &str, args: Value| {
+            !format_watchdog_orchestration_activity(&turn(name, args, "c1", name)).is_empty()
+        };
+        assert!(admitted("bg_wait", json!({})));
+        assert!(admitted("subagent", json!({ "action": "status" })));
+        assert!(
+            admitted("subagent", json!({ "agent": "worker", "task": "t" })),
+            "a dispatch"
+        );
+        assert!(
+            admitted("subagent", json!({ "workflow": null })),
+            "a workflow key, any value"
+        );
+        assert!(admitted(
+            "subagent_supervisor",
+            json!({ "action": "reply" })
+        ));
+        assert!(
+            !admitted("subagent", json!({ "action": "watchdog.status" })),
+            "management"
+        );
+        assert!(
+            !admitted("subagent", json!({ "action": null, "agent": "w" })),
+            "null is not absent"
+        );
+        assert!(!admitted(
+            "subagent_supervisor",
+            json!({ "action": "configure" })
+        ));
+        assert!(!admitted("bash", json!({ "command": "subagent" })));
+        let paired =
+            format_watchdog_orchestration_activity(&turn("bg_wait", json!({}), "c1", "bg_wait"));
+        assert!(paired.starts_with("Tool call: bg_wait"), "{paired}");
+        assert!(paired.contains("RESULT"));
+        assert!(
+            format_watchdog_orchestration_activity(&turn("bg_wait", json!({}), "c2", "bg_wait"))
+                .is_empty(),
+            "another id"
+        );
+        assert!(
+            format_watchdog_orchestration_activity(&turn("bg_wait", json!({}), "c1", "subagent"))
+                .is_empty(),
+            "another name"
+        );
+        assert!(
+            format_watchdog_orchestration_activity(&json!({ "type": "tool_result" })).is_empty()
         );
     }
 }

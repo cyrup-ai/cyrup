@@ -53,9 +53,10 @@ use super::settings::{
     get_watchdog_user_settings_path, write_user_watchdog_enabled, write_watchdog_model_settings,
 };
 use super::types::{
-    SUBAGENT_WATCHDOG_WARNING_TYPE, ThinkingSetting, WatchdogCategory, WatchdogImportance,
-    WatchdogRuntimeStatus, WatchdogSettingsSource, WatchdogSeverity, WatchdogWarning,
-    WatchdogWarningDetails, WatchdogWarningSource, WatchdogWarningState,
+    SUBAGENT_WATCHDOG_CLARIFICATION_TYPE, SUBAGENT_WATCHDOG_WARNING_TYPE, ThinkingSetting,
+    WatchdogCategory, WatchdogImportance, WatchdogRuntimeStatus, WatchdogSettingsSource,
+    WatchdogSeverity, WatchdogWarning, WatchdogWarningDetails, WatchdogWarningSource,
+    WatchdogWarningState,
 };
 use super::warning_format::{
     WatchdogWarningDetailsPatch, create_watchdog_warning_message_from_details,
@@ -192,6 +193,7 @@ pub fn register_main_watchdog(
     let display_services = Arc::clone(&services);
     let user_warning_services = Arc::clone(&services);
     let user_message_services = Arc::clone(&services);
+    let clarification_services = Arc::clone(&services);
     Arc::new(MainWatchdogRuntime::new(MainWatchdogRuntimeOptions {
         cwd: Some(cwd.to_path_buf()),
         resolve_config: None,
@@ -257,6 +259,23 @@ pub fn register_main_watchdog(
             super::lsp_diagnostics::TypeScriptLspDiagnostics::new(),
         )),
         repo_change_signature: Some(Arc::new(super::change_signature::GitRepoChangeSource)),
+        // SUBA-234 — `displayClarification: (content) => pi.sendMessage({ customType:
+        // "subagent_watchdog_clarification", content, display: true }, { deliverAs: "steer",
+        // triggerTurn: true })` (`register-main.ts:382` @ad11b7ab): a displayed message, steered
+        // into the session, that triggers the one continuation in which the orchestrator takes the
+        // question into account. Supplying it is what makes this the main role.
+        display_clarification: Some(Arc::new(move |content: &str| {
+            let Some(services) = clarification_services() else {
+                return;
+            };
+            let _ = services.inject_message(
+                content,
+                Some(SUBAGENT_WATCHDOG_CLARIFICATION_TYPE),
+                true,
+                None,
+                true,
+            );
+        })),
     }))
 }
 
@@ -492,11 +511,26 @@ pub fn build_watchdog_status(
                 String::new()
             }
         ),
+        // SUBA-234 — `register-main.ts:110-111` @ad11b7ab: with clarification on, delivered
+        // orchestration activity is a review trigger too, and the setting has its own line.
         format!(
             "Review trigger: {}",
             match snapshot.review_trigger {
+                super::runtime::WatchdogReviewTrigger::RepoEdits
+                    if snapshot.config.clarification =>
+                {
+                    "repo edits + bounded main orchestration activity"
+                }
                 super::runtime::WatchdogReviewTrigger::RepoEdits => "repo edits only",
                 super::runtime::WatchdogReviewTrigger::TurnDelta => "every non-empty turn delta",
+            }
+        ),
+        format!(
+            "Main clarification: {}",
+            if snapshot.config.clarification {
+                "on"
+            } else {
+                "off"
             }
         ),
         format!(
@@ -1259,6 +1293,7 @@ mod tests {
         );
         assert!(status.contains("Runtime: idle\n"));
         assert!(status.contains("Review trigger: repo edits only\n"));
+        assert!(status.contains("Main clarification: off\n"));
         assert!(status.contains("Scope context: on\n"));
         assert!(status.contains("Cadence: boundary only\n"));
         assert!(status.contains("Session override: none\n"));
@@ -1277,6 +1312,20 @@ mod tests {
         ));
     }
 
+    /// SUBA-234 — `register-main.ts:110-111` @ad11b7ab: with clarification on, the trigger line
+    /// names the activity trigger and the setting has its own line. RED at HEAD: neither line
+    /// exists.
+    #[test]
+    fn the_status_block_reports_clarification_and_its_activity_trigger() {
+        let mut snapshot = snapshot();
+        snapshot.config.clarification = true;
+        let status = build_watchdog_status(&snapshot, &ctx());
+        assert!(
+            status.contains("Review trigger: repo edits + bounded main orchestration activity\n"),
+            "{status}"
+        );
+        assert!(status.contains("Main clarification: on\n"), "{status}");
+    }
     #[test]
     fn a_waiting_status_label_loses_its_hyphens() {
         let mut snap = snapshot();

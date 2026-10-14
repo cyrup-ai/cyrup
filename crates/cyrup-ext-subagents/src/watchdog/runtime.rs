@@ -63,7 +63,9 @@ use super::emission_guard::{WatchdogEmissionGuard, WatchdogEmissionGuardOptions}
 use super::lsp_diagnostics::{TypeScriptLspDiagnostics, WatchdogLspRequest};
 use super::scope::{WatchdogAutoFollowPromptLedger, WatchdogScopeArtifact};
 use super::settings::resolve_watchdog_config;
-use super::turn_delta::{WatchdogTurnDeltaInput, format_watchdog_turn_delta};
+use super::turn_delta::{
+    WatchdogTurnDeltaInput, format_watchdog_orchestration_activity, format_watchdog_turn_delta,
+};
 use super::types::{
     ResolvedWatchdogConfig, ThinkingSetting, WatchdogImportance, WatchdogLspResult,
     WatchdogLspRuntimeSnapshot, WatchdogLspStatus, WatchdogRuntimeStatus, WatchdogSettingsError,
@@ -74,6 +76,25 @@ use super::warning_format::{WatchdogWarningDetailsPatch, normalize_watchdog_warn
 
 /// `MAX_REVIEW_INPUT_CHARS` (`runtime.ts:94`).
 const MAX_REVIEW_INPUT_CHARS: usize = 24_000;
+/// `REVIEW_INPUT_HEAD_CHARS` (`runtime.ts:104` @ad11b7ab) — the most of an over-long text
+/// [`bound_watchdog_review_text`] keeps from its head.
+const REVIEW_INPUT_HEAD_CHARS: usize = 6_000;
+/// SUBA-234 — one activity entry's bound (`boundWatchdogReviewText(activity, 3_000)`,
+/// `runtime.ts:356` @ad11b7ab).
+const ACTIVITY_ENTRY_MAX_CHARS: usize = 3_000;
+/// SUBA-234 — the retained activity tail (`.slice(-6_000)`, `runtime.ts:356` @ad11b7ab).
+const ACTIVITY_TAIL_MAX_CHARS: usize = 6_000;
+/// SUBA-234 — a reviewer's question and its evidence (`runtime.ts:668-669` @ad11b7ab).
+pub(crate) const CLARIFICATION_QUESTION_MAX_CHARS: usize = 1_000;
+/// The evidence half of [`CLARIFICATION_QUESTION_MAX_CHARS`].
+pub(crate) const CLARIFICATION_EVIDENCE_MAX_CHARS: usize = 2_000;
+/// SUBA-234 — the activity block's heading in the review input, upstream's verbatim
+/// (`runtime.ts:857` @ad11b7ab). This is the "supplied activity evidence" the reviewer's scope line
+/// names.
+pub const ACTIVITY_BLOCK_HEADER: &str = "Recent delivered orchestration activity (oldest first; \
+                                         bounded observations, not a task board; waits/holds are \
+                                         not evidence of neglect):";
+
 /// `REVIEW_DELTA_SEPARATOR` (`runtime.ts:95`) — the same string
 /// [`super::turn_delta::WATCHDOG_DELTA_SECTION_SEPARATOR`] joins turn sections with, so a buffer of
 /// deltas reads as one continuous transcript.
@@ -126,6 +147,20 @@ pub struct WatchdogReviewResult {
     pub warnings: Vec<WatchdogWarning>,
     /// The provider's stop reason, when the review knows it.
     pub stop_reason: Option<ReviewStopReason>,
+    /// SUBA-234 — the reviewer yielded with a question instead of ruling
+    /// (`clarification?: { question, evidence }`, `runtime.ts:37` @ad11b7ab). Honoured only when
+    /// the request allowed it ([`WatchdogReviewRequest::allow_clarification`]).
+    pub clarification: Option<WatchdogClarification>,
+}
+
+/// SUBA-234 — one reviewer question and the concrete evidence that prompted it
+/// (`{ question: string; evidence: string }`, `runtime.ts:37` @ad11b7ab).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchdogClarification {
+    /// The focused question, at most 1,000 characters once the runtime accepts it.
+    pub question: String,
+    /// What made it necessary, at most 2,000 characters.
+    pub evidence: String,
 }
 
 /// `emitWarning(warning): boolean` (`runtime.ts:41`) — the streaming channel a review uses to hand
@@ -192,6 +227,10 @@ pub struct WatchdogReviewRequest {
     /// — upstream's `options.diffBaseline` (`review.ts:59`,`:293` @ad11b7ab), which the review
     /// awaits. Empty when nothing started a capture; the review is then given no diff tool.
     pub diff_baseline: super::diff_tool::WatchdogDiffBaselineSlot,
+    /// SUBA-234 — `allowClarification` (`runtime.ts:47` @ad11b7ab): this review may give the
+    /// reviewer `watchdog_ask`. Set only on a main-session boundary review with clarification on,
+    /// no question asked yet this prompt, and no stalemate; never on a cadence review.
+    pub allow_clarification: bool,
 }
 
 /// `WatchdogReviewFunction` (`runtime.ts:45`) — the model call that actually reviews a delta.
@@ -309,6 +348,11 @@ pub type WatchdogUserWarningSink = Arc<dyn Fn(&WatchdogWarningDetails) + Send + 
 /// rejected promise, which un-queues the prompt and records `lastError` (`:677-682`).
 pub type WatchdogUserMessageSink = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// SUBA-234 — `displayClarification` (`runtime.ts:90-91` @ad11b7ab): *"Supplying this
+/// main-session delivery capability gates clarification (children omit it)."* The content is the
+/// whole message; the main registration steers it into the session and triggers a turn.
+pub type WatchdogClarificationSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// `resolveConfig` (`runtime.ts:80`) — how this runtime resolves its config. The main role uses
 /// [`resolve_watchdog_config`]; a child role hands back a fixed, already-resolved config
 /// (`register-child.ts:76`).
@@ -423,6 +467,10 @@ pub struct MainWatchdogRuntimeOptions {
     pub lsp_diagnostics: Option<Arc<dyn WatchdogLspDiagnostics>>,
     /// The repo-change seam (`:179`).
     pub repo_change_signature: Option<Arc<dyn WatchdogRepoChangeSource>>,
+    /// SUBA-234 — where a reviewer's question goes. Its PRESENCE is the main-role gate: a runtime
+    /// built without it (every child watchdog) never collects activity, never offers
+    /// `watchdog_ask` and never resets on user input, whatever `clarification` says.
+    pub display_clarification: Option<WatchdogClarificationSink>,
 }
 
 impl std::fmt::Debug for MainWatchdogRuntimeOptions {
@@ -448,14 +496,19 @@ pub struct WatchdogResetOptions {
     pub clear_scope: bool,
     /// Reset the auto-follow attempt/stalemate counters.
     pub reset_auto_follow: bool,
+    /// SUBA-234 — drop the delivered-orchestration activity tail (`clearActivity`,
+    /// `runtime.ts:277`,`:300` @ad11b7ab). [`Self::clear_scope`] drops it too.
+    pub clear_activity: bool,
 }
 
 /// The outcome of one `reviewDelta` (`runtime.ts:91`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReviewDeltaOutcome {
     Completed,
     Timeout,
     Stale,
+    /// SUBA-234 — the reviewer yielded with a question (`runtime.ts:100` @ad11b7ab).
+    Clarification(WatchdogClarification),
 }
 
 /// Every mutable field of `MainWatchdogRuntime` (`runtime.ts:114-167`).
@@ -504,6 +557,19 @@ struct RuntimeInner {
     failed_reviews: u32,
     stale_reviews: u32,
     scope: WatchdogScopeArtifact,
+    /// SUBA-234 — `askedThisPrompt` (`runtime.ts:183` @ad11b7ab): one question per user prompt.
+    asked_this_prompt: bool,
+    /// SUBA-234 — `activityTail` (`:184`): the bounded tail of delivered orchestration activity.
+    activity_tail: String,
+    /// SUBA-234 — `activityPending` (`:185`): activity arrived that no boundary has reviewed.
+    activity_pending: bool,
+    /// SUBA-234 — `activityReviewUsed` (`:186`): this prompt's one no-edit activity review is spent.
+    activity_review_used: bool,
+    /// SUBA-234 — upstream's `boundaryRepeats` (`:175`) as the activity gates read it: how many
+    /// boundary warnings this user prompt has displayed. A displayed boundary warning continues the
+    /// run, and upstream refuses to treat that continuation's orchestration as fresh evidence
+    /// (`boundaryRepeats === 0`, `:353`,`:400`). See [`MainWatchdogRuntime::handle_turn_end`].
+    boundary_warnings_this_prompt: u32,
 }
 
 /// `MainWatchdogRuntime` (`runtime.ts:113-868`).
@@ -516,6 +582,7 @@ pub struct MainWatchdogRuntime {
     display_warning: Option<WatchdogWarningSink>,
     display_user_warning: Option<WatchdogUserWarningSink>,
     send_user_message: Option<WatchdogUserMessageSink>,
+    display_clarification: Option<WatchdogClarificationSink>,
     review_changes_only: bool,
     lsp_diagnostics: Arc<dyn WatchdogLspDiagnostics>,
     repo_change_signature: Arc<dyn WatchdogRepoChangeSource>,
@@ -620,6 +687,11 @@ impl MainWatchdogRuntime {
             failed_reviews: 0,
             stale_reviews: 0,
             scope: WatchdogScopeArtifact::new(),
+            asked_this_prompt: false,
+            activity_tail: String::new(),
+            activity_pending: false,
+            activity_review_used: false,
+            boundary_warnings_this_prompt: 0,
         };
         let runtime = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -630,6 +702,7 @@ impl MainWatchdogRuntime {
             display_warning: options.display_warning,
             display_user_warning: options.display_user_warning,
             send_user_message: options.send_user_message,
+            display_clarification: options.display_clarification,
             review_changes_only: options.review_changes_only,
             lsp_diagnostics,
             repo_change_signature,
@@ -676,17 +749,26 @@ impl MainWatchdogRuntime {
             clear_lsp_ledger: true,
             clear_scope: true,
             reset_auto_follow: true,
+            ..WatchdogResetOptions::default()
         });
+        // `resetBoundaryRepeats()` (`runtime.ts:213` @ad11b7ab) — a new session starts a new
+        // prompt chain.
+        self.lock().start_user_prompt();
     }
 
     /// `refreshConfig(cwd)` (`runtime.ts:195-214`) — re-resolve every layer, rebuild the emission
     /// guard when the warning ceiling moved, and invalidate an in-flight review if the watchdog was
     /// just turned off.
     pub fn refresh_config(&self, cwd: &Path) -> WatchdogSettingsResult {
-        let (session, was_enabled) = {
+        let (session, was_enabled, had_clarification, previous_main) = {
             let mut inner = self.lock();
             inner.cwd = cwd.to_path_buf();
-            (inner.session_patch(), inner.is_enabled())
+            (
+                inner.session_patch(),
+                inner.is_enabled(),
+                inner.config_result.config.clarification,
+                inner.config_result.config.main.clone(),
+            )
         };
         let resolved = (self.resolve_config)(cwd, session.as_ref());
         let mut invalidate = false;
@@ -701,6 +783,25 @@ impl MainWatchdogRuntime {
                 });
             }
             if was_enabled && !inner.is_enabled() {
+                invalidate = true;
+            }
+            // SUBA-234 — `if (!this.isEnabled() || !this.configResult.config.clarification)
+            // this.clearActivity()` (`runtime.ts:236` @ad11b7ab): no activity is kept while it
+            // could not be used.
+            let clarification = inner.config_result.config.clarification;
+            if !inner.is_enabled() || !clarification {
+                inner.clear_activity();
+            }
+            // `:237-239` — turning clarification off, or changing the reviewer's model or thinking
+            // under it, invalidates an in-flight review: its result would be judged under a
+            // configuration that no longer holds.
+            if self.display_clarification.is_some()
+                && (had_clarification || clarification)
+                && (inner.reviewing || inner.waiting_at_agent_end)
+                && (!clarification
+                    || previous_main.model != inner.config_result.config.main.model
+                    || previous_main.thinking != inner.config_result.config.main.thinking)
+            {
                 invalidate = true;
             }
             inner.config_result.clone()
@@ -784,6 +885,10 @@ impl MainWatchdogRuntime {
         let clear_ledger = options.clear_lsp_ledger;
         let waiters = {
             let mut inner = self.lock();
+            // `this.activeReviewAbortController?.abort()` (`runtime.ts:278` @ad11b7ab) — a reset
+            // ABORTS the in-flight review rather than only orphaning it, so a reviewer mid-turn
+            // stops spending tokens on evidence nothing will read (SUBA-234).
+            inner.abort_active_review();
             inner.abort_active_agent_end();
             inner.epoch += 1;
             inner.status = WatchdogRuntimeStatus::Idle;
@@ -806,6 +911,10 @@ impl MainWatchdogRuntime {
             if options.clear_scope {
                 inner.scope.reset();
                 inner.pending_auto_follow_prompts.clear();
+            }
+            // `if (options.clearScope || options.clearActivity) this.clearActivity()` (`:300`).
+            if options.clear_scope || options.clear_activity {
+                inner.clear_activity();
             }
             if options.reset_auto_follow {
                 inner.reset_auto_follow_state();
@@ -830,6 +939,10 @@ impl MainWatchdogRuntime {
     pub fn dispose(&self) {
         let waiters = {
             let mut inner = self.lock();
+            // `this.clearActivity(); this.activeReviewAbortController?.abort();` (`runtime.ts:308-309`
+            // @ad11b7ab, SUBA-234).
+            inner.clear_activity();
+            inner.abort_active_review();
             inner.disposed = true;
             inner.abort_active_agent_end();
             inner.epoch += 1;
@@ -875,6 +988,15 @@ impl MainWatchdogRuntime {
             reset_auto_follow: !auto_follow_prompt,
             ..WatchdogResetOptions::default()
         });
+        // SUBA-234 — `this.askedThisPrompt = false; this.activityReviewUsed = false;` and
+        // `resetBoundaryRepeats()` (`runtime.ts:334-336` @ad11b7ab): a new user prompt gets its own
+        // question and its own activity review. The watchdog's OWN auto-follow prompt is not a new
+        // user prompt — it is cyrup's warning continuation (upstream's continuation never fires
+        // `before_agent_start`) — so it keeps the prompt's counters, exactly as it keeps the
+        // auto-follow counters above.
+        if !auto_follow_prompt {
+            self.lock().start_user_prompt();
+        }
         self.refresh_config(cwd);
         {
             let mut inner = self.lock();
@@ -895,36 +1017,66 @@ impl MainWatchdogRuntime {
         self.reset_repo_change_baseline(None, false);
     }
 
-    /// SUBA-198 — `handleUserInput(event)` (`runtime.ts:512-517` @ad11b7ab, wired at
+    /// SUBA-198 / SUBA-234 — `handleUserInput(event)` (`runtime.ts:512-517` @ad11b7ab, wired at
     /// `register-main.ts:406`): *"A real user input sent while the agent streams reaches the loop
     /// without before_agent_start, so record it in scope here."*
     ///
-    /// A steer or follow-up is queued onto the live run, so [`Self::handle_before_agent_start`] —
-    /// the only other place a prompt enters the scope record — never sees it, and the next review
-    /// would judge the work it asked for against a scope that never authorized it. Whether an
-    /// input is such a message is the rule `bg_wait` applies too, [`crate::mid_run_input::admits`];
-    /// idle input is left to `before_agent_start`, which records it once.
+    /// Three lines, in upstream's order:
     ///
-    /// `[CYRUP-DELTA]` upstream's second line (`:515`) resets an in-flight clarification on any
-    /// non-extension input. cyrup's watchdog has no clarification lifecycle (`watchdog_ask` is not
-    /// adopted — see `review.rs`'s `ModelTurnReviewAgent`), and upstream's own default leaves it
-    /// off (`settings.ts:65`), so there is nothing here for it to reset.
+    /// 1. `:514` — a disposed runtime, or an extension talking, is ignored
+    ///    ([`crate::mid_run_input::is_operator_input`]).
+    /// 2. `:515` (SUBA-234) — with clarification on, ANY operator input while a review is in flight
+    ///    (`reviewing || waitingAtAgentEnd`) resets the runtime, which aborts that review: the
+    ///    operator is answering, or moving past, the turn it is judging, so whatever it concludes —
+    ///    a warning or a question — is about a conversation that has moved on. Idle input counts,
+    ///    which is why this uses the WEAKER rule and not [`crate::mid_run_input::admits`]: a boundary
+    ///    review runs after the run ended, so the agent is idle exactly when this matters most.
+    /// 3. `:516` — a steer or follow-up queued onto the live run joins the scope record, the rule
+    ///    `bg_wait` applies too ([`crate::mid_run_input::admits`]); idle input is left to
+    ///    `before_agent_start`, which records it once.
     pub fn handle_user_input(
         &self,
         text: &str,
         source: cyrup_ext::InputEventSource,
         streaming_behavior: Option<cyrup_ext::InputStreamingBehavior>,
     ) {
-        let mut inner = self.lock();
-        // pi `:514` — `this.disposed ||`, ahead of everything else.
-        if inner.disposed {
-            return;
+        let reset = {
+            let inner = self.lock();
+            if inner.disposed || !crate::mid_run_input::is_operator_input(source) {
+                return;
+            }
+            inner.clarification_review_in_flight(self.display_clarification.is_some())
+        };
+        if reset {
+            // `this.reset("new user input")` — default options: the scope, the activity tail and
+            // the auto-follow counters all survive; only the in-flight work is dropped.
+            self.reset(WatchdogResetOptions::default());
         }
-        // pi `:516` — `if (event.streamingBehavior) this.scope.addPrompt(event.text)`, behind
-        // `:514`'s extension skip; together they are the shared rule.
         if crate::mid_run_input::admits(source, streaming_behavior) {
-            inner.scope.add_prompt(text, None);
+            self.lock().scope.add_prompt(text, None);
         }
+    }
+
+    /// SUBA-234 — `handleModelChange()` (`runtime.ts:519-521` @ad11b7ab, wired to `model_select`
+    /// at `register-main.ts:407`): with clarification on, a session model change while a review is
+    /// in flight resets the runtime. An inherited-model reviewer would otherwise finish on the model
+    /// the operator just moved away from.
+    pub fn handle_model_change(&self) {
+        let reset = {
+            let inner = self.lock();
+            !inner.disposed
+                && inner.clarification_review_in_flight(self.display_clarification.is_some())
+        };
+        if reset {
+            self.reset(WatchdogResetOptions::default());
+        }
+    }
+
+    /// SUBA-234 — the retained activity tail. Test-only: production reads it through the review
+    /// input's activity block alone.
+    #[cfg(test)]
+    pub(crate) fn activity_tail(&self) -> String {
+        self.lock().activity_tail.clone()
     }
 
     /// The scope record's entries, oldest first — what the next review's `Current scope:` block is
@@ -950,6 +1102,22 @@ impl MainWatchdogRuntime {
         }
         let (include_user_prompt, user_prompt) = {
             let mut inner = self.lock();
+            // SUBA-234 — `runtime.ts:353-358` @ad11b7ab. With clarification on (and only in the
+            // main role, which is what the clarification sink marks), every completed turn's PAIRED
+            // orchestration calls and results join a bounded activity tail the next boundary
+            // review reads: each entry bounded to 3,000 characters, the joined tail clipped to its
+            // newest 6,000. Not collected during a warning's continuation (`boundaryRepeats ===
+            // 0`): orchestration the agent does in answer to a warning is not fresh evidence of
+            // the task, and would let a warning re-trigger its own review.
+            if self.display_clarification.is_some()
+                && inner.config_result.config.clarification
+                && inner.boundary_warnings_this_prompt == 0
+            {
+                let activity = format_watchdog_orchestration_activity(event);
+                if !activity.is_empty() {
+                    inner.append_activity(&activity);
+                }
+            }
             inner.observed_repo_edit_this_turn =
                 inner.observed_repo_edit_this_turn || event_indicates_repo_edit(event);
             let include = inner.include_user_prompt_in_next_delta;
@@ -1068,12 +1236,33 @@ impl MainWatchdogRuntime {
         }
         let change_signature = self.resolve_review_change_signature(cwd);
 
-        // `:367-372` — "changes only" and nothing changed: drop the buffer and stay idle.
-        if self.review_changes_only && change_signature.is_none() {
+        // SUBA-234 — `runtime.ts:400-410` @ad11b7ab. With clarification on, NEW delivered
+        // orchestration activity admits one boundary review per user prompt even when nothing in
+        // the tree changed: a subagent reported back, a gate cleared, and the reviewer gets to
+        // weigh that against the scope. Not during a warning's continuation, and at most once per
+        // prompt.
+        let (activity_review, known_evidence) = {
+            let inner = self.lock();
+            let activity_review = self.display_clarification.is_some()
+                && inner.config_result.config.clarification
+                && !inner.activity_review_used
+                && inner.boundary_warnings_this_prompt == 0
+                && inner.activity_pending;
+            let known_evidence = change_signature.as_ref().is_some_and(|signature| {
+                inner.last_reviewed_change_signature.as_deref() == Some(signature.key.as_str())
+            });
+            (activity_review, known_evidence)
+        };
+        // `:367-378` (`:402-407` @ad11b7ab) — "changes only" and nothing changed, or the tree is
+        // byte-identical to what was already reviewed: drop the buffer and stay idle — unless new
+        // activity admits a review on its own.
+        if !activity_review
+            && (known_evidence || (self.review_changes_only && change_signature.is_none()))
+        {
             let waiters = {
                 let mut inner = self.lock();
                 inner.clear_pending_deltas();
-                if inner.status == WatchdogRuntimeStatus::Queued {
+                if known_evidence || inner.status == WatchdogRuntimeStatus::Queued {
                     inner.status = WatchdogRuntimeStatus::Idle;
                 }
                 inner.take_waiters(true)
@@ -1081,22 +1270,14 @@ impl MainWatchdogRuntime {
             resolve_waiters(waiters, true);
             return;
         }
-        // `:373-378` — the tree is byte-identical to what was already reviewed.
-        if let Some(signature) = &change_signature {
-            let already = {
-                let inner = self.lock();
-                inner.last_reviewed_change_signature.as_deref() == Some(signature.key.as_str())
-            };
-            if already {
-                let waiters = {
-                    let mut inner = self.lock();
-                    inner.clear_pending_deltas();
-                    inner.status = WatchdogRuntimeStatus::Idle;
-                    inner.take_waiters(true)
-                };
-                resolve_waiters(waiters, true);
-                return;
+        {
+            let mut inner = self.lock();
+            // `:409-410` — only a review the ACTIVITY admitted spends the prompt's one activity
+            // review; one an edit admitted would have run anyway.
+            if activity_review && (change_signature.is_none() || known_evidence) {
+                inner.activity_review_used = true;
             }
+            inner.activity_pending = false;
         }
 
         self.cancel_mid_run_review();
@@ -1200,9 +1381,19 @@ impl MainWatchdogRuntime {
         }
 
         let timeout_ms = self.lock().config_result.config.agent_end_timeout_ms;
-        let outcome = self.review_delta(delta, timeout_ms, false).await;
+        // `{ allowClarification: true }` (`runtime.ts:441` @ad11b7ab) — the boundary review is the
+        // one that may ask; `review_delta` narrows it by the setting, the prompt's budget and the
+        // stalemate.
+        let outcome = self.review_delta(delta, timeout_ms, false, true).await;
 
         let mut inner = self.lock();
+        // `if (!this.isAgentEndCurrent(agentEndEpoch, agentEndId)) return;` (`runtime.ts:442`
+        // @ad11b7ab, SUBA-234) — a boundary something reset while its review ran (the operator's
+        // message, a model change, clarification turned off) records nothing and displays nothing:
+        // its question or its warning would be about a conversation that has moved on.
+        if !inner.is_agent_end_current(agent_end_epoch, agent_end_id) {
+            return;
+        }
         inner.waiting_at_agent_end = false;
         if outcome == ReviewDeltaOutcome::Timeout {
             // `:414-421`.
@@ -1215,10 +1406,15 @@ impl MainWatchdogRuntime {
             resolve_waiters(waiters, true);
             return;
         }
-        if outcome == ReviewDeltaOutcome::Completed
-            && inner.status != WatchdogRuntimeStatus::Failed
+        let mut question = None;
+        if matches!(
+            outcome,
+            ReviewDeltaOutcome::Completed | ReviewDeltaOutcome::Clarification(_)
+        ) && inner.status != WatchdogRuntimeStatus::Failed
             && inner.status != WatchdogRuntimeStatus::Stale
         {
+            // `:448-450` — "A question consumes this evidence just like a completed review, not a
+            // pending exchange." So an unchanged boundary after the question does not re-review it.
             inner.last_review_input_signature = Some(signature);
             if let Some(sig) = &change_signature {
                 inner.last_reviewed_change_signature = Some(sig.key.clone());
@@ -1226,6 +1422,9 @@ impl MainWatchdogRuntime {
             inner.current_changed_paths =
                 change_signature.as_ref().map(|s| s.changed_paths.clone());
             inner.status = WatchdogRuntimeStatus::Idle;
+            if let ReviewDeltaOutcome::Clarification(clarification) = &outcome {
+                question = Some(clarification_message(clarification));
+            }
         }
         let displayed = if inner.displayed_warning_sequence != previous_displayed_sequence {
             inner.last_warning.clone()
@@ -1234,6 +1433,13 @@ impl MainWatchdogRuntime {
         };
         let waiters = inner.take_waiters(true);
         drop(inner);
+        // `this.displayClarification?.([...].join("\n"))` (`runtime.ts:458-461` @ad11b7ab) —
+        // delivered, and the lifecycle is over: the reviewer has yielded, nothing waits for an
+        // answer, and the runtime is already idle. The question steers the session into one
+        // continuation in which the orchestrator takes the missing context into account.
+        if let (Some(question), Some(sink)) = (question, &self.display_clarification) {
+            sink(&question);
+        }
         self.queue_auto_follow_if_needed(displayed.as_ref());
         resolve_waiters(waiters, true);
     }
@@ -1330,7 +1536,7 @@ impl MainWatchdogRuntime {
             inner.mid_run_generation
         };
         let timeout_ms = self.lock().config_result.config.agent_end_timeout_ms;
-        let outcome = self.review_delta(delta, timeout_ms, true).await;
+        let outcome = self.review_delta(delta, timeout_ms, true, false).await;
         let waiters = {
             let mut inner = self.lock();
             if generation != inner.mid_run_generation {
@@ -1380,6 +1586,7 @@ impl MainWatchdogRuntime {
         delta: String,
         timeout_ms: u64,
         correction: bool,
+        allow_clarification: bool,
     ) -> ReviewDeltaOutcome {
         let (review_epoch, review_id, cancel, request) = {
             let mut inner = self.lock();
@@ -1395,6 +1602,13 @@ impl MainWatchdogRuntime {
             inner.status = WatchdogRuntimeStatus::Reviewing;
             let cancel = CancelToken::new();
             inner.active_review_cancel = Some((review_id, cancel.clone()));
+            // `runtime.ts:640` @ad11b7ab — the caller's wish, narrowed: the main role only, the
+            // setting on, no question yet this prompt (answered or not), and not in stalemate.
+            let allow_clarification = allow_clarification
+                && self.display_clarification.is_some()
+                && inner.config_result.config.clarification
+                && !inner.asked_this_prompt
+                && !inner.auto_follow_stalemate;
             let request = WatchdogReviewRequest {
                 delta,
                 epoch: review_epoch,
@@ -1404,10 +1618,12 @@ impl MainWatchdogRuntime {
                 emit_warning: self.warning_emitter(review_epoch, review_id),
                 cancel: cancel.clone(),
                 diff_baseline: self.diff_baseline.clone(),
+                allow_clarification,
             };
             (review_epoch, review_id, cancel, request)
         };
 
+        let allowed = request.allow_clarification;
         let outcome = match tokio::time::timeout(
             Duration::from_millis(timeout_ms),
             self.review.review(request),
@@ -1431,21 +1647,17 @@ impl MainWatchdogRuntime {
                         // `:605` — a `void` return is a stale review.
                         None => ReviewDeltaOutcome::Stale,
                         Some(result) => {
-                            for warning in &result.warnings {
-                                self.accept_warning(review_epoch, review_id, warning);
-                            }
-                            match result.stop_reason {
-                                Some(reason) if reason != ReviewStopReason::Stop => {
-                                    self.fail(&format!(
-                                        "Watchdog review ended with stop reason '{}'.",
-                                        reason.as_str()
-                                    ));
-                                    ReviewDeltaOutcome::Completed
-                                }
-                                _ => {
-                                    self.display_accepted_review_warning(correction);
-                                    ReviewDeltaOutcome::Completed
-                                }
+                            // SUBA-234 — `runtime.ts:664-671` @ad11b7ab: a question is taken in
+                            // place of a ruling only when this review was allowed one, the setting
+                            // is STILL on, the review ended cleanly, no warning was accepted or
+                            // returned, and nothing aborted it; and only with both halves
+                            // non-empty. Anything else falls through to the ordinary ruling.
+                            if let Some(clarification) =
+                                self.accept_clarification(&result, allowed, &cancel)
+                            {
+                                ReviewDeltaOutcome::Clarification(clarification)
+                            } else {
+                                self.rule_on_review(review_epoch, review_id, &result, correction)
                             }
                         }
                     }
@@ -1482,6 +1694,62 @@ impl MainWatchdogRuntime {
         };
         resolve_waiters(waiters, true);
         outcome
+    }
+
+    /// The ordinary ruling on a finished review (`runtime.ts:672-680` @ad11b7ab): accept its
+    /// returned warnings, fail a non-`stop` stop reason, else display what was accepted.
+    fn rule_on_review(
+        &self,
+        review_epoch: u64,
+        review_id: u64,
+        result: &WatchdogReviewResult,
+        correction: bool,
+    ) -> ReviewDeltaOutcome {
+        for warning in &result.warnings {
+            self.accept_warning(review_epoch, review_id, warning);
+        }
+        match result.stop_reason {
+            Some(reason) if reason != ReviewStopReason::Stop => {
+                self.fail(&format!(
+                    "Watchdog review ended with stop reason '{}'.",
+                    reason.as_str()
+                ));
+            }
+            _ => self.display_accepted_review_warning(correction),
+        }
+        ReviewDeltaOutcome::Completed
+    }
+
+    /// SUBA-234 — the question a finished review yielded, if the runtime takes it
+    /// (`runtime.ts:664-671` @ad11b7ab); marks the prompt's one question spent when it does.
+    fn accept_clarification(
+        &self,
+        result: &WatchdogReviewResult,
+        allowed: bool,
+        cancel: &CancelToken,
+    ) -> Option<WatchdogClarification> {
+        let clarification = result.clarification.as_ref()?;
+        let mut inner = self.lock();
+        let clean_stop = matches!(result.stop_reason, None | Some(ReviewStopReason::Stop));
+        if !allowed
+            || !inner.config_result.config.clarification
+            || !clean_stop
+            || inner.active_review_warning.is_some()
+            || !result.warnings.is_empty()
+            || cancel.is_cancelled()
+        {
+            return None;
+        }
+        let question = clarification.question.trim();
+        let evidence = clarification.evidence.trim();
+        if question.is_empty() || evidence.is_empty() {
+            return None;
+        }
+        inner.asked_this_prompt = true;
+        Some(WatchdogClarification {
+            question: bound_watchdog_review_text(question, CLARIFICATION_QUESTION_MAX_CHARS),
+            evidence: bound_watchdog_review_text(evidence, CLARIFICATION_EVIDENCE_MAX_CHARS),
+        })
     }
 
     /// The `emitWarning` closure handed to a review (`runtime.ts:591`).
@@ -1527,6 +1795,9 @@ impl MainWatchdogRuntime {
             let details = normalize_watchdog_warning_details(warning, &patch);
             inner.last_warning = Some(details.clone());
             inner.displayed_warning_sequence += 1;
+            // SUBA-234 — `deliverBoundaryWarning` counts this boundary (`runtime.ts:579`,`:717`
+            // @ad11b7ab); see `boundary_warnings_this_prompt`.
+            inner.boundary_warnings_this_prompt += 1;
             details
         };
         self.route_warning(&details, None);
@@ -1565,6 +1836,12 @@ impl MainWatchdogRuntime {
             };
             inner.last_warning = Some(details.clone());
             inner.displayed_warning_sequence += 1;
+            // SUBA-234 — a boundary (non-correction) warning goes through `deliverBoundaryWarning`
+            // upstream (`runtime.ts:710`,`:717` @ad11b7ab), which counts it; a mid-run correction
+            // does not.
+            if !correction {
+                inner.boundary_warnings_this_prompt += 1;
+            }
             details
         };
         self.route_warning(
@@ -1873,6 +2150,52 @@ impl RuntimeInner {
         self.active_agent_end_id = None;
     }
 
+    /// `this.activeReviewAbortController?.abort()` (`runtime.ts:278`,`:309`,`:584` @ad11b7ab) —
+    /// cancel the in-flight review's token, so the reviewer's nested turn stops. Only the token is
+    /// taken; the review's own `finally` clears the rest.
+    fn abort_active_review(&mut self) {
+        if let Some((_, cancel)) = self.active_review_cancel.take() {
+            cancel.cancel();
+        }
+    }
+
+    /// SUBA-234 — the per-USER-prompt counters (`runtime.ts:334-336` @ad11b7ab):
+    /// `askedThisPrompt`, `activityReviewUsed` and `resetBoundaryRepeats()`.
+    fn start_user_prompt(&mut self) {
+        self.asked_this_prompt = false;
+        self.activity_review_used = false;
+        self.boundary_warnings_this_prompt = 0;
+    }
+
+    /// SUBA-234 — the shared condition of `handleUserInput`'s and `handleModelChange`'s reset
+    /// (`runtime.ts:515`,`:520` @ad11b7ab): the main role (`has_sink`), clarification on, and a
+    /// review in flight.
+    fn clarification_review_in_flight(&self, has_sink: bool) -> bool {
+        has_sink
+            && self.config_result.config.clarification
+            && (self.reviewing || self.waiting_at_agent_end)
+    }
+
+    /// SUBA-234 — append one turn's activity to the tail (`runtime.ts:356-357` @ad11b7ab): the
+    /// entry bounded to [`ACTIVITY_ENTRY_MAX_CHARS`], joined to what is kept by the delta
+    /// separator, the whole clipped to its NEWEST [`ACTIVITY_TAIL_MAX_CHARS`]. Marks it unreviewed.
+    fn append_activity(&mut self, activity: &str) {
+        let entry = bound_watchdog_review_text(activity, ACTIVITY_ENTRY_MAX_CHARS);
+        let joined = if self.activity_tail.is_empty() {
+            entry
+        } else {
+            format!("{}{REVIEW_DELTA_SEPARATOR}{entry}", self.activity_tail)
+        };
+        self.activity_tail = tail_chars(&joined, ACTIVITY_TAIL_MAX_CHARS);
+        self.activity_pending = true;
+    }
+
+    /// SUBA-234 — `clearActivity()` (`runtime.ts:881-885` @ad11b7ab).
+    fn clear_activity(&mut self) {
+        self.activity_tail.clear();
+        self.activity_pending = false;
+    }
+
     /// `isAgentEndCurrent(epoch, agentEndId)` (`runtime.ts:486-488`).
     fn is_agent_end_current(&self, epoch: u64, agent_end_id: u64) -> bool {
         !self.disposed
@@ -1921,6 +2244,8 @@ impl RuntimeInner {
 
     /// `invalidateActiveReview(reason)` (`runtime.ts:528-537`).
     fn invalidate_active_review(&mut self) {
+        // `this.activeReviewAbortController?.abort()` (`runtime.ts:584` @ad11b7ab, SUBA-234).
+        self.abort_active_review();
         self.abort_active_agent_end();
         self.epoch += 1;
         self.status = WatchdogRuntimeStatus::Idle;
@@ -2015,10 +2340,23 @@ impl RuntimeInner {
             }
             _ => String::new(),
         };
-        let context_pieces: Vec<&str> = [scope_block.as_str(), changes.as_str(), lsp_block]
-            .into_iter()
-            .filter(|piece| !piece.is_empty())
-            .collect();
+        // SUBA-234 — the activity block (`runtime.ts:857-858` @ad11b7ab), the fourth context piece:
+        // the "supplied activity evidence" the reviewer's scope line names. Empty unless the main
+        // watchdog runs with clarification on and some orchestration result was delivered.
+        let activity = if self.activity_tail.is_empty() {
+            String::new()
+        } else {
+            format!("{ACTIVITY_BLOCK_HEADER}\n{}", self.activity_tail)
+        };
+        let context_pieces: Vec<&str> = [
+            scope_block.as_str(),
+            changes.as_str(),
+            lsp_block,
+            activity.as_str(),
+        ]
+        .into_iter()
+        .filter(|piece| !piece.is_empty())
+        .collect();
         if context_pieces.is_empty() {
             return if char_len(&input) > MAX_REVIEW_INPUT_CHARS {
                 tail_chars(&input, MAX_REVIEW_INPUT_CHARS)
@@ -2032,10 +2370,17 @@ impl RuntimeInner {
             .iter()
             .map(|piece| {
                 if char_len(piece) > max_piece_length {
-                    format!(
-                        "{}\n- ...",
-                        head_chars(piece, max_piece_length.saturating_sub(6))
-                    )
+                    // `piece === activity ? boundWatchdogReviewText(piece, maxPieceLength) : …`
+                    // (`runtime.ts:864` @ad11b7ab): the activity keeps its NEWEST observations too,
+                    // where the other pieces keep their head.
+                    if *piece == activity.as_str() {
+                        bound_watchdog_review_text(piece, max_piece_length)
+                    } else {
+                        format!(
+                            "{}\n- ...",
+                            head_chars(piece, max_piece_length.saturating_sub(6))
+                        )
+                    }
                 } else {
                     (*piece).to_string()
                 }
@@ -2116,6 +2461,41 @@ fn resolve_waiters(waiters: Vec<tokio::sync::oneshot::Sender<bool>>, settled: bo
     for waiter in waiters {
         let _ = waiter.send(settled);
     }
+}
+
+/// `boundWatchdogReviewText(text, cap)` (`runtime.ts:107-112` @ad11b7ab) — over the cap, keep a
+/// head of at most a quarter of it (and at most [`REVIEW_INPUT_HEAD_CHARS`]), an omission marker,
+/// and the tail that fills the rest; so the result is exactly `cap` characters and both ends of the
+/// text survive. Counted in characters, as the rest of this module counts.
+pub(crate) fn bound_watchdog_review_text(text: &str, cap: usize) -> String {
+    let len = char_len(text);
+    if len <= cap {
+        return text.to_string();
+    }
+    let head = std::cmp::min(REVIEW_INPUT_HEAD_CHARS, cap / 4);
+    let marker = format!("\n\n[... about {} characters omitted ...]\n\n", len - cap);
+    let tail = cap.saturating_sub(head).saturating_sub(char_len(&marker));
+    format!(
+        "{}{marker}{}",
+        head_chars(text, head),
+        tail_chars(text, tail)
+    )
+}
+
+/// SUBA-234 — the message a reviewer's question is delivered as (`runtime.ts:458-461` @ad11b7ab),
+/// upstream's four lines verbatim: the question, its evidence, and the statement that it is not
+/// approval and needs no reply.
+fn clarification_message(clarification: &WatchdogClarification) -> String {
+    [
+        "Main watchdog clarification:".to_string(),
+        clarification.question.clone(),
+        format!("Evidence: {}", clarification.evidence),
+        "Consider this missing context as you continue the task. This is not approval, \
+         permission, or a warning. The reviewer has yielded; no reply or follow-up review is \
+         required."
+            .to_string(),
+    ]
+    .join("\n")
 }
 
 /// `promptFromBeforeAgentStart(event)` (`runtime.ts:101-107`) — `prompt`, else `systemPrompt`.
@@ -2243,6 +2623,7 @@ mod tests {
             Ok(Some(WatchdogReviewResult {
                 warnings: self.warnings.clone(),
                 stop_reason: self.stop_reason,
+                clarification: None,
             }))
         }
     }
@@ -2309,6 +2690,9 @@ mod tests {
             review_changes_only: false,
             lsp_diagnostics: None,
             repo_change_signature: None,
+            // The pre-SUBA-234 tests run without the main role's clarification sink; the
+            // clarification tests install one explicitly.
+            display_clarification: None,
         }
     }
 
@@ -3422,6 +3806,11 @@ mod tests {
             failed_reviews: 0,
             stale_reviews: 0,
             scope: WatchdogScopeArtifact::new(),
+            asked_this_prompt: false,
+            activity_tail: String::new(),
+            activity_pending: false,
+            activity_review_used: false,
+            boundary_warnings_this_prompt: 0,
         }
     }
 
@@ -3583,5 +3972,541 @@ mod tests {
         runtime.handle_agent_end(&cwd()).await;
         let snapshot = runtime.get_snapshot(None);
         assert_eq!(snapshot.lsp.result.status, WatchdogLspStatus::Skipped);
+    }
+
+    // ---- SUBA-234: clarification, the activity tail, the reset on operator input ---------------
+
+    mod clarification {
+        use super::*;
+        use cyrup_ext::InputEventSource;
+
+        /// A review that records each request, signals when it has started, optionally holds until
+        /// released (whether or not it was cancelled meanwhile — a LATE result is exactly what the
+        /// runtime must ignore), and then returns its scripted result.
+        struct ClarifyingReview {
+            requests: Arc<Mutex<Vec<WatchdogReviewRequest>>>,
+            result: WatchdogReviewResult,
+            entered: Arc<tokio::sync::Notify>,
+            release: Option<Arc<tokio::sync::Notify>>,
+        }
+
+        #[async_trait]
+        impl WatchdogReview for ClarifyingReview {
+            async fn review(
+                &self,
+                request: WatchdogReviewRequest,
+            ) -> Result<Option<WatchdogReviewResult>, String> {
+                self.requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(request);
+                self.entered.notify_one();
+                if let Some(release) = &self.release {
+                    release.notified().await;
+                }
+                Ok(Some(self.result.clone()))
+            }
+        }
+
+        fn asked(question: &str, evidence: &str) -> WatchdogReviewResult {
+            WatchdogReviewResult {
+                clarification: Some(WatchdogClarification {
+                    question: question.to_string(),
+                    evidence: evidence.to_string(),
+                }),
+                ..WatchdogReviewResult::default()
+            }
+        }
+
+        fn warned() -> WatchdogReviewResult {
+            WatchdogReviewResult {
+                warnings: vec![blocker("a finding")],
+                ..WatchdogReviewResult::default()
+            }
+        }
+
+        struct Fx {
+            runtime: Arc<MainWatchdogRuntime>,
+            config: Arc<Mutex<ResolvedWatchdogConfig>>,
+            questions: Arc<Mutex<Vec<String>>>,
+            sinks: Sinks,
+            requests: Arc<Mutex<Vec<WatchdogReviewRequest>>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        impl Fx {
+            fn requests(&self) -> Vec<WatchdogReviewRequest> {
+                self.requests.lock().unwrap().clone()
+            }
+            fn questions(&self) -> Vec<String> {
+                self.questions.lock().unwrap().clone()
+            }
+            fn set_clarification(&self, on: bool) {
+                self.config.lock().unwrap().clarification = on;
+                self.runtime.refresh_config(&cwd());
+            }
+        }
+
+        /// The main role (`main: true` installs the clarification sink, as `register_main` does)
+        /// or a child (`false`), over a review that answers `result`, holding when `hold`.
+        fn fixture(
+            clarification: bool,
+            main: bool,
+            result: WatchdogReviewResult,
+            hold: bool,
+        ) -> Fx {
+            let sinks = Sinks::default();
+            let mut config = enabled_config();
+            config.clarification = clarification;
+            let config = Arc::new(Mutex::new(config));
+            let resolver_config = Arc::clone(&config);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let questions = Arc::new(Mutex::new(Vec::new()));
+            let mut options = options_with(enabled_config(), &sinks);
+            options.resolve_config = Some(Arc::new(move |_cwd: &Path, _s: Option<&Value>| {
+                WatchdogSettingsResult {
+                    ok: true,
+                    config: resolver_config.lock().unwrap().clone(),
+                    errors: Vec::new(),
+                    sources: Vec::new(),
+                }
+            }));
+            options.review = Some(Arc::new(ClarifyingReview {
+                requests: Arc::clone(&requests),
+                result,
+                entered: Arc::clone(&entered),
+                release: hold.then(|| Arc::clone(&release)),
+            }));
+            options.review_changes_only = true;
+            options.repo_change_signature = Some(Arc::new(NoSignatures));
+            if main {
+                let sink = Arc::clone(&questions);
+                options.display_clarification = Some(Arc::new(move |content: &str| {
+                    sink.lock().unwrap().push(content.to_string());
+                }));
+            }
+            let runtime = Arc::new(MainWatchdogRuntime::new(options));
+            runtime.handle_before_agent_start(&json!({ "prompt": "Original task" }), &cwd());
+            Fx {
+                runtime,
+                config,
+                questions,
+                sinks,
+                requests,
+                entered,
+                release,
+            }
+        }
+
+        /// One orchestration turn: an assistant tool call and its result, paired by `id`.
+        fn activity_turn(name: &str, args: Value, text: &str, id: &str) -> Value {
+            json!({
+                "type": "turn_end",
+                "message": { "role": "assistant", "content": [
+                    { "type": "toolCall", "id": id, "name": name, "arguments": args }
+                ]},
+                "toolResults": [{
+                    "role": "toolResult", "toolCallId": id, "toolName": name,
+                    "content": [{ "type": "text", "text": text }], "isError": false
+                }],
+            })
+        }
+
+        fn status_turn(text: &str) -> Value {
+            activity_turn(
+                "subagent",
+                json!({ "action": "status", "id": "task" }),
+                text,
+                "call-1",
+            )
+        }
+
+        /// Start a boundary whose review holds, and return once the review is RUNNING — so every
+        /// assertion that follows is about a review that really started.
+        async fn hold_a_review(fx: &Fx) -> tokio::task::JoinHandle<()> {
+            fx.runtime
+                .handle_turn_end(&status_turn("Gate state unclear"), &cwd());
+            let runtime = Arc::clone(&fx.runtime);
+            let boundary = tokio::spawn(async move { runtime.handle_agent_end(&cwd()).await });
+            tokio::time::timeout(Duration::from_secs(10), fx.entered.notified())
+                .await
+                .expect("the review started");
+            boundary
+        }
+
+        /// [`hold_a_review`] for a boundary an EDIT admits (the observed edit/write trigger), so it
+        /// reviews whatever the clarification setting says.
+        async fn hold_an_edit_review(fx: &Fx) -> tokio::task::JoinHandle<()> {
+            fx.runtime.enqueue_delta("work");
+            fx.runtime.handle_turn_end(
+                &json!({ "type": "tool_result", "toolName": "edit", "isError": false }),
+                &cwd(),
+            );
+            let runtime = Arc::clone(&fx.runtime);
+            let boundary = tokio::spawn(async move { runtime.handle_agent_end(&cwd()).await });
+            tokio::time::timeout(Duration::from_secs(10), fx.entered.notified())
+                .await
+                .expect("the review started");
+            boundary
+        }
+
+        /// Clause 1 — upstream `watchdog-runtime.test.ts:278` @ad11b7ab ("aborts an active review
+        /// on new user input and suppresses stale questions and warnings"), the input edge. The
+        /// message is IDLE (no streaming behavior): a boundary review runs after the run ended.
+        ///
+        /// RED at HEAD (`cde73dc9`): does not compile — no `clarification` setting, no
+        /// `display_clarification` sink and no `WatchdogReviewResult::clarification`. With the
+        /// reset removed from `handle_user_input` it compiles and fails: the review's token is
+        /// never cancelled and the late question is displayed.
+        #[tokio::test]
+        async fn with_clarification_on_an_idle_operator_message_aborts_the_review_in_flight() {
+            let fx = fixture(true, true, asked("Old question?", "Old context"), true);
+            let boundary = hold_a_review(&fx).await;
+            let epoch = fx.runtime.get_snapshot(None).epoch;
+
+            fx.runtime
+                .handle_user_input("New input", InputEventSource::Interactive, None);
+
+            let requests = fx.requests();
+            assert_eq!(requests.len(), 1, "the review itself ran");
+            assert!(
+                requests[0].cancel.is_cancelled(),
+                "the in-flight review is aborted, not orphaned"
+            );
+            assert!(fx.runtime.get_snapshot(None).epoch > epoch);
+            assert!(
+                !requests[0].emit_warning.emit(&blocker("late")),
+                "a late warning callback is stale"
+            );
+            // The reviewer answers anyway, late.
+            fx.release.notify_one();
+            boundary.await.unwrap();
+            assert!(
+                fx.questions().is_empty(),
+                "a stale question is not displayed"
+            );
+            assert!(fx.sinks.displayed.lock().unwrap().is_empty());
+            assert_eq!(fx.runtime.get_snapshot(None).active_review_id, None);
+            assert!(
+                !fx.runtime
+                    .scope_prompts()
+                    .contains(&"New input".to_string()),
+                "idle input is recorded by before_agent_start, not here"
+            );
+        }
+
+        /// Clause 1, the other two edges of the same upstream test: clarification turned off, and
+        /// the session model changing (`handleModelChange`, `runtime.ts:519-521`).
+        ///
+        /// RED at HEAD: does not compile (no `handle_model_change`, no setting).
+        #[tokio::test]
+        async fn turning_clarification_off_or_changing_the_model_mid_review_aborts_it() {
+            for edge in ["clarification off", "model change"] {
+                let fx = fixture(true, true, asked("Old question?", "Old context"), true);
+                let boundary = hold_a_review(&fx).await;
+                match edge {
+                    "clarification off" => fx.set_clarification(false),
+                    _ => fx.runtime.handle_model_change(),
+                }
+                assert!(fx.requests()[0].cancel.is_cancelled(), "{edge}");
+                fx.release.notify_one();
+                boundary.await.unwrap();
+                assert!(fx.questions().is_empty(), "{edge}");
+            }
+        }
+
+        /// Clause 2 — NON-REGRESSION GUARD, not evidence the feature works: green at HEAD in
+        /// substance (there, nothing could reset a review). Upstream `watchdog-runtime.test.ts:253`
+        /// @ad11b7ab: with clarification OFF the lifecycle handlers are inert — an operator
+        /// message or a model change during a review leaves it running, its warning is delivered,
+        /// and no question is offered or shown. Asserts the review ran, so "nothing happened"
+        /// cannot pass vacuously.
+        #[tokio::test]
+        async fn guard_with_clarification_off_nothing_changes() {
+            let fx = fixture(false, true, warned(), true);
+            let boundary = hold_an_edit_review(&fx).await;
+            let epoch = fx.runtime.get_snapshot(None).epoch;
+            fx.runtime
+                .handle_user_input("New input", InputEventSource::Interactive, None);
+            fx.runtime.handle_model_change();
+            assert_eq!(
+                fx.runtime.get_snapshot(None).epoch,
+                epoch,
+                "the handlers are inert"
+            );
+            let requests = fx.requests();
+            assert_eq!(requests.len(), 1, "the review ran");
+            assert!(!requests[0].cancel.is_cancelled());
+            assert!(!requests[0].allow_clarification, "no question is offered");
+            fx.release.notify_one();
+            boundary.await.unwrap();
+            assert_eq!(
+                fx.sinks.displayed.lock().unwrap().len(),
+                1,
+                "the warning lands"
+            );
+            assert!(fx.questions().is_empty());
+            assert!(
+                fx.runtime.activity_tail().is_empty(),
+                "no activity is collected while off"
+            );
+        }
+
+        /// Clause 3 — a reviewer that yields a question gets it displayed, and the lifecycle ENDS:
+        /// the runtime is idle and settled, the evidence counts as reviewed, and the same prompt
+        /// gets no second question; a new prompt gets one again.
+        ///
+        /// RED at HEAD: does not compile (no clarification outcome or sink).
+        #[tokio::test]
+        async fn a_yielded_question_is_displayed_and_the_review_does_not_stay_open() {
+            let fx = fixture(
+                true,
+                true,
+                asked("Is the gate held?", "Delivered status is unclear"),
+                false,
+            );
+            fx.runtime
+                .handle_turn_end(&status_turn("Gate state unclear"), &cwd());
+            fx.runtime.handle_agent_end(&cwd()).await;
+
+            let requests = fx.requests();
+            assert_eq!(requests.len(), 1, "the review ran");
+            assert!(requests[0].allow_clarification, "a boundary review may ask");
+            let questions = fx.questions();
+            assert_eq!(questions.len(), 1);
+            for text in [
+                "Main watchdog clarification:",
+                "Is the gate held?",
+                "Evidence: Delivered status is unclear",
+                "This is not approval, permission, or a warning.",
+            ] {
+                assert!(questions[0].contains(text), "{text} in {}", questions[0]);
+            }
+            let snapshot = fx.runtime.get_snapshot(None);
+            assert_eq!(snapshot.status, WatchdogRuntimeStatus::Idle);
+            assert_eq!(snapshot.active_review_id, None);
+            assert!(
+                fx.runtime.wait_for_idle(Duration::from_millis(50)).await,
+                "nothing is left waiting on an answer"
+            );
+            assert!(
+                fx.sinks.displayed.lock().unwrap().is_empty(),
+                "a question is not a warning"
+            );
+
+            // Same prompt, new activity: the activity review is spent, so no second review.
+            fx.runtime
+                .handle_turn_end(&status_turn("Still unclear"), &cwd());
+            fx.runtime.handle_agent_end(&cwd()).await;
+            assert_eq!(fx.requests().len(), 1, "one activity review per prompt");
+
+            // A new prompt gets its own question and its own activity review.
+            fx.runtime
+                .handle_before_agent_start(&json!({ "prompt": "Next task" }), &cwd());
+            fx.runtime.handle_agent_end(&cwd()).await;
+            let requests = fx.requests();
+            assert_eq!(
+                requests.len(),
+                2,
+                "unreviewed activity survives into the next prompt"
+            );
+            assert!(requests[1].allow_clarification);
+            assert_eq!(fx.questions().len(), 2);
+        }
+
+        /// Clause 3, the prompt budget: once this prompt has asked, the next boundary review is
+        /// NOT offered `watchdog_ask`, and a question it returns anyway is not displayed.
+        #[tokio::test]
+        async fn one_question_per_prompt() {
+            let fx = fixture(true, true, asked("Q?", "E"), false);
+            fx.runtime.handle_turn_end(&status_turn("one"), &cwd());
+            fx.runtime.handle_agent_end(&cwd()).await;
+            // An edit-free second boundary is admitted by the observed-edit trigger.
+            fx.runtime.handle_turn_end(
+                &json!({ "type": "tool_result", "toolName": "edit", "isError": false }),
+                &cwd(),
+            );
+            fx.runtime.enqueue_delta("new work, same prompt");
+            fx.runtime.handle_agent_end(&cwd()).await;
+            let requests = fx.requests();
+            assert_eq!(requests.len(), 2, "the second boundary reviewed");
+            assert!(!requests[1].allow_clarification);
+            assert_eq!(fx.questions().len(), 1);
+        }
+
+        /// Clause 4 — the activity tail is PAIRED: an orchestration call counts only with the
+        /// result of the same name and the exact id; an unmatched one, and a non-orchestration tool,
+        /// contribute nothing. With no edit at all, the new activity admits a review, and the review
+        /// input carries the block under upstream's heading — the "supplied activity evidence" the
+        /// reviewer's own prompt line names.
+        ///
+        /// RED at HEAD: does not compile (no activity tail); before it, a review with no edit
+        /// never ran at all under `review_changes_only`.
+        #[tokio::test]
+        async fn the_activity_tail_is_paired_and_reaches_the_review() {
+            let fx = fixture(true, true, WatchdogReviewResult::default(), false);
+            let mut unmatched = status_turn("unmatched result");
+            unmatched["toolResults"][0]["toolCallId"] = json!("other");
+            fx.runtime.handle_turn_end(&unmatched, &cwd());
+            fx.runtime.handle_turn_end(
+                &activity_turn(
+                    "bash",
+                    json!({ "command": "echo subagent" }),
+                    "not orchestration",
+                    "b",
+                ),
+                &cwd(),
+            );
+            fx.runtime.handle_agent_end(&cwd()).await;
+            assert!(
+                fx.requests().is_empty(),
+                "unpaired and foreign calls are not evidence"
+            );
+            assert!(fx.runtime.activity_tail().is_empty());
+
+            fx.runtime.handle_turn_end(
+                &activity_turn(
+                    "bg_wait",
+                    json!({ "id": "ci" }),
+                    "CI gate completed successfully",
+                    "w",
+                ),
+                &cwd(),
+            );
+            fx.runtime.handle_agent_end(&cwd()).await;
+            let requests = fx.requests();
+            assert_eq!(requests.len(), 1, "new activity admits a no-edit review");
+            let delta = &requests[0].delta;
+            assert!(delta.contains(ACTIVITY_BLOCK_HEADER), "{delta}");
+            assert!(delta.contains("Tool call: bg_wait"));
+            assert!(delta.contains("CI gate completed successfully"));
+            assert!(!delta.contains("unmatched result"));
+            assert!(!delta.contains("not orchestration"));
+        }
+
+        /// Clause 4 — the CLIP: each entry is bounded to 3,000 characters (head, omission marker,
+        /// tail) and the joined tail keeps its NEWEST 6,000.
+        ///
+        /// RED at HEAD: does not compile.
+        #[tokio::test]
+        async fn the_activity_tail_is_clipped_to_its_newest_six_thousand_characters() {
+            let fx = fixture(true, true, WatchdogReviewResult::default(), false);
+            fx.runtime.handle_turn_end(
+                &activity_turn("bg_wait", json!({}), &"x".repeat(10_000), "big"),
+                &cwd(),
+            );
+            let one = fx.runtime.activity_tail();
+            assert_eq!(
+                one.chars().count(),
+                ACTIVITY_ENTRY_MAX_CHARS,
+                "one entry is bounded"
+            );
+            assert!(one.contains("characters omitted"));
+            for n in 0..5 {
+                fx.runtime.handle_turn_end(
+                    &activity_turn(
+                        "bg_wait",
+                        json!({}),
+                        &format!("marker-{n} {}", "y".repeat(2_400)),
+                        &format!("c{n}"),
+                    ),
+                    &cwd(),
+                );
+            }
+            let tail = fx.runtime.activity_tail();
+            assert_eq!(tail.chars().count(), ACTIVITY_TAIL_MAX_CHARS);
+            assert!(tail.contains("marker-4"), "the newest observation survives");
+            assert!(!tail.contains("marker-0"), "the oldest is clipped away");
+        }
+
+        /// Clause 4 — the CLEAR: turning clarification off drops the tail and stops collection,
+        /// and so do a compaction's `clear_activity` and disabling the watchdog.
+        ///
+        /// RED at HEAD: does not compile.
+        #[tokio::test]
+        async fn the_activity_tail_is_cleared_when_clarification_goes_off() {
+            let fx = fixture(true, true, WatchdogReviewResult::default(), false);
+            fx.runtime
+                .handle_turn_end(&status_turn("kept while on"), &cwd());
+            assert!(fx.runtime.activity_tail().contains("kept while on"));
+            fx.set_clarification(false);
+            assert!(fx.runtime.activity_tail().is_empty(), "cleared on refresh");
+            fx.runtime
+                .handle_turn_end(&status_turn("arrives while off"), &cwd());
+            assert!(
+                fx.runtime.activity_tail().is_empty(),
+                "not collected while off"
+            );
+
+            fx.set_clarification(true);
+            fx.runtime
+                .handle_turn_end(&status_turn("before compaction"), &cwd());
+            fx.runtime.reset(WatchdogResetOptions {
+                clear_activity: true,
+                ..WatchdogResetOptions::default()
+            });
+            assert!(
+                fx.runtime.activity_tail().is_empty(),
+                "a compaction clears it"
+            );
+
+            fx.runtime
+                .handle_turn_end(&status_turn("before disable"), &cwd());
+            fx.config.lock().unwrap().main.enabled = false;
+            fx.runtime.refresh_config(&cwd());
+            assert!(fx.runtime.activity_tail().is_empty(), "disabling clears it");
+        }
+
+        /// The main-role gate: a runtime built WITHOUT the clarification sink — every child
+        /// watchdog — collects no activity, is never offered a question, and is not reset by
+        /// operator input, even with the setting on (upstream `watchdog-runtime.test.ts:253`'s
+        /// `[true, false]` case).
+        #[tokio::test]
+        async fn a_runtime_without_the_main_sink_never_runs_the_lifecycle() {
+            let fx = fixture(true, false, warned(), true);
+            let boundary = hold_an_edit_review(&fx).await;
+            let epoch = fx.runtime.get_snapshot(None).epoch;
+            fx.runtime
+                .handle_user_input("New input", InputEventSource::Interactive, None);
+            assert_eq!(fx.runtime.get_snapshot(None).epoch, epoch);
+            let requests = fx.requests();
+            assert_eq!(requests.len(), 1, "the review ran");
+            assert!(!requests[0].allow_clarification);
+            fx.release.notify_one();
+            boundary.await.unwrap();
+            fx.runtime
+                .handle_turn_end(&status_turn("child activity"), &cwd());
+            assert!(fx.runtime.activity_tail().is_empty());
+            assert_eq!(fx.sinks.displayed.lock().unwrap().len(), 1);
+        }
+
+        /// An extension's input is never the operator (`runtime.ts:514`), clarification or not.
+        #[tokio::test]
+        async fn extension_input_does_not_reset_a_review() {
+            let fx = fixture(true, true, warned(), true);
+            let boundary = hold_a_review(&fx).await;
+            fx.runtime
+                .handle_user_input("from an extension", InputEventSource::Extension, None);
+            assert!(!fx.requests()[0].cancel.is_cancelled());
+            fx.release.notify_one();
+            boundary.await.unwrap();
+            assert_eq!(fx.sinks.displayed.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn bound_keeps_both_ends_at_exactly_the_cap() {
+            let text: String = (0..5_000)
+                .map(|i| char::from(b'a' + (i % 26) as u8))
+                .collect();
+            let bounded = bound_watchdog_review_text(&text, 1_000);
+            assert_eq!(bounded.chars().count(), 1_000);
+            assert!(bounded.starts_with(&text[..250]));
+            assert!(bounded.ends_with(&text[text.len() - 100..]));
+            assert!(bounded.contains("[... about 4000 characters omitted ...]"));
+            assert_eq!(bound_watchdog_review_text("short", 1_000), "short");
+        }
     }
 }

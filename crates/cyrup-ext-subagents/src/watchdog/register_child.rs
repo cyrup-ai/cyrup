@@ -320,6 +320,10 @@ pub fn register_child_watchdog(
         review_changes_only: true,
         lsp_diagnostics: None,
         repo_change_signature: None,
+        // SUBA-234 — no `displayClarification`: *"Supplying this main-session delivery capability
+        // gates clarification (children omit it)"* (`runtime.ts:90` @ad11b7ab). A child watchdog
+        // never collects activity, never offers `watchdog_ask` and never resets on input.
+        display_clarification: None,
     }));
     Some(Arc::new(ChildWatchdog {
         runtime,

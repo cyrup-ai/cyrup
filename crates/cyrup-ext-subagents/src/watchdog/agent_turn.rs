@@ -44,8 +44,10 @@ use super::model_selection::WatchdogModelInfo;
 use super::permission_arbiter::WatchdogPermissionDecisionTool;
 use super::register_main::{WatchdogServicesFn, watchdog_config_dirs};
 use super::review::{
-    WATCHDOG_WARN_TOOL_LABEL, WATCHDOG_WARN_TOOL_NAME, WatchdogReviewModelSelection,
-    WatchdogWarnTool, watchdog_warn_parameters_schema, watchdog_warn_tool_description,
+    WATCHDOG_ASK_TOOL_DESCRIPTION, WATCHDOG_ASK_TOOL_LABEL, WATCHDOG_ASK_TOOL_NAME,
+    WATCHDOG_WARN_TOOL_LABEL, WATCHDOG_WARN_TOOL_NAME, WatchdogClarificationLatch,
+    WatchdogReviewModelSelection, WatchdogWarnTool, watchdog_ask_parameters_schema,
+    watchdog_warn_parameters_schema, watchdog_warn_tool_description,
 };
 use super::runtime::WatchdogWarningEmitter;
 
@@ -245,6 +247,63 @@ impl Tool for WatchdogWarnAgentTool {
         Ok(ToolResult {
             content: vec![Content::text(result.text)],
             details: Some(serde_json::json!({ "accepted": result.accepted })),
+            ..ToolResult::default()
+        })
+    }
+}
+
+/// SUBA-234 — the `watchdog_ask` tool (`review.ts:308-322` @ad11b7ab) as a runtime [`Tool`]. The
+/// state, the gates and the yield all live on [`WatchdogClarificationLatch`]; this is the adapter.
+pub struct WatchdogAskAgentTool {
+    latch: WatchdogClarificationLatch,
+    parameters: Value,
+}
+
+impl WatchdogAskAgentTool {
+    /// Bind the tool to one review's latch.
+    #[must_use]
+    pub fn new(latch: WatchdogClarificationLatch) -> Self {
+        Self {
+            latch,
+            parameters: watchdog_ask_parameters_schema(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for WatchdogAskAgentTool {
+    fn name(&self) -> &str {
+        WATCHDOG_ASK_TOOL_NAME
+    }
+
+    fn parameters(&self) -> &Value {
+        &self.parameters
+    }
+
+    /// `executionMode: "sequential"` (`review.ts:313` @ad11b7ab).
+    fn execution_mode(&self) -> ExecMode {
+        ExecMode::Sequential
+    }
+
+    fn description(&self) -> &str {
+        WATCHDOG_ASK_TOOL_DESCRIPTION
+    }
+
+    fn label(&self) -> Option<&str> {
+        Some(WATCHDOG_ASK_TOOL_LABEL)
+    }
+
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        params: Value,
+        _cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        let text = self.latch.ask(&params).map_err(ToolError::new)?;
+        Ok(ToolResult {
+            content: vec![Content::text(text)],
+            details: Some(serde_json::json!({})),
             ..ToolResult::default()
         })
     }

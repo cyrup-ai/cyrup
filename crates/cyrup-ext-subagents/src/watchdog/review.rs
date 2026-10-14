@@ -52,8 +52,8 @@ use super::model_selection::{
     THINKING_LEVELS, WatchdogModelContext, WatchdogModelInfo, resolve_model_candidate,
 };
 use super::runtime::{
-    ReviewStopReason, WatchdogReview, WatchdogReviewRequest, WatchdogReviewResult,
-    WatchdogWarningEmitter,
+    ReviewStopReason, WatchdogClarification, WatchdogReview, WatchdogReviewRequest,
+    WatchdogReviewResult, WatchdogWarningEmitter,
 };
 use super::types::{
     ResolvedWatchdogConfig, ThinkingSetting, WatchdogCategory, WatchdogImportance,
@@ -94,6 +94,168 @@ pub const WATCHDOG_WARN_TOOL_LABEL: &str = "Watchdog warning";
 /// cannot shadow [`WatchdogWarnTool`] — the only `watchdog_warn` on the agent is the one built at
 /// `:273`, whose `execute` reaches the runtime's emitter.
 pub const WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES: [&str; 4] = ["read", "grep", "find", "ls"];
+
+/// SUBA-234 — the reviewer's question tool (`name: "watchdog_ask"`, `review.ts:309` @ad11b7ab).
+/// Given to a review only when its request allows a question
+/// ([`WatchdogReviewRequest::allow_clarification`]), and permitted at execution time only then.
+pub const WATCHDOG_ASK_TOOL_NAME: &str = "watchdog_ask";
+/// Its `label` (`review.ts:310` @ad11b7ab).
+pub const WATCHDOG_ASK_TOOL_LABEL: &str = "Watchdog clarification";
+/// Its `description` (`review.ts:311` @ad11b7ab), verbatim — prompt text the model reads.
+pub const WATCHDOG_ASK_TOOL_DESCRIPTION: &str = "Send one focused question when missing task \
+     status, intent or other orchestrator context prevents a concrete review judgment. Yields and \
+     ends this review so the orchestrator can handle the message and continue; no answer or \
+     follow-up review is required. Never ask for approval or permission, or after recording a \
+     warning. Question and evidence are capped at 1000 and 2000 characters.";
+/// What a yielding call returns to the model (`review.ts:320` @ad11b7ab).
+pub const WATCHDOG_ASK_RESULT_TEXT: &str = "Review yielded for clarification.";
+
+/// `WatchdogAskParams` (`review.ts:28` @ad11b7ab): `{ question: string, evidence: string }`, no
+/// other keys.
+#[must_use]
+pub fn watchdog_ask_parameters_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "question": { "type": "string" },
+            "evidence": { "type": "string" },
+        },
+        "required": ["question", "evidence"],
+        "additionalProperties": false,
+    })
+}
+
+#[derive(Debug, Default)]
+struct ClarificationLatchState {
+    /// `let clarification` (`review.ts:294` @ad11b7ab).
+    clarification: Option<WatchdogClarification>,
+    /// `let warned` (`review.ts:295` @ad11b7ab) — a warning was ACCEPTED in this review.
+    warned: bool,
+}
+
+/// SUBA-234 — one review's clarification state, shared by the three places that read or write it
+/// upstream as closure captures (`review.ts:294-338` @ad11b7ab): the `watchdog_ask` tool (records
+/// the question and yields), the wrapped `emitWarning` (refuses a warning after the yield, and
+/// records that one was accepted, which closes the question), and `beforeToolCall` (refuses every
+/// tool after the yield). The turn's own token is cancelled on the yield — upstream's
+/// `agent.abort()` (`:319`) — so a batch the model sent alongside the question stops there.
+#[derive(Debug, Clone)]
+pub struct WatchdogClarificationLatch {
+    state: Arc<std::sync::Mutex<ClarificationLatchState>>,
+    /// The nested turn's token, cancelled on the yield.
+    turn_cancel: CancelToken,
+    /// The REVIEW's token — the runtime's abort — which refuses a question too (`:316`).
+    review_cancel: CancelToken,
+}
+
+impl WatchdogClarificationLatch {
+    /// A latch over one review: `review_cancel` is the request's token, `turn_cancel` the token
+    /// the nested turn runs under (a child of it).
+    #[must_use]
+    pub fn new(review_cancel: CancelToken, turn_cancel: CancelToken) -> Self {
+        Self {
+            state: Arc::default(),
+            turn_cancel,
+            review_cancel,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ClarificationLatchState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the reviewer has yielded with a question.
+    #[must_use]
+    pub fn yielded(&self) -> bool {
+        self.lock().clarification.is_some()
+    }
+
+    /// The question, once yielded.
+    #[must_use]
+    pub fn clarification(&self) -> Option<WatchdogClarification> {
+        self.lock().clarification.clone()
+    }
+
+    /// `warnRequest.emitWarning` (`review.ts:297-302` @ad11b7ab): after the yield every warning is
+    /// refused; otherwise the runtime decides, and an accepted one closes the question.
+    #[must_use]
+    pub fn wrap_emitter(&self, inner: WatchdogWarningEmitter) -> WatchdogWarningEmitter {
+        let latch = self.clone();
+        WatchdogWarningEmitter::from_fn(Arc::new(move |warning| {
+            if latch.yielded() {
+                return false;
+            }
+            let accepted = inner.emit(warning);
+            if accepted {
+                latch.lock().warned = true;
+            }
+            accepted
+        }))
+    }
+
+    /// `beforeToolCall` (`review.ts:338` @ad11b7ab): nothing after the yield; before it, the read-only
+    /// permit list plus `watchdog_ask`.
+    #[must_use]
+    pub fn block_reason(&self, tool_name: &str) -> Option<String> {
+        if !self.yielded()
+            && (WATCHDOG_ALLOWED_TOOL_NAMES.contains(&tool_name)
+                || tool_name == WATCHDOG_ASK_TOOL_NAME)
+        {
+            return None;
+        }
+        Some(format!(
+            "Watchdog reviews are read-only; tool '{tool_name}' is not allowed."
+        ))
+    }
+
+    /// `watchdog_ask`'s `execute` (`review.ts:314-321` @ad11b7ab): refuse after a warning, a
+    /// previous yield or a cancellation; require both halves; record them bounded; and yield.
+    ///
+    /// # Errors
+    ///
+    /// Upstream's two thrown messages, which the harness reports to the model as the tool's error.
+    pub fn ask(&self, params: &Value) -> Result<&'static str, String> {
+        let text = |key: &str| {
+            params
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        };
+        {
+            let mut state = self.lock();
+            if state.warned
+                || state.clarification.is_some()
+                || self.review_cancel.is_cancelled()
+                || self.turn_cancel.is_cancelled()
+            {
+                return Err(
+                    "Clarification unavailable after warning, yield, or cancellation.".to_string(),
+                );
+            }
+            let (question, evidence) = (text("question"), text("evidence"));
+            if question.is_empty() || evidence.is_empty() {
+                return Err("A focused question and concrete evidence are required.".to_string());
+            }
+            state.clarification = Some(WatchdogClarification {
+                question: super::runtime::bound_watchdog_review_text(
+                    &question,
+                    super::runtime::CLARIFICATION_QUESTION_MAX_CHARS,
+                ),
+                evidence: super::runtime::bound_watchdog_review_text(
+                    &evidence,
+                    super::runtime::CLARIFICATION_EVIDENCE_MAX_CHARS,
+                ),
+            });
+        }
+        // `agent.abort(); // Intentional yield also stops mixed tool batches` (`review.ts:319`).
+        self.turn_cancel.cancel();
+        Ok(WATCHDOG_ASK_RESULT_TEXT)
+    }
+}
 
 /// `WatchdogReviewAuth` (`review.ts:41-45`) — the credential overlay a review's stream calls carry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -546,8 +708,17 @@ impl std::fmt::Debug for WatchdogWarnTool<'_> {
 /// `buildWatchdogSystemPrompt` (`review.ts:207-220`) — the reviewer's whole instruction set, lines
 /// in upstream's order, with the scope line included only when the delta carries a scope block, and
 /// `watchdog_diff` named only when the reviewer has it (`hasDiff`, `review.ts:231` @ad11b7ab).
+///
+/// SUBA-234 — `guidance` is [`super::guidance::load_watchdog_guidance`]'s text, appended after the
+/// rules as `Standing instructions from WATCHDOG.md (project first, then user):` when non-empty
+/// (`review.ts:226`,`:237` @ad11b7ab); blank guidance adds no block.
 #[must_use]
-pub fn build_watchdog_system_prompt(cwd: &str, has_scope: bool, has_diff: bool) -> String {
+pub fn build_watchdog_system_prompt(
+    cwd: &str,
+    has_scope: bool,
+    has_diff: bool,
+    guidance: &str,
+) -> String {
     let mut lines = vec![
         "You are the main-session subagent watchdog for Pi.".to_string(),
         format!("Working directory: {cwd}"),
@@ -589,6 +760,12 @@ pub fn build_watchdog_system_prompt(cwd: &str, has_scope: bool, has_diff: bool) 
          otherwise use severity='concern'."
             .to_string(),
     ]);
+    let guidance = guidance.trim();
+    if !guidance.is_empty() {
+        lines.push(format!(
+            "\nStanding instructions from WATCHDOG.md (project first, then user):\n{guidance}"
+        ));
+    }
     lines.join("\n")
 }
 
@@ -708,6 +885,11 @@ pub struct WatchdogReviewTurn<'a> {
     pub emit_warning: &'a WatchdogWarningEmitter,
     /// Cancellation.
     pub cancel: CancelToken,
+    /// SUBA-234 — the review's clarification latch when this review may ask
+    /// ([`WatchdogReviewRequest::allow_clarification`]); `None` gives the agent no `watchdog_ask`
+    /// and leaves the tool policy the read-only one. When present, [`Self::emit_warning`] is
+    /// already wrapped by it and [`Self::cancel`] is the token it cancels on the yield.
+    pub clarification: Option<WatchdogClarificationLatch>,
 }
 
 impl WatchdogReviewTurn<'_> {
@@ -721,7 +903,10 @@ impl WatchdogReviewTurn<'_> {
     /// a tool of its own.
     #[must_use]
     pub fn block_reason(&self, tool_name: &str) -> Option<String> {
-        watchdog_tool_call_block_reason(tool_name)
+        match &self.clarification {
+            Some(latch) => latch.block_reason(tool_name),
+            None => watchdog_tool_call_block_reason(tool_name),
+        }
     }
 }
 
@@ -862,6 +1047,7 @@ impl WatchdogReview for MainWatchdogReview {
             return Ok(Some(WatchdogReviewResult {
                 warnings: Vec::new(),
                 stop_reason: Some(ReviewStopReason::Aborted),
+                clarification: None,
             }));
         }
         let ctx = WatchdogModelContext {
@@ -880,17 +1066,38 @@ impl WatchdogReview for MainWatchdogReview {
             return Ok(Some(WatchdogReviewResult {
                 warnings: Vec::new(),
                 stop_reason: Some(ReviewStopReason::Aborted),
+                clarification: None,
             }));
         }
         // `const diffBaseline = await options.diffBaseline?.()` (`review.ts:293` @ad11b7ab) — after
         // the model is resolved, as upstream orders it.
         let diff_baseline = request.diff_baseline.get().await;
+        // `guidance: loadWatchdogGuidance(ctx.cwd, request.config.guidance.watchdogMd)`
+        // (`review.ts:325` @ad11b7ab) — read fresh for every review, so an edited `WATCHDOG.md`
+        // reaches the next one without a restart.
+        let guidance =
+            super::guidance::load_watchdog_guidance(&self.cwd, request.config.guidance.watchdog_md);
         let system_prompt = build_watchdog_system_prompt(
             &self.cwd.to_string_lossy(),
             request.has_scope,
             diff_baseline.is_some(),
+            &guidance,
         );
         let prompt = build_review_prompt(&request, &selection);
+        // SUBA-234 — `request.allowClarification ? … : request` (`review.ts:294-322` @ad11b7ab):
+        // a review that may ask runs its turn under a CHILD token the question cancels, with the
+        // warn tool's emitter wrapped by the same latch. A review that may not is built exactly as
+        // before — no `watchdog_ask`, the unwrapped emitter, the request's own token.
+        let latch = request.allow_clarification.then(|| {
+            WatchdogClarificationLatch::new(request.cancel.clone(), request.cancel.child_token())
+        });
+        let emit_warning = match &latch {
+            Some(latch) => latch.wrap_emitter(request.emit_warning.clone()),
+            None => request.emit_warning.clone(),
+        };
+        let turn_cancel = latch
+            .as_ref()
+            .map_or_else(|| request.cancel.clone(), |latch| latch.turn_cancel.clone());
         let messages = self
             .agent
             .run(WatchdogReviewTurn {
@@ -899,19 +1106,43 @@ impl WatchdogReview for MainWatchdogReview {
                 prompt,
                 allowed_tools: &WATCHDOG_ALLOWED_TOOL_NAMES,
                 read_only_tools: &WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES,
-                // `createWatchdogWarnTool(request)` (`:273`) — built eagerly, exactly where
-                // upstream builds it, so `name`/`label`/`description`/`parameters` reach a bound
-                // agent instead of being re-derived by it.
-                warn_tool: WatchdogWarnTool::new(&request.emit_warning),
+                // `createWatchdogWarnTool(warnRequest)` (`:306` @ad11b7ab) — built eagerly,
+                // exactly where upstream builds it, so `name`/`label`/`description`/`parameters`
+                // reach a bound agent instead of being re-derived by it.
+                warn_tool: WatchdogWarnTool::new(&emit_warning),
                 diff_baseline,
                 tool_execution_sequential: true,
-                emit_warning: &request.emit_warning,
-                cancel: request.cancel.clone(),
+                emit_warning: &emit_warning,
+                cancel: turn_cancel,
+                clarification: latch.clone(),
             })
             .await?;
+        // `if (ctx.signal?.aborted || request.signal?.aborted) return { stopReason: "aborted" }`
+        // (`review.ts:354` @ad11b7ab) — the REVIEW's token, not the turn's: the yield cancels only
+        // the turn, and a yielded review is not an aborted one.
+        if request.cancel.is_cancelled() {
+            return Ok(Some(WatchdogReviewResult {
+                warnings: Vec::new(),
+                stop_reason: Some(ReviewStopReason::Aborted),
+                clarification: None,
+            }));
+        }
+        // `clarification ? { clarification } : …` (`review.ts:361` @ad11b7ab) — a yielded review
+        // reports its question and no stop reason; the turn's own abort is the yield, not a fault.
+        if let Some(clarification) = latch
+            .as_ref()
+            .and_then(WatchdogClarificationLatch::clarification)
+        {
+            return Ok(Some(WatchdogReviewResult {
+                warnings: Vec::new(),
+                stop_reason: None,
+                clarification: Some(clarification),
+            }));
+        }
         Ok(Some(WatchdogReviewResult {
             warnings: Vec::new(),
             stop_reason: Some(final_stop_reason(&messages)),
+            clarification: None,
         }))
     }
 }
@@ -926,10 +1157,12 @@ impl WatchdogReview for MainWatchdogReview {
 /// `review_description` — "real model review" — true.
 ///
 /// [CYRUP-DELTA] this file is a v0.43.0 port; THIS type is pinned to **v0.68.0** and every citation
-/// on it says so. Of the three features that live in the same upstream block, `watchdog_diff` is
-/// ported (SUBA-233, `review.ts:293`,`:306` @ad11b7ab: the tool is added when the session has a Git
-/// baseline); `watchdog_ask`/the clarification yield and `loadWatchdogGuidance`/`WATCHDOG.md` are
-/// not, and are `SUBA-234`.
+/// on it says so. The three features that live in the same upstream block are ported against
+/// @ad11b7ab: `watchdog_diff` (SUBA-233, `review.ts:293`,`:306`: added when the session has a Git
+/// baseline), and `watchdog_ask` with the clarification yield and `loadWatchdogGuidance`/
+/// `WATCHDOG.md` (SUBA-234, `review.ts:294-338`,`:325`): the ask tool is added, and permitted, when
+/// the turn carries a [`WatchdogClarificationLatch`]; the guidance is read by
+/// [`MainWatchdogReview`] into the system prompt.
 pub struct ModelTurnReviewAgent {
     cwd: std::path::PathBuf,
     turn: super::agent_turn::WatchdogAgentTurn,
@@ -1019,6 +1252,20 @@ impl ModelTurnReviewAgent {
                 false,
             )));
         }
+        // `if (request.allowClarification) tools.push({ name: "watchdog_ask", … })`
+        // (`review.ts:308-322` @ad11b7ab, SUBA-234), and the execution-time policy that permits it
+        // (`:338`) — both from the one latch, so the tool and its permission cannot disagree.
+        let block_reason = match &turn.clarification {
+            Some(latch) => {
+                tools.push(Arc::new(super::agent_turn::WatchdogAskAgentTool::new(
+                    latch.clone(),
+                )));
+                let latch = latch.clone();
+                Arc::new(move |name: &str| latch.block_reason(name))
+                    as Arc<dyn Fn(&str) -> Option<String> + Send + Sync>
+            }
+            None => self.tool_call_block_reason(),
+        };
         super::agent_turn::WatchdogTurnRequest {
             system_prompt: turn.system_prompt,
             prompt: turn.prompt,
@@ -1027,7 +1274,7 @@ impl ModelTurnReviewAgent {
             // `beforeToolCall` (`:338-340 @v0.68.0`) — the EXECUTION-TIME layer, checked against
             // the wider PERMIT list, which is what refuses a tool the harness supplied from
             // outside the list above.
-            block_reason: self.tool_call_block_reason(),
+            block_reason,
             cancel: turn.cancel.clone(),
         }
     }
@@ -1361,13 +1608,13 @@ mod tests {
     /// words (`review.ts:231` @ad11b7ab); otherwise the read-only line is unchanged.
     #[test]
     fn the_system_prompt_names_watchdog_diff_only_when_the_reviewer_has_it() {
-        let with = build_watchdog_system_prompt("/repo", false, true);
+        let with = build_watchdog_system_prompt("/repo", false, true, "");
         assert!(with.contains(
             "You are read-only. You may use read, grep, find, ls, and watchdog_diff (the full repo \
              diff since the session baseline; pass a path to narrow it). Do not edit files, run \
              shell commands, spawn agents, or mutate state."
         ));
-        let without = build_watchdog_system_prompt("/repo", false, false);
+        let without = build_watchdog_system_prompt("/repo", false, false, "");
         assert!(without.contains(
             "You are read-only. You may use read, grep, find, and ls. Do not edit files, run shell \
              commands, spawn agents, or mutate state."
@@ -1402,6 +1649,7 @@ mod tests {
             tool_execution_sequential: true,
             emit_warning: &emitter,
             cancel: CancelToken::new(),
+            clarification: None,
         });
         let diff = request
             .tools
@@ -1419,11 +1667,11 @@ mod tests {
 
     #[test]
     fn the_system_prompt_includes_the_scope_line_only_when_there_is_scope() {
-        let without = build_watchdog_system_prompt("/repo", false, false);
+        let without = build_watchdog_system_prompt("/repo", false, false, "");
         assert!(!without.contains("Use the Current scope record"));
         assert!(without.contains("Working directory: /repo"));
         assert_eq!(without.lines().count(), 9);
-        let with = build_watchdog_system_prompt("/repo", true, false);
+        let with = build_watchdog_system_prompt("/repo", true, false, "");
         // The pin's line (`review.ts:230` @ad11b7ab), verbatim.
         assert!(with.contains(
             "Use the Current scope record alongside supplied activity evidence; an unrelated user \
@@ -1478,6 +1726,7 @@ mod tests {
             emit_warning: WatchdogWarningEmitter::inert(),
             cancel: CancelToken::new(),
             diff_baseline: Default::default(),
+            allow_clarification: false,
         };
         let prompt = build_review_prompt(&request, &selection);
         assert!(prompt.contains(
@@ -1567,6 +1816,7 @@ mod tests {
             tool_execution_sequential: true,
             emit_warning: &emitter,
             cancel: CancelToken::new(),
+            clarification: None,
         });
 
         let mut offered: Vec<&str> = request.tools.iter().map(|tool| tool.name()).collect();
@@ -1739,6 +1989,7 @@ mod tests {
                 })),
                 cancel: CancelToken::new(),
                 diff_baseline: Default::default(),
+                allow_clarification: false,
             })
             .await
             .unwrap();
@@ -1791,6 +2042,7 @@ mod tests {
                 emit_warning: WatchdogWarningEmitter::inert(),
                 cancel,
                 diff_baseline: Default::default(),
+                allow_clarification: false,
             })
             .await
             .unwrap()
@@ -1817,6 +2069,7 @@ mod tests {
                 emit_warning: WatchdogWarningEmitter::inert(),
                 cancel: CancelToken::new(),
                 diff_baseline: Default::default(),
+                allow_clarification: false,
             })
             .await
             .unwrap()
@@ -1841,6 +2094,7 @@ mod tests {
             emit_warning: WatchdogWarningEmitter::inert(),
             cancel: CancelToken::new(),
             diff_baseline: Default::default(),
+            allow_clarification: false,
         }
     }
 
@@ -1996,5 +2250,281 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection.thinking_level, "xhigh");
+    }
+
+    // ---- SUBA-234: `watchdog_ask` and `WATCHDOG.md` -------------------------------------------
+
+    fn ask_request(
+        allow: bool,
+        emit: WatchdogWarningEmitter,
+        config: ResolvedWatchdogConfig,
+    ) -> WatchdogReviewRequest {
+        WatchdogReviewRequest {
+            delta: "d".into(),
+            epoch: 1,
+            has_scope: false,
+            review_id: 1,
+            config,
+            emit_warning: emit,
+            cancel: CancelToken::new(),
+            diff_baseline: Default::default(),
+            allow_clarification: allow,
+        }
+    }
+
+    fn live_review(
+        agent: Arc<dyn WatchdogReviewAgent>,
+        cwd: std::path::PathBuf,
+    ) -> MainWatchdogReview {
+        MainWatchdogReview::new(
+            Arc::new(registry()),
+            Arc::new(AmbientReviewAuth),
+            agent,
+            cwd,
+        )
+        .with_current_model(Some(WatchdogModelInfo::new("anthropic", "claude-opus-4-8")))
+    }
+
+    /// Plays the model's ONE mixed batch upstream's adapter test sends (`watchdog-review.test.ts`
+    /// @ad11b7ab, "yields an ask from a mixed batch without another model call or warning"):
+    /// `watchdog_ask`, then `watchdog_warn`, then `ls` — through the turn's own tools and policy.
+    struct MixedBatch(Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl WatchdogReviewAgent for MixedBatch {
+        async fn run(&self, turn: WatchdogReviewTurn<'_>) -> Result<Vec<Value>, String> {
+            let mut log = self.0.lock().unwrap();
+            let latch = turn
+                .clarification
+                .clone()
+                .expect("an allowed review carries the latch");
+            log.push(format!(
+                "ask permitted: {}",
+                turn.block_reason(WATCHDOG_ASK_TOOL_NAME).is_none()
+            ));
+            log.push(
+                latch
+                    .ask(&json!({
+                        "question": "  Which constraint applies?  ",
+                        "evidence": "Two scope statements differ.",
+                    }))?
+                    .to_string(),
+            );
+            log.push(format!("turn cancelled: {}", turn.cancel.is_cancelled()));
+            let warn = turn.warn_tool.execute(&json!({
+                "severity": "concern", "importance": "high", "summary": "Must not emit",
+                "evidence": "x", "recommendedAction": "x",
+            }))?;
+            log.push(format!("warning accepted: {}", warn.accepted));
+            log.push(format!("ls blocked: {}", turn.block_reason("ls").is_some()));
+            log.push(format!(
+                "second ask: {}",
+                latch
+                    .ask(&json!({ "question": "again?", "evidence": "e" }))
+                    .unwrap_err()
+            ));
+            // The yield aborted the turn: its terminal message says so, and that must not turn a
+            // question into an aborted review.
+            Ok(vec![
+                json!({ "role": "assistant", "stopReason": "aborted" }),
+            ])
+        }
+    }
+
+    /// Clause 3, the reviewer half — the question YIELDS the review: it is reported as the result
+    /// (no stop reason), the turn's token is cancelled (upstream's `agent.abort()`), a warning in
+    /// the same batch is refused before it reaches the runtime, every later tool is blocked, and
+    /// a second ask is refused.
+    ///
+    /// RED at HEAD: does not compile — no `watchdog_ask`, no latch, no `clarification` result.
+    #[tokio::test]
+    async fn watchdog_ask_yields_the_review_and_refuses_the_rest_of_the_batch() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let review = live_review(Arc::new(MixedBatch(Arc::clone(&log))), "/repo".into());
+        let emitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&emitted);
+        let request = ask_request(
+            true,
+            WatchdogWarningEmitter::from_fn(Arc::new(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            })),
+            default_watchdog_config(),
+        );
+        let review_cancel = request.cancel.clone();
+        let result = review.review(request).await.unwrap().unwrap();
+        assert_eq!(
+            result.clarification,
+            Some(WatchdogClarification {
+                question: "Which constraint applies?".into(),
+                evidence: "Two scope statements differ.".into(),
+            })
+        );
+        assert_eq!(result.stop_reason, None, "a yield is not an abort");
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            emitted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no warning reached the runtime"
+        );
+        assert!(
+            !review_cancel.is_cancelled(),
+            "the yield cancels the turn, not the review"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                "ask permitted: true".to_string(),
+                WATCHDOG_ASK_RESULT_TEXT.to_string(),
+                "turn cancelled: true".to_string(),
+                "warning accepted: false".to_string(),
+                "ls blocked: true".to_string(),
+                "second ask: Clarification unavailable after warning, yield, or cancellation."
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// The other order: a warning ACCEPTED first closes the question (upstream's `warned`), and
+    /// empty halves are refused. RED at HEAD: does not compile.
+    #[test]
+    fn an_accepted_warning_closes_the_question_and_both_halves_are_required() {
+        let latch = WatchdogClarificationLatch::new(CancelToken::new(), CancelToken::new());
+        assert_eq!(
+            latch
+                .ask(&json!({ "question": "  ", "evidence": "e" }))
+                .unwrap_err(),
+            "A focused question and concrete evidence are required."
+        );
+        let emit = latch.wrap_emitter(WatchdogWarningEmitter::from_fn(Arc::new(|_| true)));
+        assert!(
+            emit.emit(
+                &to_watchdog_warning(&json!({
+                    "severity": "concern", "importance": "high", "summary": "s", "evidence": "e",
+                    "recommendedAction": "r"
+                }))
+                .unwrap()
+            )
+        );
+        assert!(
+            latch
+                .ask(&json!({ "question": "q", "evidence": "e" }))
+                .is_err()
+        );
+        assert!(!latch.yielded());
+    }
+
+    /// A review NOT allowed to ask is built exactly as before: no `watchdog_ask` on the agent, the
+    /// policy refuses it by name, and the turn runs under the request's own token. With the latch,
+    /// the tool is there and permitted. RED at HEAD: does not compile.
+    #[test]
+    fn the_ask_tool_exists_only_on_a_review_allowed_to_ask() {
+        let selection = WatchdogReviewModelSelection {
+            model: WatchdogModelInfo::new("anthropic", "claude-opus-4-8"),
+            thinking_level: "off".to_string(),
+            auth: WatchdogReviewAuth::default(),
+            explicit: true,
+        };
+        let emitter = WatchdogWarningEmitter::inert();
+        let agent = ModelTurnReviewAgent::new(std::env::temp_dir(), Arc::new(|| None));
+        for allowed in [false, true] {
+            let latch = allowed
+                .then(|| WatchdogClarificationLatch::new(CancelToken::new(), CancelToken::new()));
+            let request = agent.turn_request(WatchdogReviewTurn {
+                selection: &selection,
+                system_prompt: "system".to_string(),
+                prompt: "prompt".to_string(),
+                allowed_tools: &WATCHDOG_ALLOWED_TOOL_NAMES,
+                read_only_tools: &WATCHDOG_REVIEW_READ_ONLY_TOOL_NAMES,
+                warn_tool: WatchdogWarnTool::new(&emitter),
+                diff_baseline: None,
+                tool_execution_sequential: true,
+                emit_warning: &emitter,
+                cancel: CancelToken::new(),
+                clarification: latch,
+            });
+            let has_ask = request
+                .tools
+                .iter()
+                .any(|t| t.name() == WATCHDOG_ASK_TOOL_NAME);
+            assert_eq!(has_ask, allowed);
+            assert_eq!(
+                (request.block_reason)(WATCHDOG_ASK_TOOL_NAME).is_none(),
+                allowed
+            );
+            assert_eq!((request.block_reason)("read"), None);
+            assert!((request.block_reason)("bash").is_some());
+            if let Some(ask) = request
+                .tools
+                .iter()
+                .find(|t| t.name() == WATCHDOG_ASK_TOOL_NAME)
+            {
+                assert_eq!(ask.description(), WATCHDOG_ASK_TOOL_DESCRIPTION);
+                assert_eq!(
+                    ask.parameters()["required"],
+                    json!(["question", "evidence"])
+                );
+            }
+        }
+    }
+
+    /// Records the system prompt the review handed its turn.
+    struct PromptCapture(Arc<std::sync::Mutex<Option<String>>>);
+
+    #[async_trait]
+    impl WatchdogReviewAgent for PromptCapture {
+        async fn run(&self, turn: WatchdogReviewTurn<'_>) -> Result<Vec<Value>, String> {
+            *self.0.lock().unwrap() = Some(turn.system_prompt);
+            Ok(Vec::new())
+        }
+    }
+
+    /// Clause 5 — `WATCHDOG.md` reaches the reviewer's system prompt when present
+    /// (`review.ts:237`,`:325` @ad11b7ab), is absent-safe, and `guidance.watchdogMd: false`
+    /// turns it off. Drives the REAL review, so the read happens where production reads it.
+    ///
+    /// RED at HEAD: does not compile — `build_watchdog_system_prompt` takes no guidance and
+    /// nothing reads `WATCHDOG.md`; with the read removed from `MainWatchdogReview::review` it
+    /// compiles and the first assertion fails.
+    #[tokio::test]
+    async fn watchdog_md_reaches_the_reviewer_and_is_absent_safe() {
+        let project = tempfile::tempdir().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let review = live_review(
+            Arc::new(PromptCapture(Arc::clone(&captured))),
+            project.path().to_path_buf(),
+        );
+        let prompt = |config| {
+            let review = &review;
+            let captured = Arc::clone(&captured);
+            async move {
+                review
+                    .review(ask_request(false, WatchdogWarningEmitter::inert(), config))
+                    .await
+                    .unwrap();
+                captured.lock().unwrap().clone().unwrap()
+            }
+        };
+        let without = prompt(default_watchdog_config()).await;
+        assert!(
+            without.contains("If the turn is clean"),
+            "absent-safe: the review still runs"
+        );
+
+        let dir = crate::paths::project_config_dir(project.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("WATCHDOG.md"),
+            "Never flag generated files under out/.\n",
+        )
+        .unwrap();
+        let with = prompt(default_watchdog_config()).await;
+        assert!(with.contains(
+            "Standing instructions from WATCHDOG.md (project first, then user):\nNever flag generated files under out/."
+        ), "{with}");
+
+        let mut off = default_watchdog_config();
+        off.guidance.watchdog_md = false;
+        assert!(!prompt(off).await.contains("Never flag generated files"));
     }
 }
