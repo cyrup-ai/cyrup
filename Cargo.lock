@@ -1720,6 +1720,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cyrup",
+ "cyrup-acp",
  "cyrup-agent",
  "cyrup-codemode",
  "cyrup-codemode-runtime",

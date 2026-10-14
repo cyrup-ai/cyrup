@@ -195,6 +195,35 @@ impl Acp {
         }
     }
 
+    /// The responses to `ids` that arrive within `within`, by id — WITHOUT failing on a timeout, so
+    /// a request the agent never answers is reported as missing rather than hanging the suite
+    /// (`ACP-014`).
+    fn answers_within(
+        &mut self,
+        ids: &[u64],
+        within: Duration,
+    ) -> std::collections::BTreeMap<u64, Value> {
+        let deadline = std::time::Instant::now() + within;
+        let mut answered = std::collections::BTreeMap::new();
+        while answered.len() < ids.len() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let Ok(line) = self.rx.recv_timeout(left) else {
+                break;
+            };
+            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            self.seen.push(frame.clone());
+            if let Some(id) = frame.get("id").and_then(Value::as_u64)
+                && ids.contains(&id)
+                && frame.get("method").is_none()
+            {
+                answered.insert(id, frame);
+            }
+        }
+        answered
+    }
+
     /// Read until an `agent_message_chunk` whose text starts with `prefix` arrives.
     ///
     /// Needed because `session/new`'s follow-ups now include the startup prelude (`ACP-066`), so
@@ -1267,6 +1296,174 @@ fn session_load_replays_before_its_response_and_advertises_after_it() {
             .len(),
         0,
         "ACP-219: and no headerless stub reappeared under the live session"
+    );
+    acp.shutdown();
+}
+
+/// The bound on an answer the `ACP-014` tests wait for: every request here is answered at once or
+/// never, so this only has to outlast a cold debug binary's scheduling.
+const ANSWER_WITHIN: Duration = Duration::from_secs(15);
+
+/// **ACP-014** — `session/close` and `session/resume`, which this port does not serve, are answered
+/// exactly as pi-acp's SDK answers a method pi-acp does not serve (`@agentclientprotocol/sdk` 0.26.0
+/// `RequestError.methodNotFound`): `-32601`, `"Method not found": <method>`, data `{ method }`.
+///
+/// The row expected these to hang (a request carrying a `sessionId` retained forever); measured, they
+/// did not — the agent side's last resort is `Client`'s default, which never retries — and the wait
+/// here is bounded anyway, so a regression to a hang fails within [`ANSWER_WITHIN`]. The sibling
+/// `session/list`, sent after them on the same connection, must be answered too, so a missing
+/// answer cannot be a transport that never started. Red at the base on the answer itself: the Rust
+/// SDK's default said `"Method not found"` with data `"session/close"`.
+#[test]
+fn session_close_and_resume_are_answered_and_the_connection_still_serves() {
+    let mut acp = Acp::start();
+    let session = acp.new_session(2);
+    acp.send(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "session/close",
+        "params": {"sessionId": session}
+    }));
+    acp.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "session/resume",
+        "params": {"sessionId": session, "cwd": acp.project.display().to_string()}
+    }));
+    acp.send(json!({"jsonrpc": "2.0", "id": 5, "method": "session/list", "params": {}}));
+    let answered = acp.answers_within(&[3, 4, 5], ANSWER_WITHIN);
+
+    let sibling = answered
+        .get(&5)
+        .unwrap_or_else(|| panic!("the sibling session/list was not answered:\n{}", acp.dump()));
+    assert!(sibling.get("result").is_some(), "{sibling}");
+    for (id, method) in [(3, "session/close"), (4, "session/resume")] {
+        let frame = answered.get(&id).unwrap_or_else(|| {
+            panic!(
+                "ACP-014: {method} (id {id}) was never answered while the sibling was:\n{}",
+                acp.dump()
+            )
+        });
+        assert_eq!(frame["error"]["code"], -32601, "{frame}");
+        assert_eq!(
+            frame["error"]["message"],
+            format!("\"Method not found\": {method}"),
+            "{frame}"
+        );
+        assert_eq!(
+            frame["error"]["data"],
+            json!({ "method": method }),
+            "{frame}"
+        );
+    }
+    acp.shutdown();
+}
+
+/// **ACP-014's completeness guard** — every agent method the ACP schema declares is ANSWERED, and
+/// only the ones this port declines on purpose are answered `-32601`.
+///
+/// **Where the list comes from.** Not from this file: [`cyrup_acp::connection::schema_agent_methods`]
+/// serializes the schema crate's own `AGENT_METHOD_NAMES`, whose fields are exactly the methods
+/// compiled into this build. Each is sent as a request carrying a `sessionId` (an unknown one, so
+/// no live session is touched) — the shape the row feared an SDK would retain unanswered.
+///
+/// **What makes it fail.**
+/// - A 14th ungated method in the schema (a `agent-client-protocol-schema` upgrade): it appears in
+///   `AGENT_METHOD_NAMES`, is sent, and is answered `-32601` by the catch-all — but it is not in
+///   [`cyrup_acp::connection::DECLINED_METHODS`], so this fails naming it: serve it, or decline it
+///   on purpose by adding it there (with pi-acp's behaviour for it).
+/// - Turning on `unstable_session_fork` (or `unstable_llm_providers`): `session/fork` (or the three
+///   `providers/*`) enter `AGENT_METHOD_NAMES` and fail the same way.
+/// - Any schema method left unanswered (an SDK whose agent side retains an unclaimed request, which
+///   the row feared and 2.1.0 does not do): it is listed, within [`ANSWER_WITHIN`] rather than
+///   hanging the suite.
+/// - A name in `DECLINED_METHODS` or `NOTIFICATION_METHODS` the schema no longer declares.
+/// - A default log filter that lets the SDK's `Handler errored` line through (`ACP-304`): seven of
+///   these requests are answered `Invalid params`, the line for each is tens of KiB, and this
+///   harness never drains the agent's stderr — so the agent blocks writing it and answers nothing,
+///   which is how this test first found it.
+///
+/// The last request, `session/list`, is the sibling: it must be answered too, so a missing answer
+/// cannot be a transport that never started.
+#[test]
+fn every_agent_method_the_schema_declares_is_answered() {
+    let declared = cyrup_acp::connection::schema_agent_methods();
+    assert!(
+        declared.len() >= 13,
+        "the schema's method list could not be read: {declared:?}"
+    );
+    for name in cyrup_acp::connection::DECLINED_METHODS
+        .iter()
+        .chain(cyrup_acp::connection::NOTIFICATION_METHODS.iter())
+    {
+        assert!(
+            declared.iter().any(|method| method == name),
+            "{name} is declined or a notification here but the schema no longer declares it"
+        );
+    }
+
+    let mut acp = Acp::start();
+    let unknown = "01a07000-0000-7000-8000-00000000c10e";
+    let mut ids = Vec::new();
+    for (index, method) in declared.iter().enumerate() {
+        let id = 100 + index as u64;
+        acp.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": method,
+            "params": {"sessionId": unknown}
+        }));
+        ids.push(id);
+    }
+    let sibling = 99;
+    acp.send(json!({"jsonrpc": "2.0", "id": sibling, "method": "session/list", "params": {}}));
+    ids.push(sibling);
+
+    let answered = acp.answers_within(&ids, ANSWER_WITHIN);
+    if !answered.contains_key(&sibling) {
+        // The agent's stderr is never drained here, so an agent that logs enough blocks on it;
+        // its size is the first thing to look at (`ACP-304`).
+        let _ = acp.child.kill();
+        let mut err = String::new();
+        if let Some(mut handle) = acp.child.stderr.take() {
+            use std::io::Read as _;
+            let _ = handle.read_to_string(&mut err);
+        }
+        eprintln!(
+            "agent stderr ({} bytes), head:\n{}",
+            err.len(),
+            err.get(..2000).unwrap_or(&err)
+        );
+    }
+    assert!(
+        answered.contains_key(&sibling),
+        "the sibling session/list was not answered, so nothing below is evidence; sent {:?}, \
+         answered {:?}",
+        declared,
+        answered
+            .iter()
+            .map(|(id, frame)| (*id, frame.get("error").map(|e| e["code"].clone())))
+            .collect::<Vec<_>>()
+    );
+    let mut unanswered = Vec::new();
+    let mut undeclared_not_found = Vec::new();
+    for (index, method) in declared.iter().enumerate() {
+        let id = 100 + index as u64;
+        match answered.get(&id) {
+            None => unanswered.push(method.clone()),
+            Some(frame) => {
+                let not_found = frame["error"]["code"] == -32601;
+                let excused = cyrup_acp::connection::DECLINED_METHODS.contains(&method.as_str())
+                    || cyrup_acp::connection::NOTIFICATION_METHODS.contains(&method.as_str());
+                if not_found && !excused {
+                    undeclared_not_found.push(method.clone());
+                }
+            }
+        }
+    }
+    assert!(
+        unanswered.is_empty(),
+        "ACP-014: these schema methods were never answered: {unanswered:?}"
+    );
+    assert!(
+        undeclared_not_found.is_empty(),
+        "these schema methods are answered method-not-found but are not declined on purpose — \
+         serve them, or add them to cyrup_acp::connection::DECLINED_METHODS: \
+         {undeclared_not_found:?}"
     );
     acp.shutdown();
 }

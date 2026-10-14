@@ -271,11 +271,22 @@ pub fn resolve_default_launch_model(
 /// path is briefly missing reports a `walkdir error` at `warn` on every poll (`notify`), which is
 /// noise rather than a fault: the owners of those paths already surface the failures that matter,
 /// so the crate is held to `error`. `RUST_LOG`, when set, replaces all of this.
+///
+/// The ACP SDK's incoming actor is held to `error` too, in both filters (`ACP-304`). When a handler
+/// answers an error — every malformed or unknown-session request a client sends — it logs
+/// `Handler errored` at `warn` with `handler = ?describe_chain()`, and `agent-client-protocol`
+/// 2.1.0's `ChainedHandler::describe_chain` Debug-formats the previous link's already-Debug-escaped
+/// description, so the escaping doubles at every link and one line grows exponentially with the
+/// number of registered handlers: measured with this port's thirteen, 34,385 bytes for one bad
+/// `session/set_mode` and over 64 KiB for one bad `initialize` — enough, from a client that does not
+/// drain the agent's stderr, to fill the pipe and block the agent mid-write, so it answers nothing
+/// more. The error itself is still logged, once and compactly, by the SDK's outgoing actor
+/// (`Sending error response`), and the client receives it.
 fn default_trace_filter(verbose: bool) -> &'static str {
     if verbose {
-        "debug"
+        "debug,agent_client_protocol::jsonrpc::incoming_actor=error"
     } else {
-        "warn,notify=error"
+        "warn,notify=error,agent_client_protocol::jsonrpc::incoming_actor=error"
     }
 }
 
@@ -516,8 +527,15 @@ mod trace_tests {
 
     #[test]
     fn the_notify_crate_is_held_to_error_unless_verbose() {
-        assert_eq!(default_trace_filter(false), "warn,notify=error");
-        assert_eq!(default_trace_filter(true), "debug");
+        assert_eq!(
+            default_trace_filter(false),
+            "warn,notify=error,agent_client_protocol::jsonrpc::incoming_actor=error"
+        );
+        assert_eq!(
+            default_trace_filter(true),
+            "debug,agent_client_protocol::jsonrpc::incoming_actor=error"
+        );
         assert!(tracing_subscriber::EnvFilter::try_new(default_trace_filter(false)).is_ok());
+        assert!(tracing_subscriber::EnvFilter::try_new(default_trace_filter(true)).is_ok());
     }
 }

@@ -4,15 +4,30 @@
 //! `new AgentSideConnection(agent, stream)` pair and of the handler table at the head of
 //! `src/acp/agent.ts`'s `class PiAcpAgent`.
 //!
-//! # Why every handler is registered, including the ones that are not written yet
+//! # What an unserved method is answered (`ACP-014`)
 //!
 //! `agent_client_protocol::Agent` is a **role marker with no trait to implement**, so there is no
-//! compiler check that the handler set is complete. An unregistered method falls through to
-//! `default_handle_dispatch_from`, which returns `Handled::No { retry: message.has_session_id() }`
-//! — a session-scoped method is **retained and retried**, so a forgotten handler is a HANG, not a
-//! `method_not_found`. That is `ACP-014`'s point and it is why every method this port serves is
-//! registered here from the first commit. Every one is now implemented; the rule stands for
-//! whatever the protocol grows next.
+//! compiler check that the handler set is complete. A request no handler claims reaches the
+//! incoming actor's last resort, `counterpart.default_handle_dispatch_from`
+//! (`agent-client-protocol` 2.1.0 `src/jsonrpc/incoming_actor.rs`) — and for an agent the
+//! counterpart is `Client`, whose default declines with `retry: false` (`src/role/acp.rs`), so the
+//! actor answers the SDK's own `method_not_found` at once. (`Agent`'s default, which retains a
+//! message carrying a `sessionId` and retries it as dynamic handlers are added, is the one a
+//! CLIENT's connection consults; it is not on this side, and an earlier reading of it as this side's
+//! is what this section used to warn about.) Measured over the stdio transport: an unserved
+//! `session/close` was answered `-32601`, `"Method not found"`, data `"session/close"`.
+//!
+//! The schema declares 13 ungated agent methods (`AGENT_METHOD_NAMES`, `agent-client-protocol-schema`
+//! 1.7.0 `src/v1/agent.rs`; [`schema_agent_methods`]); this port serves ten, `session/cancel`
+//! among them a notification, and declines [`DECLINED_METHODS`]. pi-acp v0.0.33 serves none of the
+//! three either, and its SDK (`@agentclientprotocol/sdk` 0.26.0, `AgentSideConnection`'s request
+//! switch) answers each — and any method it does not know, pi-acp defining no `extMethod` — with
+//! `RequestError.methodNotFound(method)`: `-32601`, message `"Method not found": <method>`, data
+//! `{ method }`. So the chain ends in a catch-all that answers exactly that ([`method_not_found`]):
+//! **parity** in code, message and data, where the SDK's default differed in the last two. An
+//! unserved notification is dropped by the same `Client` default (`Ignoring unhandled
+//! notification`), as that SDK drops it. The guard that makes declining a method a decision rather
+//! than an accident is `cyrup-it`'s `every_agent_method_the_schema_declares_is_answered`.
 //!
 //! # Why request handlers never receive `ConnectionTo<Client>`
 //!
@@ -35,10 +50,49 @@ use agent_client_protocol::schema::v1::{
     Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest, LoadSessionRequest,
     NewSessionRequest, PromptRequest, SetSessionConfigOptionRequest, SetSessionModeRequest,
 };
-use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo};
+use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, UntypedMessage};
 
 use crate::error::AcpError;
 use crate::sessions::{AcpHost, SessionManager};
+
+/// The agent methods the schema declares that this port does not serve, answered
+/// [`method_not_found`] as pi-acp v0.0.33 answers them (`ACP-014`): it has no `session/resume`,
+/// `session/close` or `logout` handler (`src/acp/agent.ts`), so its SDK answers `-32601`. None is
+/// advertised in `agentCapabilities`, so only a client that ignores capabilities sends one.
+pub const DECLINED_METHODS: [&str; 3] = ["session/resume", "session/close", "logout"];
+
+/// The agent methods the schema declares that are notifications, not requests: served by an
+/// `on_receive_notification` handler, so a REQUEST of that name is answered [`method_not_found`],
+/// as pi-acp's SDK answers it (its request switch has no `session/cancel` arm).
+pub const NOTIFICATION_METHODS: [&str; 1] = ["session/cancel"];
+
+/// Every agent method the schema compiled into this build declares — `AGENT_METHOD_NAMES`,
+/// serialized, so a method the schema adds (or an `unstable_*` feature switches on) is in this list
+/// without anyone writing it down. Read by the `ACP-014` completeness guard.
+#[must_use]
+pub fn schema_agent_methods() -> Vec<String> {
+    let names = serde_json::to_value(agent_client_protocol::schema::v1::AGENT_METHOD_NAMES)
+        .unwrap_or_default();
+    names
+        .as_object()
+        .map(|fields| {
+            fields
+                .values()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The answer to a request no handler serves (`ACP-014`): pi-acp's SDK's
+/// `RequestError.methodNotFound(method)` (`@agentclientprotocol/sdk` 0.26.0 `dist/acp.js`), byte for
+/// byte — code `-32601`, message `"Method not found": <method>`, data `{ "method": <method> }`.
+#[must_use]
+pub fn method_not_found(method: &str) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::new(-32601, format!("\"Method not found\": {method}"))
+        .data(serde_json::json!({ "method": method }))
+}
 
 /// The agent identity advertised in `initialize`'s `agentInfo` (`ACP-051`).
 ///
@@ -273,7 +327,7 @@ pub async fn serve(
     let conn = AcpConnection::new(host);
 
     // The builder chain. Every handler below is registered for the life of the connection; see the
-    // module docs for why a missing one is a hang rather than a `method_not_found`.
+    // module docs for what an unserved method is answered.
     let init = conn.clone();
     let authenticate = conn.clone();
     let new_session = conn.clone();
@@ -439,6 +493,18 @@ pub async fn serve(
                 Ok::<_, agent_client_protocol::Error>(())
             },
             agent_client_protocol::on_receive_notification!(),
+        )
+        // ---- everything else (`ACP-014`) ------------------------------------------------------
+        // LAST, so it sees only what every handler above declined: a request is answered as
+        // pi-acp's SDK answers a method it does not serve, rather than with the Rust SDK's own
+        // `method_not_found`, whose message and data differ. See the module docs.
+        .on_receive_request(
+            async move |req: UntypedMessage,
+                        responder: agent_client_protocol::Responder<serde_json::Value>,
+                        _cx: ConnectionTo<Client>| {
+                responder.respond_with_error(method_not_found(&req.method))
+            },
+            agent_client_protocol::on_receive_request!(),
         )
         .connect_to(transport)
         .await
