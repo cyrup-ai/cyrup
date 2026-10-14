@@ -51,6 +51,36 @@ use bindings::cyrup::ext::types as wit_types;
 // Host-import implementations: the guest's registration + capability calls land here.
 // ---------------------------------------------------------------------------
 
+/// [`crate::WidgetEvent`] in the world's own types (`types.widget-event`), field for field.
+fn widget_event_to_wit(event: crate::WidgetEvent) -> wit_types::WidgetEvent {
+    match event {
+        crate::WidgetEvent::Mouse(mouse) => wit_types::WidgetEvent::Mouse(wit_types::WidgetMouse {
+            pointer: match mouse.pointer {
+                crate::WidgetPointer::Press { column, row } => {
+                    wit_types::WidgetPointer::Press(wit_types::WidgetCell { column, row })
+                }
+                crate::WidgetPointer::Click { column, row, count } => {
+                    wit_types::WidgetPointer::Click(wit_types::WidgetClick { column, row, count })
+                }
+                crate::WidgetPointer::Wheel { column, row, lines } => {
+                    wit_types::WidgetPointer::Wheel(wit_types::WidgetWheel { column, row, lines })
+                }
+            },
+            modifiers: wit_types::PointerModifiers {
+                shift: mouse.modifiers.shift,
+                alt: mouse.modifiers.alt,
+                ctrl: mouse.modifiers.ctrl,
+            },
+        }),
+        crate::WidgetEvent::Resize(size) => {
+            wit_types::WidgetEvent::Resize(wit_types::TerminalSize {
+                columns: size.columns,
+                rows: size.rows,
+            })
+        }
+    }
+}
+
 /// Helper: fetch the guest backing or surface a trap-free error string (imports never panic).
 fn guest_of(state: &HostState) -> Result<&Arc<GuestState>, String> {
     state
@@ -635,6 +665,12 @@ impl bindings::cyrup::ext::ui::Host for HostState {
                 content_json.map(|j| serde_json::from_str::<Vec<String>>(&j).unwrap_or_default());
             let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
             let placement = crate::host::WidgetPlacement::from_opts(&opts);
+            // SUBA-210 — this guest now owns the key, so the widget's pointer and resize events
+            // come back to it (`ExtensionHost::widget_event`); a removal forgets the key. The
+            // native tier records the same thing in `CallerScopedServices::set_widget`.
+            let _ = guest
+                .registry
+                .record_widget(&key, lines.is_some(), &guest.owner);
             guest.services.set_widget(&key, lines.as_deref(), placement);
             guest.set_widget(crate::host::WidgetEffect {
                 key,
@@ -814,6 +850,15 @@ impl bindings::cyrup::ext::ui::Host for HostState {
         ui_guest_of(self)
             .map(|g| g.services.tools_expanded())
             .unwrap_or(false)
+    }
+    /// SUBA-211 — pi `process.stdout.columns` / `.rows`. `none` with no terminal attached, and
+    /// for a guest that holds no `ui` grant (the gate every `ui.*` read shares).
+    async fn get_terminal_size(&mut self) -> Option<wit_types::TerminalSize> {
+        let size = ui_guest_of(self).ok()?.services.terminal_size()?;
+        Some(wit_types::TerminalSize {
+            columns: size.columns,
+            rows: size.rows,
+        })
     }
     async fn set_tools_expanded(&mut self, expanded: bool) {
         if let Ok(guest) = ui_guest_of(self) {
@@ -2779,6 +2824,34 @@ impl LiveExtension {
         api.call_on_branch_change(&mut inner.store, branch)
             .await
             .map_err(|e| self.fault(&e))
+    }
+
+    /// Deliver one widget event to this guest's `handle-widget-event` export (SUBA-210,
+    /// SUBA-211). Runs at EVENT tier for [`Self::on_terminal_input`]'s reason: the TUI awaits the
+    /// answer on its input path, so the guest must not be able to hold it past the epoch budget.
+    #[cfg(feature = "wasm-host")]
+    pub async fn handle_widget_event(
+        &self,
+        key: &str,
+        event: crate::WidgetEvent,
+    ) -> Result<crate::WidgetEventOutcome, ExtError> {
+        let wit_event = widget_event_to_wit(event);
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        inner.store.set_epoch_deadline(self.epoch_ticks);
+        self.guest.arm_epoch_deadline_estimate(self.epoch_ticks);
+        self.guest.set_tier(CtxTier::Event);
+        let api = inner.instance.cyrup_ext_events();
+        match api
+            .call_handle_widget_event(&mut inner.store, key, wit_event)
+            .await
+        {
+            Ok(wit_types::WidgetEventOutcome::Handled) => Ok(crate::WidgetEventOutcome::Handled),
+            Ok(wit_types::WidgetEventOutcome::Unhandled) => {
+                Ok(crate::WidgetEventOutcome::Unhandled)
+            }
+            Err(e) => Err(self.fault(&e)),
+        }
     }
 
     /// Run the guest provider's `login(callbacks)` flow (Pi `oauth.login`, host gap #1). Runs at

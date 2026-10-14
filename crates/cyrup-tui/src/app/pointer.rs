@@ -1,5 +1,5 @@
 //! The pointer over the dock: clicks and wheel notches on the editor, its completion popup and the
-//! selector that replaces it.
+//! selector that replaces it, and a click on an extension widget.
 //!
 //! Pi routes a mouse report through its component tree: every component may implement
 //! `handleMouse`, a container forwards the event to the child under the pointer after translating
@@ -49,6 +49,32 @@
 //! otherwise the release copies as any other does. A drag across the prompt is not a click, so it
 //! selects the text and never moves the caret.
 //!
+//! # Extension widgets take clicks, and only clicks
+//! An extension widget is a mounted component upstream, and pi's async-jobs card answers
+//! `handleMouse` for one thing: a left `click` on its row 0 with no shift, alt or ctrl, which folds
+//! it (`pi-subagents/src/tui/render.ts:2938-2944` @ad11b7ab). It answers `undefined` for a press,
+//! a drag, a wheel notch and every other click, so in pi a press on a widget starts a text
+//! selection and the fold arrives through the selection's release, exactly as the editor's caret
+//! click does above. SUBA-210 routes widgets through that same path and no other:
+//!
+//! * the **press** on a widget is still not claimed, so the selection starts and a drag across the
+//!   widget's text still selects and copies it — the press and the wheel are never offered to a
+//!   widget at all (a widget would leave them alone, as pi's does, and claiming them would take the
+//!   selection away);
+//! * the **click** a clean release completes is offered, after overlays and the dock, to the widget
+//!   painted under the cell ([`App::widget_at`], which walks the widgets in the order the painter
+//!   stacks them). The owner is an extension, and asking it is `async`, so the release is HELD:
+//!   [`App::complete_selection_click`] answers [`AppAction::ExtensionWidgetClick`], the run loop
+//!   asks the widget's owner through [`cyrup_ext::ExtensionHost::widget_event`], and
+//!   [`App::offer_widget_click`] finishes the release with the answer. A click the widget takes
+//!   clears the selection and copies nothing, as a click the editor takes does; one it leaves alone
+//!   (another row, a modified click, a widget whose owner does not answer) finishes as any other
+//!   release. The modifiers of the release travel with the click, because the widget, not the
+//!   host, decides that a modified click is not its own.
+//!
+//! The widget that takes a click republishes its lines through `set_widget` before answering, and
+//! that write is what repaints it.
+//!
 //! # Where a selection started decides what it can reach
 //! A selection that began in the scrolled document stays in the document: a drag that ends over the
 //! dock keeps selecting document rows, clamped to the viewport. A selection that began anywhere
@@ -60,7 +86,7 @@
 
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use super::{App, AppAction, AppState, OverlayClick, Regions};
@@ -68,6 +94,16 @@ use super::{App, AppAction, AppState, OverlayClick, Regions};
 /// Consecutive clicks on the same cell count as a double or triple click only if each follows the
 /// last within this window — pi's `DOUBLE_CLICK_INTERVAL_MS = 500` (`tui-alt-screen.ts:68`).
 pub(super) const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The modifier keys of a mouse report, as an extension widget is told them (pi's
+/// `MouseEvent.shift` / `.alt` / `.ctrl`).
+fn pointer_modifiers(modifiers: KeyModifiers) -> cyrup_ext::PointerModifiers {
+    cyrup_ext::PointerModifiers {
+        shift: modifiers.contains(KeyModifiers::SHIFT),
+        alt: modifiers.contains(KeyModifiers::ALT),
+        ctrl: modifiers.contains(KeyModifiers::CONTROL),
+    }
+}
 
 /// What a component is told about the pointer. Positions are **local**: `(0, 0)` is the top-left
 /// cell of the rectangle the component was painted in.
@@ -283,16 +319,48 @@ impl<B: ratatui::backend::Backend> App<B> {
     ///
     /// A component that takes the click clears the selection and nothing is copied; otherwise the
     /// release finishes as any other, copying what is selected under the `copyOnSelect` rule.
-    pub(crate) fn complete_selection_click(&mut self, at: Position, count: u8) -> AppAction {
+    pub(crate) fn complete_selection_click(
+        &mut self,
+        at: Position,
+        count: u8,
+        modifiers: KeyModifiers,
+    ) -> AppAction {
         // An overlay under the cell is offered the click first, and when it leaves it alone the
         // components beneath it are not (`overlay.result ?? (overlay.hit ? undefined : layout)`,
         // `tui-alt-screen.ts:1346-1347`).
         let taken = match self.offer_overlay_click(at, count) {
             OverlayClick::Taken(action) => Some(action),
             OverlayClick::Unhandled => None,
-            OverlayClick::Miss => DockTarget::at(&self.state.regions, at)
-                .and_then(|target| self.dispatch_pointer(target, Pointer::Click { at, count })),
+            OverlayClick::Miss => match DockTarget::at(&self.state.regions, at) {
+                Some(target) => self.dispatch_pointer(target, Pointer::Click { at, count }),
+                None => {
+                    // SUBA-210 — an extension widget under the cell is asked next, through its
+                    // owner. That is `async`, so the release is held and the run loop finishes
+                    // it with the answer ([`Self::offer_widget_click`]).
+                    if let Some((key, cell)) = self.widget_at(at) {
+                        return AppAction::ExtensionWidgetClick {
+                            key,
+                            mouse: cyrup_ext::WidgetMouse {
+                                pointer: cyrup_ext::WidgetPointer::Click {
+                                    column: cell.x,
+                                    row: cell.y,
+                                    count,
+                                },
+                                modifiers: pointer_modifiers(modifiers),
+                            },
+                        };
+                    }
+                    None
+                }
+            },
         };
+        self.settle_selection_click(taken)
+    }
+
+    /// Finish a clean click's release once it is known whether a component took it: a taken
+    /// click clears the selection and copies nothing, one nobody took finishes the release as any
+    /// other does.
+    pub(crate) fn settle_selection_click(&mut self, taken: Option<AppAction>) -> AppAction {
         let Some(alt) = self.altscreen.as_mut() else {
             return taken.unwrap_or(AppAction::None);
         };
@@ -317,6 +385,58 @@ impl<B: ratatui::backend::Backend> App<B> {
                 _ => AppAction::None,
             },
         }
+    }
+
+    /// The extension widget painted under `at`, as its key and the cell local to it (row 0 is the
+    /// widget's first line), against the rectangles the last frame was painted with. Widgets are
+    /// stacked in mount order inside their placement's rectangle, one row per line, exactly as
+    /// `render_extension_widgets` (`app/render.rs`) paints them, so the hit test and the
+    /// painter read one list. A row the rectangle clipped is not painted and is not hit.
+    pub(crate) fn widget_at(&self, at: Position) -> Option<(String, Position)> {
+        let regions = &self.state.regions;
+        let (rect, below) = if regions.widgets_above.contains(at) {
+            (regions.widgets_above, false)
+        } else if regions.widgets_below.contains(at) {
+            (regions.widgets_below, true)
+        } else {
+            return None;
+        };
+        let mut row = usize::from(at.y.saturating_sub(rect.y));
+        let column = at.x.saturating_sub(rect.x);
+        for widget in self
+            .state
+            .extension_widgets
+            .iter()
+            .filter(|w| w.below == below)
+        {
+            if row < widget.lines.len() {
+                let row = u16::try_from(row).unwrap_or(u16::MAX);
+                return Some((widget.key.clone(), Position::new(column, row)));
+            }
+            row -= widget.lines.len();
+        }
+        None
+    }
+
+    /// SUBA-210 — the async half of a clean click on an extension widget
+    /// ([`AppAction::ExtensionWidgetClick`]): ask the widget's owner
+    /// ([`cyrup_ext::ExtensionHost::widget_event`]) and finish the held release with its answer. A
+    /// widget that takes the click (the async-jobs card folding on its header row) has already
+    /// republished its lines; the selection is cleared and nothing is copied. A click it leaves
+    /// alone (another row, a modified click, a widget nobody answers for) is the selection's, so
+    /// a drag or a click over a widget's text still selects and copies it.
+    pub(crate) async fn offer_widget_click(
+        &mut self,
+        host: &cyrup_ext::ExtensionHost,
+        key: &str,
+        mouse: cyrup_ext::WidgetMouse,
+    ) -> AppAction {
+        let outcome = host
+            .widget_event(key, cyrup_ext::WidgetEvent::Mouse(mouse))
+            .await;
+        let taken =
+            (outcome == cyrup_ext::WidgetEventOutcome::Handled).then_some(AppAction::Redraw);
+        self.settle_selection_click(taken)
     }
 
     /// Hand `event` to the component `target` names, positions made local to its rectangle.

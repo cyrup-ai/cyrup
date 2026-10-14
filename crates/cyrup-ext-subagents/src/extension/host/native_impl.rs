@@ -882,6 +882,9 @@ impl NativeExtension for SubagentsExtension {
                     );
                     self.async_slot_occupied
                         .store(false, std::sync::atomic::Ordering::Release);
+                    if let Ok(mut last) = self.async_widget_last.lock() {
+                        *last = None;
+                    }
                 }
                 // The join. Everything above has run; this is the only thing left to wait for, and
                 // it is bounded so that a herdr which stopped answering ends this handler
@@ -1255,6 +1258,26 @@ impl NativeExtension for SubagentsExtension {
     /// `fleet_view_enabled` gate above.
     fn on_terminal_input(&self, data: &str) -> Option<cyrup_ext::TerminalInputResult> {
         self.dispatch_terminal_input(data)
+    }
+
+    /// SUBA-210 / SUBA-211 — the async-jobs card is a mounted component upstream
+    /// (`buildWidgetComponent`, `tui/render.ts:2911` @ad11b7ab): a plain click on its header row
+    /// folds it, and a resize relays it out. See
+    /// [`crate::extension::SubagentsExtension::handle_async_widget_event`]. The fleet-status widget
+    /// answers no pointer upstream, so its key, like any other, is left unhandled.
+    ///
+    /// Synchronous and non-blocking, as the trait requires: it re-renders from the rows the last
+    /// refresh edge published and republishes through the fire-and-forget `set_widget`.
+    fn on_widget_event(
+        &self,
+        key: &str,
+        event: cyrup_ext::WidgetEvent,
+    ) -> cyrup_ext::WidgetEventOutcome {
+        if key == crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY {
+            self.handle_async_widget_event(event)
+        } else {
+            cyrup_ext::WidgetEventOutcome::Unhandled
+        }
     }
 
     /// Late-bind the live capability backend (P-1, reconciliation §2 item 1). The session builder

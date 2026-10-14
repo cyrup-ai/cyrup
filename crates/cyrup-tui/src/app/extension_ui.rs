@@ -257,6 +257,10 @@ impl<B: Backend> App<B> {
         // every mode, including this one, and an extension that gates on editor focus would be
         // permanently inert.
         services.attach_editor_focus_mirror(self.state.editor_focus_mirror.clone());
+        // SUBA-211 — the terminal size an extension's widget is laid out against (pi's
+        // `process.stdout.rows`/`columns`). Attached here, with the other interactive readbacks,
+        // so it is re-attached against every swapped-in session; seeded by the publish below.
+        services.attach_terminal_size_mirror(self.state.terminal_size_mirror.clone());
         // EXT-064 — the footer's data seam (SEAM-T03), attached here for the same reason the two
         // editor mirrors are: `LiveHostServices::footer_data` otherwise keeps its trait default
         // `None` in every mode, including this one, so an extension's custom footer would have
@@ -301,6 +305,17 @@ impl<B: Backend> App<B> {
         // [`App::editor_has_keyboard_focus`].
         let has_focus = self.editor_has_keyboard_focus();
         self.state.editor_focus_mirror.publish(has_focus);
+        // SUBA-211 — the terminal as measured, never a guess: a backend that cannot report its
+        // size leaves the last published value (or none), and the extension applies pi's own
+        // `|| 30` / `|| 120` fallbacks to a `None`.
+        if let Ok(size) = self.terminal.backend().size() {
+            self.state
+                .terminal_size_mirror
+                .publish(cyrup_ext::TerminalSize {
+                    columns: size.width,
+                    rows: size.height,
+                });
+        }
         // TUI-126 — the four namespaces `HostServices::effective_keybindings` answers. Republished
         // per frame like the buffer above, because a `/keybindings` reload or a `merge_json` mutates
         // these in place and an extension must not be left holding the pre-rebind table.

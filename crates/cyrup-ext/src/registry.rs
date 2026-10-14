@@ -555,6 +555,15 @@ struct RegistryInner {
     /// one on a real change (`notifyBranchChange`, `:197-199`); a `Vec` reproduces the `Set.add`
     /// idempotence and fixes the order, and `unsubscribe` is upstream's `Set.delete`.
     branch_change_subscribers: Vec<ExtensionId>,
+    /// SUBA-210 — which extension published each mounted widget key, so the host can route the
+    /// widget's pointer and resize events ([`crate::WidgetEvent`]) back to it.
+    ///
+    /// pi keeps one shared widget map whose last write wins a key, and the component mounted under
+    /// it is the last writer's (`interactive-mode.ts` `setExtensionWidget`, which removes the key
+    /// before re-inserting it); a removal (`content: undefined`) unmounts it. So the last publish
+    /// owns the key and a removal forgets it, whoever makes it. Key-ordered, so a resize reaches
+    /// the widgets in one stable order.
+    widget_owner: std::collections::BTreeMap<String, ExtensionId>,
     /// Which extensions are replaceable built-ins and which of them were left out (pi
     /// `omitReplacedExtensions`, `core/resource-loader.ts:116-153` @v1.0.1). See
     /// [`crate::replaceable`].
@@ -1015,6 +1024,38 @@ impl ExtensionRegistry {
     /// cheap gate [`Self::has_terminal_input_subscribers`] is.
     pub fn has_branch_change_subscribers(&self) -> Result<bool, ExtError> {
         Ok(!self.lock_read()?.branch_change_subscribers.is_empty())
+    }
+
+    /// SUBA-210 — record one `set_widget` write: `present` makes `owner` the owner of `key`, a
+    /// removal forgets the key. The last write wins, as it does in pi's one shared widget map.
+    pub fn record_widget(
+        &self,
+        key: &str,
+        present: bool,
+        owner: &ExtensionId,
+    ) -> Result<(), ExtError> {
+        let mut g = self.lock_write()?;
+        if present {
+            g.widget_owner.insert(key.to_string(), owner.clone());
+        } else {
+            g.widget_owner.remove(key);
+        }
+        Ok(())
+    }
+
+    /// The extension that published the widget mounted under `key`, if one is.
+    pub fn widget_owner(&self, key: &str) -> Result<Option<ExtensionId>, ExtError> {
+        Ok(self.lock_read()?.widget_owner.get(key).cloned())
+    }
+
+    /// Every mounted widget key with its owner, in key order.
+    pub fn widget_owners(&self) -> Result<Vec<(String, ExtensionId)>, ExtError> {
+        Ok(self
+            .lock_read()?
+            .widget_owner
+            .iter()
+            .map(|(k, o)| (k.clone(), o.clone()))
+            .collect())
     }
 
     pub fn message_renderer_owner(
@@ -1925,6 +1966,8 @@ impl ExtensionRegistry {
         retain_not_owner!(bash_operations, |o: &ExtensionId| o != owner);
         retain_not_owner!(terminal_input_subscribers, |o: &ExtensionId| o != owner);
         retain_not_owner!(branch_change_subscribers, |o: &ExtensionId| o != owner);
+        // SUBA-210: a purged extension can no longer answer for a widget it published.
+        retain_not_owner!(widget_owner, |_: &String, o: &mut ExtensionId| o != owner);
         retain_not_owner!(tool_renderer_owner, |_: &String, o: &mut ExtensionId| o
             != owner);
         // EXT-107: a resolver goes with its owner, or `/reload` would leave a dead extension

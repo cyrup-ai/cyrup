@@ -196,3 +196,4 @@ mod tree_label_timestamp;
 mod tree_selector;
 mod turn_interleaving;
 mod use_theme_override;
+mod widget_pointer;

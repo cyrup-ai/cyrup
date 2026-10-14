@@ -187,6 +187,7 @@ pub mod subscriber;
 pub mod tool_renderer;
 pub mod ui_prompt;
 pub mod virtual_model;
+pub mod widget;
 pub mod word_nav;
 pub mod wrapper;
 
@@ -269,6 +270,9 @@ pub use tool_renderer::{
 };
 pub use ui_prompt::{UiPromptGuard, UiPromptKind, UiPromptTracker};
 pub use virtual_model::{VirtualModelFlushError, VirtualModelHub};
+pub use widget::{
+    PointerModifiers, TerminalSize, WidgetEvent, WidgetEventOutcome, WidgetMouse, WidgetPointer,
+};
 pub use wrapper::{
     ActiveToolNames, RegisteredTool, wrap_registered_tool, wrap_registered_tool_with_nested,
 };

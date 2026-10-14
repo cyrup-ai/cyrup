@@ -767,6 +767,40 @@ impl EditorFocusMirror {
     }
 }
 
+/// The interactive terminal's size (SUBA-211) — the source behind
+/// [`HostServices::terminal_size`], i.e. pi's `process.stdout.columns` / `.rows`, which
+/// `pi-subagents`' async-jobs widget reads on every render (`src/tui/render.ts:2536-2547`
+/// @ad11b7ab) to choose its tier.
+///
+/// A sibling of [`EditorFocusMirror`], for the reason that one gives: the value lives in the
+/// interactive app's own state and is published from it. The app publishes it from the same
+/// `App::publish_extension_readbacks` choke point, and ALSO on a terminal resize BEFORE it tells
+/// the widgets' owners (`cyrup_ext::ExtensionHost::terminal_resized`), so an extension that
+/// republishes in answer to the resize reads the new size rather than the last frame's.
+///
+/// Unattached (`None` on [`LiveHostServices`]) in every non-interactive mode, where
+/// [`HostServices::terminal_size`] keeps its trait default `None` and the caller applies pi's own
+/// `|| 30` / `|| 120` fallbacks; also `None` until the first publish.
+#[derive(Clone, Debug, Default)]
+pub struct TerminalSizeMirror(Arc<Mutex<Option<cyrup_ext::TerminalSize>>>);
+
+impl TerminalSizeMirror {
+    /// A fresh mirror, holding no size until the app publishes one.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish the terminal's current size.
+    pub fn publish(&self, size: cyrup_ext::TerminalSize) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(size);
+    }
+
+    /// The last size published, if any.
+    pub fn size(&self) -> Option<cyrup_ext::TerminalSize> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// pi's synthetic `SourceInfo` for a tool the extension registry does not own — the value
 /// `createSyntheticSourceInfo("<builtin:NAME>", { source: "builtin" })` produces
 /// (`core/agent-session.ts:2478`, defaults from `core/source-info.ts:24-40` @v0.83.0: scope
@@ -1177,6 +1211,10 @@ pub struct LiveHostServices {
     /// `None` outside the interactive TUI, where [`HostServices::editor_has_focus`] keeps its
     /// trait default `false`. See [`EditorFocusMirror`].
     editor_focus_mirror: Mutex<Option<EditorFocusMirror>>,
+    /// SUBA-211 — the interactive terminal's size, attached by
+    /// [`Self::attach_terminal_size_mirror`]. `None` outside the interactive TUI, where
+    /// [`HostServices::terminal_size`] keeps its trait default `None`. See [`TerminalSizeMirror`].
+    terminal_size_mirror: Mutex<Option<TerminalSizeMirror>>,
     /// The host-owned inter-extension event bus (Pi's single `createEventBus()`, threaded onto
     /// every `ExtensionAPI` at `extensions/loader.ts:389` @v0.83.0), attached post-build via
     /// [`Self::attach_event_bus`] — the `ExtensionHost` that owns it is built AFTER this backend,
@@ -1339,6 +1377,7 @@ impl LiveHostServices {
             footer_data_mirror: Mutex::new(None),
             editor_mirror: Mutex::new(None),
             editor_focus_mirror: Mutex::new(None),
+            terminal_size_mirror: Mutex::new(None),
             event_bus: Mutex::new(None),
             provider_swap: Mutex::new(None),
             ui_prompts: Mutex::new(None),
@@ -1549,6 +1588,13 @@ impl LiveHostServices {
     /// for the same reasons [`Self::attach_editor_mirror`] is.
     pub fn attach_editor_focus_mirror(&self, mirror: EditorFocusMirror) {
         *Self::lock(&self.editor_focus_mirror) = Some(mirror);
+    }
+
+    /// Attach the interactive terminal's size cell (SUBA-211) — the source behind
+    /// [`HostServices::terminal_size`]. Interactive TUI only, and re-run on every session swap,
+    /// for the same reasons [`Self::attach_editor_mirror`] is.
+    pub fn attach_terminal_size_mirror(&self, mirror: TerminalSizeMirror) {
+        *Self::lock(&self.terminal_size_mirror) = Some(mirror);
     }
 
     /// Attach the command-tier control sink (the runtime owns it once the session is live).
@@ -2164,6 +2210,15 @@ impl HostServices for LiveHostServices {
         Self::lock(&self.editor_focus_mirror)
             .clone()
             .is_some_and(|m| m.has_focus())
+    }
+
+    /// SUBA-211 — pi `process.stdout.columns` / `.rows`. A shared cell the interactive app
+    /// publishes each frame and on every resize, unattached (and so `None`) in every other mode.
+    /// See [`TerminalSizeMirror`].
+    fn terminal_size(&self) -> Option<cyrup_ext::TerminalSize> {
+        Self::lock(&self.terminal_size_mirror)
+            .clone()
+            .and_then(|m| m.size())
     }
 
     // --- the theme family (SEAM-T01) ---

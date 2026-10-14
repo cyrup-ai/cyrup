@@ -221,14 +221,23 @@ impl<B: Backend> App<B> {
                 self.state.editor.handle_paste(s);
                 AppAction::Redraw
             }
-            InputEvent::Resize(_, _) => {
+            InputEvent::Resize(columns, rows) => {
                 // A resize is the alternate screen's full redraw, and kitty placements do not live
                 // in ratatui's buffer, so they must be unpinned before the repaint lands on top of
                 // them — pi's `fullRedraw` image arm (`tui-alt-screen.ts:1310-1316`).
                 if let Some(alt) = self.altscreen.as_mut() {
                     alt.handle_resize();
                 }
-                AppAction::Redraw
+                // SUBA-211 — pi's mounted widgets re-render on a resize and read the new
+                // `process.stdout.rows`/`columns` there. The size is published FIRST, so a widget
+                // that republishes in answer to the resize lays itself out against it; the owners
+                // are then told through the run loop, which can await them.
+                let size = cyrup_ext::TerminalSize {
+                    columns: *columns,
+                    rows: *rows,
+                };
+                self.state.terminal_size_mirror.publish(size);
+                AppAction::ExtensionWidgetsResized(size)
             }
             // ADR-0005 §B-6/§B-7/§B-8 — the alternate screen's pointer surface. Reports only reach
             // here while it is live (`altscreen::mouse::map_reader_event`'s gate), so the `None`
@@ -285,7 +294,7 @@ impl<B: Backend> App<B> {
                     // A click that began a selection on the screen: the component under the cell
                     // may take it (the editor places its caret), else the release copies.
                     crate::altscreen::PointerOutcome::Click { at, count } => {
-                        self.complete_selection_click(at, count)
+                        self.complete_selection_click(at, count, m.modifiers)
                     }
                     crate::altscreen::PointerOutcome::Toggle(hit) => {
                         alt.anchor_toggle(hit, &self.state.transcript);

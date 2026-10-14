@@ -2400,6 +2400,76 @@ impl ExtensionHost {
         }
     }
 
+    /// The extension that published the widget mounted under `key`, if one is (SUBA-210). The
+    /// owner is recorded on every `set_widget` the host sees from a native
+    /// ([`crate::host::CallerScopedServices`]) or a guest (the `ui.set-widget` import).
+    pub fn widget_owner(&self, key: &str) -> Option<ExtensionId> {
+        self.registry.widget_owner(key).ok().flatten()
+    }
+
+    /// Deliver one [`crate::WidgetEvent`] to the extension that owns the widget `key` and return
+    /// its answer (SUBA-210, SUBA-211) — pi's `component.handleMouse(event)` on a mounted widget,
+    /// and the re-render a resize gives it. See [`crate::widget`] for the contract.
+    ///
+    /// A key no extension owns answers [`crate::WidgetEventOutcome::Unhandled`]: the click stays
+    /// the text selection's. A faulting or panicking owner is CONTAINED and answers `Unhandled`
+    /// too, for [`Self::terminal_input`]'s reason — this is awaited on the TUI's input path, and
+    /// a broken extension must not be able to take a click (or the frame) with it.
+    pub async fn widget_event(
+        &self,
+        key: &str,
+        event: crate::WidgetEvent,
+    ) -> crate::WidgetEventOutcome {
+        let Some(owner) = self.widget_owner(key) else {
+            return crate::WidgetEventOutcome::Unhandled;
+        };
+        if let Some(native) = self.native.read().ok().and_then(|g| g.get(&owner).cloned()) {
+            return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                native.on_widget_event(key, event)
+            })) {
+                Ok(outcome) => outcome,
+                Err(panic) => {
+                    tracing::warn!(
+                        extension = %owner, widget = key, error = %native_panic_msg(panic),
+                        "native widget-event handler panicked (the event is left unhandled)"
+                    );
+                    crate::WidgetEventOutcome::Unhandled
+                }
+            };
+        }
+        #[cfg(feature = "wasm-host")]
+        {
+            let Some(ext) = self.live.read().ok().and_then(|g| g.get(&owner).cloned()) else {
+                return crate::WidgetEventOutcome::Unhandled;
+            };
+            return match ext.handle_widget_event(key, event).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::warn!(
+                        extension = %owner, widget = key, error = %e,
+                        "widget-event handler contained (the event is left unhandled)"
+                    );
+                    crate::WidgetEventOutcome::Unhandled
+                }
+            };
+        }
+        #[cfg(not(feature = "wasm-host"))]
+        crate::WidgetEventOutcome::Unhandled
+    }
+
+    /// The terminal was resized (SUBA-211): tell every mounted widget's owner, once per widget, in
+    /// key order. pi re-renders each mounted component on a resize, and its widget reads the new
+    /// `process.stdout.rows`/`columns` there; a cyrup widget hands over lines once, so it is told
+    /// and republishes. The size itself is read through
+    /// [`crate::host::HostServices::terminal_size`], which the TUI updates BEFORE calling this.
+    pub async fn terminal_resized(&self, size: crate::TerminalSize) {
+        let widgets = self.registry.widget_owners().unwrap_or_default();
+        for (key, _owner) in widgets {
+            self.widget_event(&key, crate::WidgetEvent::Resize(size))
+                .await;
+        }
+    }
+
     pub fn registry(&self) -> &ExtensionRegistry {
         &self.registry
     }

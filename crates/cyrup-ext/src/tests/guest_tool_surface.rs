@@ -1,6 +1,6 @@
 //! CODE-015 / CODE-017 and the structured result of a guest tool, at the host seam.
 //!
-//! A hand-built `cyrup:ext@0.20` component (`wat_guest`) registers a tool through
+//! A hand-built `cyrup:ext@0.21` component (`wat_guest`) registers a tool through
 //! `registration.register-tool` and answers `execute-tool` / `prepare-loadout`, so what is under
 //! test is the host's lift of the `tool-descriptor` record, its read of the `tool-output` record
 //! and its call of the `prepare-loadout` export, with no `wasm32-wasip2` toolchain. The SDK-built

@@ -74,6 +74,7 @@ pub use api::{
     RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool,
     RegisteredToolRenderer, RegistrationError, RenderOptions, ShortcutExec, TerminalInputHandler,
     TerminalInputResult, ToolExec, ToolOutput, ToolRendererMode, Unsubscribe, VirtualModelRouter,
+    WidgetEventHandler,
 };
 pub use autocomplete::{
     AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
@@ -98,7 +99,10 @@ pub use provider::{
     OAuthCallbacks, OAuthCredentials, OAuthProvider, ProviderHandlers, ProviderStream, StreamSimple,
 };
 pub use tool_factory::define_tool;
-pub use widget::WidgetPlacement;
+pub use widget::{
+    PointerModifiers, TerminalSize, WidgetEvent, WidgetEventOutcome, WidgetMouse, WidgetPlacement,
+    WidgetPointer,
+};
 
 /// The author-facing import surface: `use cyrup_ext_sdk::prelude::*;`.
 ///
@@ -114,7 +118,7 @@ pub mod prelude {
         RegisteredCommand, RegisteredRenderer, RegisteredShortcut, RegisteredTool,
         RegisteredToolRenderer, RegistrationError, RenderOptions, ShortcutExec,
         TerminalInputHandler, TerminalInputResult, ToolExec, ToolOutput, ToolRendererMode,
-        Unsubscribe, VirtualModelRouter,
+        Unsubscribe, VirtualModelRouter, WidgetEventHandler,
     };
     pub use crate::autocomplete::{
         AutocompleteItem, AutocompleteProvider, AutocompleteQuery, AutocompleteSuggestions,
@@ -146,7 +150,10 @@ pub mod prelude {
     /// `pub use` twin for this one: `pub mod widget;` already makes `cyrup_ext_sdk::widget`
     /// nameable there.
     pub use crate::widget;
-    pub use crate::widget::WidgetPlacement;
+    pub use crate::widget::{
+        PointerModifiers, TerminalSize, WidgetEvent, WidgetEventOutcome, WidgetMouse,
+        WidgetPlacement, WidgetPointer,
+    };
 }
 
 /// The factory the wasm guest `init` calls to build the extension (arch-08 §3.6). This crate ships

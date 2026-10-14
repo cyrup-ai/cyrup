@@ -223,6 +223,27 @@ impl App<InlineBackend<TuiStdout>> {
                     }
                 });
             }
+            AppAction::ExtensionWidgetClick { key, mouse } => {
+                // SUBA-210 — awaited HERE, not spawned: whether the click is the widget's or the
+                // text selection's decides whether the release copies, and that answer is needed
+                // now. A native handler must not block (`NativeExtension::on_widget_event`'s
+                // contract, the `on_terminal_input` hazard); the widget's republish is a
+                // fire-and-forget `set_widget` that the ui-effect arm paints.
+                let ext_host = ctx.session.services().ext_host.clone();
+                if let AppAction::CopySelection(text) =
+                    self.offer_widget_click(&ext_host, &key, mouse).await
+                {
+                    let result = crate::clipboard::copy_to_clipboard(&text).await;
+                    let (message, dwell) = copy_flash_for(&result);
+                    self.renderer_mut().flash(message, dwell);
+                }
+            }
+            AppAction::ExtensionWidgetsResized(size) => {
+                // SUBA-211 — tell every mounted widget's owner; each republishes for the new size
+                // through `set_widget`, which the ui-effect arm paints.
+                let ext_host = ctx.session.services().ext_host.clone();
+                ext_host.terminal_resized(size).await;
+            }
             AppAction::Redraw | AppAction::None => {}
         }
         // EXT-006 — the display inputs an extension renderer runs under (`options.expanded`, the

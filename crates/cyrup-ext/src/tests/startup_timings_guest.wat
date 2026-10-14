@@ -1,4 +1,4 @@
-;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.20.0`
+;; AGENT-027 fixture: the smallest component that instantiates against the `cyrup:ext@0.21.0`
 ;; `extension` world and whose `init` succeeds, so the host reaches its `${path} factory` timing mark.
 ;; It imports nothing and exports every `events` function plus `init`. Each export returns a
 ;; pointer to zeroed memory, which the canonical ABI reads as the first case / empty value
@@ -63,6 +63,10 @@
     (func (export "on-session-shutdown") (param i32 i32 i32 i32 i32))
     (func (export "on-session-info-changed") (param i32 i32 i32))
     (func (export "on-branch-change") (param i32 i32 i32))
+    ;; `handle-widget-event(key, event) -> widget-event-outcome`: the key's two words, then the
+    ;; `widget-event` variant flattened to its discriminant plus the 7-word join of its cases. The
+    ;; enum result is returned flat, and 0 is `unhandled`.
+    (func (export "handle-widget-event") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32) i32.const 0)
     (func (export "on-ui-prompt-start") (param i32 i32 i32 i32 i32))
     (func (export "on-ui-prompt-end") (param i32 i32 i32 i32 i32))
     (func (export "on-resources-discover") (param i32 i32 i32 i32) (result i32) i32.const 16)
@@ -88,6 +92,24 @@
   (export $tool-output "tool-output" (type $tool-output'))
   (type $terminal-input-result' (record (field "consume" (option bool)) (field "data" (option string))))
   (export $terminal-input-result "terminal-input-result" (type $terminal-input-result'))
+  (type $terminal-size' (record (field "columns" u16) (field "rows" u16)))
+  (export $terminal-size "terminal-size" (type $terminal-size'))
+  (type $pointer-modifiers' (record (field "shift" bool) (field "alt" bool) (field "ctrl" bool)))
+  (export $pointer-modifiers "pointer-modifiers" (type $pointer-modifiers'))
+  (type $widget-cell' (record (field "column" u16) (field "row" u16)))
+  (export $widget-cell "widget-cell" (type $widget-cell'))
+  (type $widget-click' (record (field "column" u16) (field "row" u16) (field "count" u8)))
+  (export $widget-click "widget-click" (type $widget-click'))
+  (type $widget-wheel' (record (field "column" u16) (field "row" u16) (field "lines" s32)))
+  (export $widget-wheel "widget-wheel" (type $widget-wheel'))
+  (type $widget-pointer' (variant (case "press" $widget-cell) (case "click" $widget-click) (case "wheel" $widget-wheel)))
+  (export $widget-pointer "widget-pointer" (type $widget-pointer'))
+  (type $widget-mouse' (record (field "pointer" $widget-pointer) (field "modifiers" $pointer-modifiers)))
+  (export $widget-mouse "widget-mouse" (type $widget-mouse'))
+  (type $widget-event' (variant (case "mouse" $widget-mouse) (case "resize" $terminal-size)))
+  (export $widget-event "widget-event" (type $widget-event'))
+  (type $widget-event-outcome' (enum "unhandled" "handled"))
+  (export $widget-event-outcome "widget-event-outcome" (type $widget-event-outcome'))
   (func $init  (result (result (error string)))
     (canon lift (core func $i "init") (memory $mem) (realloc $realloc)))
   (func $provider-login (param "id" string) (result (result string (error string)))
@@ -184,6 +206,8 @@
     (canon lift (core func $i "on-session-info-changed") (memory $mem) (realloc $realloc)))
   (func $on-branch-change (param "branch" (option string))
     (canon lift (core func $i "on-branch-change") (memory $mem) (realloc $realloc)))
+  (func $handle-widget-event (param "key" string) (param "event" $widget-event) (result $widget-event-outcome)
+    (canon lift (core func $i "handle-widget-event") (memory $mem) (realloc $realloc)))
   (func $on-ui-prompt-start (param "kind" string) (param "title" (option string))
     (canon lift (core func $i "on-ui-prompt-start") (memory $mem) (realloc $realloc)))
   (func $on-ui-prompt-end (param "kind" string) (param "title" (option string))
@@ -258,6 +282,7 @@
     (export "on-session-shutdown" (func $on-session-shutdown))
     (export "on-session-info-changed" (func $on-session-info-changed))
     (export "on-branch-change" (func $on-branch-change))
+    (export "handle-widget-event" (func $handle-widget-event))
     (export "on-ui-prompt-start" (func $on-ui-prompt-start))
     (export "on-ui-prompt-end" (func $on-ui-prompt-end))
     (export "on-resources-discover" (func $on-resources-discover))
@@ -272,6 +297,6 @@
     (export "on-session-tree" (func $on-session-tree))
     (export "bus-deliver" (func $bus-deliver))
   )
-  (export "cyrup:ext/events@0.20.0" (instance $events))
+  (export "cyrup:ext/events@0.21.0" (instance $events))
   (export "init" (func $init))
 )

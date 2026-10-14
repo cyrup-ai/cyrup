@@ -412,7 +412,7 @@ mod wasm {
     };
 
     /// The `host-tool` import, declaring the two functions this change adds.
-    const HOST_TOOL_IMPORT: &str = r#"  (import "cyrup:ext/host-tool@0.20.0" (instance $ht
+    const HOST_TOOL_IMPORT: &str = r#"  (import "cyrup:ext/host-tool@0.21.0" (instance $ht
     (type $eo (record (field "collect-updates" bool) (field "signal-id" (option string)) (field "timeout-ms" (option u32))))
     (export "execute-options" (type $eo-x (eq $eo)))
     (export "execute-tool" (func (param "call-id" string) (param "name" string) (param "args-json" string) (param "options" $eo-x) (result (result (tuple string (list string)) (error string)))))

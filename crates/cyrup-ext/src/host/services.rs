@@ -564,6 +564,22 @@ pub trait HostServices: Send + Sync {
         false
     }
 
+    /// The terminal's size in cells — pi `process.stdout.columns` / `process.stdout.rows`, which
+    /// an upstream widget reads on every render (`pi-subagents/src/tui/render.ts:2536-2547`
+    /// @ad11b7ab) to pick its tier and to relock when the terminal is resized (SUBA-211).
+    ///
+    /// An extension is told when this changes through [`crate::WidgetEvent::Resize`], delivered
+    /// to every widget it owns; this is the read for its FIRST publish and for any publish an
+    /// event of its own drives.
+    ///
+    /// `None` — not a guessed size — is "no terminal attached", which is every mode but the
+    /// interactive TUI. pi's own fallback there is `process.stdout.rows || 30` /
+    /// `columns || 120` (`:2537`, `:2542`, `:2546`), and the caller applies it: a guess made here
+    /// could not be told apart from a measurement.
+    fn terminal_size(&self) -> Option<crate::TerminalSize> {
+        None
+    }
+
     /// EXT-064 — the read half of pi's `ReadonlyFooterDataProvider`, the value upstream hands the
     /// `setFooter` factory as its third argument
     /// (`setFooter(factory: (tui, theme, footerData) => Component)`,

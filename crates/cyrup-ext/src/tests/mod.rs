@@ -66,5 +66,7 @@ mod virtual_models;
 mod wasm_host;
 #[cfg(feature = "wasm-host")]
 mod wat_guest;
+#[cfg(feature = "wasm-host")]
+mod widget_events;
 mod wit_world_sync;
 mod word_nav;

@@ -362,6 +362,12 @@ pub struct AppState {
     /// [`App::editor_has_keyboard_focus`](crate::App::editor_has_keyboard_focus) for what is
     /// published and why it is NOT terminal-window focus.
     pub(super) editor_focus_mirror: cyrup_session_svc::EditorFocusMirror,
+    /// SUBA-211 — the terminal's size as an extension reads it (`HostServices::terminal_size`,
+    /// pi's `process.stdout.rows`/`columns`). Published by [`App::publish_extension_readbacks`]
+    /// every frame and by the `InputEvent::Resize` arm before the widgets' owners are told of the
+    /// resize, so a widget that republishes in answer reads the new size. Attached to the live
+    /// backend by [`App::install_extension_readbacks`].
+    pub(super) terminal_size_mirror: cyrup_session_svc::TerminalSizeMirror,
     /// EXT-064 — the footer's extension-visible data (SEAM-T03): pi's `FooterDataProvider` as the
     /// cell an extension pulls through `ctx.ui.footer_data()`. The git branch and the provider
     /// count are published into it by [`App::publish_extension_readbacks`] from
@@ -686,6 +692,7 @@ impl AppState {
             pending_ui_reply: None,
             editor_mirror: cyrup_session_svc::EditorTextMirror::new(),
             editor_focus_mirror: cyrup_session_svc::EditorFocusMirror::new(),
+            terminal_size_mirror: cyrup_session_svc::TerminalSizeMirror::new(),
             footer_data_mirror: cyrup_session_svc::FooterDataMirror::new(),
             theme_access: None,
             theme_controller: None,

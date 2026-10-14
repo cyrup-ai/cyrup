@@ -143,6 +143,7 @@ impl SubagentsExtension {
         // NOTHING — not even a clear — unless the slot still holds what an earlier edge published.
         if tracked.is_empty() {
             self.reset_async_widget_session();
+            self.forget_async_human_widget();
             if self
                 .async_slot_occupied
                 .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -165,6 +166,7 @@ impl SubagentsExtension {
         // [`cyrup_ext::host::HostServices::set_widget`]'s fire-and-forget payload does not have.
         if jobs.is_empty() {
             self.reset_async_widget_session();
+            self.forget_async_human_widget();
             // `:2995` — the clear itself, and only the clear, is behind `ctx.hasUI`.
             if has_ui {
                 services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, None, placement);
@@ -175,10 +177,12 @@ impl SubagentsExtension {
         }
         // `:2998` — with no UI there is no widget slot to write to at all.
         if !has_ui {
+            self.forget_async_human_widget();
             return;
         }
         // `:2999-3002` — the RPC branch: the reader is a machine.
         if mode == cyrup_ext::ExtMode::Rpc {
+            self.forget_async_human_widget();
             let lines = encode_async_status_snapshot_widget(
                 jobs,
                 &AsyncStatusSnapshotOptions {
@@ -196,19 +200,52 @@ impl SubagentsExtension {
             .iter()
             .map(|job| crate::tui::events::AsyncJobSnapshot::from_run_view(job))
             .collect();
+        self.render_async_human_widget(services, rows, placement, services.terminal_size());
+    }
+
+    /// Render the human async-jobs card from `rows` and publish it — pi's mounted
+    /// `buildWidgetComponent` render (`tui/render.ts:2950-3008` @ad11b7ab), whole. Called by the
+    /// refresh edge above, and by `NativeExtension::on_widget_event` (SUBA-210, SUBA-211) when a
+    /// header click folds the card or the terminal is resized, which re-render from the rows the
+    /// last edge published, as pi's component re-renders from the `jobs` it holds.
+    ///
+    /// `terminal` is pi's `process.stdout.rows`/`columns` (`:2536-2547`): the host's measured
+    /// terminal ([`cyrup_ext::host::HostServices::terminal_size`]), or the size a resize event
+    /// carried. `None` — no terminal attached — falls back to upstream's own `|| 30` / `|| 120`.
+    pub(crate) fn render_async_human_widget(
+        &self,
+        services: &dyn cyrup_ext::host::HostServices,
+        rows: Vec<crate::tui::events::AsyncJobSnapshot>,
+        placement: cyrup_ext::host::WidgetPlacement,
+        terminal: Option<cyrup_ext::TerminalSize>,
+    ) {
+        use crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY;
         // The spinner frame, from the wall clock (upstream's own widget animates on a timer).
         let tick = usize::try_from(crate::time::now_epoch_millis() / 120).unwrap_or(0);
-        // SUBA-162 — pi's mounted widget reads `process.stdout.rows`/`columns` and
-        // `ui.getToolsExpanded()` (`render.ts:2541-2547,2950` @ad11b7ab). The host exposes no
-        // terminal size to an extension, so upstream's own `|| 30` / `|| 120` fallbacks stand in.
+        // SUBA-211 — pi's mounted widget reads `process.stdout.rows`/`columns` and
+        // `ui.getToolsExpanded()` (`render.ts:2541-2547,2950` @ad11b7ab). A zero dimension is
+        // pi's falsy `0`, which its `||` also replaces with the fallback.
+        let (term_rows, term_columns) = terminal
+            .map(|size| (usize::from(size.rows), usize::from(size.columns)))
+            .unwrap_or((0, 0));
         let view = crate::tui::events::AsyncWidgetRender {
             viewport: crate::tui::render::AsyncWidgetViewport {
-                rows: crate::tui::render::ASYNC_WIDGET_FALLBACK_ROWS,
-                columns: crate::tui::render::ASYNC_WIDGET_FALLBACK_COLUMNS,
+                rows: if term_rows == 0 {
+                    crate::tui::render::ASYNC_WIDGET_FALLBACK_ROWS
+                } else {
+                    term_rows
+                },
+                columns: if term_columns == 0 {
+                    crate::tui::render::ASYNC_WIDGET_FALLBACK_COLUMNS
+                } else {
+                    term_columns
+                },
                 expanded: services.tools_expanded(),
             },
             layout: self.async_widget_layout,
-            collapsed: self.async_widget_collapsed,
+            collapsed: self
+                .async_widget_collapsed
+                .load(std::sync::atomic::Ordering::Acquire),
         };
         let rendered = match self.async_widget_session.lock() {
             Ok(mut session) => {
@@ -218,9 +255,60 @@ impl SubagentsExtension {
             Err(_) => crate::tui::events::render_async_jobs_widget(&rows, &view, &mut None, tick),
         };
         let lines = crate::tui::render::lines_to_plain_text(&rendered);
+        if let Ok(mut last) = self.async_widget_last.lock() {
+            *last = Some((rows, placement));
+        }
         services.set_widget(ASYNC_STATUS_SNAPSHOT_WIDGET_KEY, Some(&lines), placement);
         self.async_slot_occupied
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// SUBA-210 / SUBA-211 — the async-jobs card's half of pi's mounted widget component:
+    /// `handleMouse` (`tui/render.ts:2938-2944` @ad11b7ab) and the re-render a resize gives it.
+    ///
+    /// * A plain left click on row 0 (no shift, alt or ctrl) flips the folded state, drops the
+    ///   layout session — pi's `invalidate()` calls `resetWidgetLayoutSession()` (`:2920-2924`), so
+    ///   the progressive card relocks — and republishes. Any other pointer event is not the
+    ///   card's: it stays the text selection's.
+    /// * A resize republishes against the new size. The layout session is NOT dropped here: pi's
+    ///   `widgetSessionMatches` (`:2549-2553`) compares the session's rows and columns with the
+    ///   terminal's on the next render and relocks when either moved, and
+    ///   [`crate::tui::render::fit_adaptive_widget_lines`] applies the same rule.
+    ///
+    /// Both re-render from the rows the last refresh edge published, so nothing here reads the
+    /// fleet or blocks. With no human card published (RPC mode, an empty slot) there is nothing to
+    /// fold or relay out, and the event is left unhandled.
+    pub(crate) fn handle_async_widget_event(
+        &self,
+        event: cyrup_ext::WidgetEvent,
+    ) -> cyrup_ext::WidgetEventOutcome {
+        let Some(services) = self.executor.host_services() else {
+            return cyrup_ext::WidgetEventOutcome::Unhandled;
+        };
+        let Some((rows, placement)) = self
+            .async_widget_last
+            .lock()
+            .ok()
+            .and_then(|last| last.clone())
+        else {
+            return cyrup_ext::WidgetEventOutcome::Unhandled;
+        };
+        let terminal = match event {
+            // pi `if (event.type !== "click" || event.button !== "left" || event.y !== 0) return
+            // undefined; if (event.shift || event.alt || event.ctrl) return undefined;`
+            cyrup_ext::WidgetEvent::Mouse(mouse) if mouse.is_plain_click_on_row(0) => {
+                // `collapsed = !collapsed; invalidate();`
+                self.async_widget_collapsed
+                    .fetch_xor(true, std::sync::atomic::Ordering::AcqRel);
+                self.reset_async_widget_session();
+                self.forget_async_human_widget();
+                services.terminal_size()
+            }
+            cyrup_ext::WidgetEvent::Mouse(_) => return cyrup_ext::WidgetEventOutcome::Unhandled,
+            cyrup_ext::WidgetEvent::Resize(size) => Some(size),
+        };
+        self.render_async_human_widget(services.as_ref(), rows, placement, terminal);
+        cyrup_ext::WidgetEventOutcome::Handled
     }
 
     /// SUBA-162 — pi `resetWidgetLayoutSession()` (`tui/render.ts:2532` @ad11b7ab), called by
@@ -228,6 +316,27 @@ impl SubagentsExtension {
     fn reset_async_widget_session(&self) {
         if let Ok(mut session) = self.async_widget_session.lock() {
             *session = None;
+        }
+    }
+
+    /// Test access to the async-jobs widget's layout session (SUBA-210 / SUBA-211): replace it, to
+    /// stand a stale lock in front of a fold or a resize, and read it back.
+    #[cfg(test)]
+    pub(crate) fn replace_async_widget_session(
+        &self,
+        session: Option<crate::tui::render::WidgetLayoutSession>,
+    ) -> Option<crate::tui::render::WidgetLayoutSession> {
+        self.async_widget_session
+            .lock()
+            .map(|mut current| std::mem::replace(&mut *current, session))
+            .unwrap_or(None)
+    }
+
+    /// Forget the rows the human card was last rendered from (SUBA-210): the slot no longer holds
+    /// a human card, so a late fold or resize must republish nothing.
+    fn forget_async_human_widget(&self) {
+        if let Ok(mut last) = self.async_widget_last.lock() {
+            *last = None;
         }
     }
 
@@ -286,6 +395,7 @@ impl SubagentsExtension {
         // (`asyncWidget: false`) AND the fleet view is off. A slot an earlier edge left occupied
         // still has to be CLEARED, which the branch below does without reading the fleet.
         if !self.fleet_view_enabled && !self.async_widget_enabled {
+            self.forget_async_human_widget();
             if self.async_slot_occupied.swap(false, Ordering::AcqRel) && has_ui {
                 services.set_widget(
                     crate::background::async_status_snapshot::ASYNC_STATUS_SNAPSHOT_WIDGET_KEY,

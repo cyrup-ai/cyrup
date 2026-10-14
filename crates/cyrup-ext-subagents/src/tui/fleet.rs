@@ -555,6 +555,7 @@ async fn read_candidate_views(
             description: None,
             context: None,
             nested_children: Vec::new(),
+            launch_roster: Default::default(),
         });
     }
     runs
@@ -2826,6 +2827,7 @@ mod tests {
             description: None,
             context: None,
             nested_children: Vec::new(),
+            launch_roster: Default::default(),
         }
     }
 
@@ -3362,6 +3364,7 @@ mod tests {
             description: None,
             context: None,
             nested_children: Vec::new(),
+            launch_roster: Default::default(),
         }
     }
 

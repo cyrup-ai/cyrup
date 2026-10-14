@@ -862,6 +862,36 @@ where
     }
 }
 
+/// The handler for one widget's events (SUBA-210, SUBA-211) — the guest half of pi's mounted
+/// widget COMPONENT: its `handleMouse` (`pi-subagents/src/tui/render.ts:2938-2944` @ad11b7ab) and
+/// the re-render a terminal resize gives it.
+///
+/// Called only for a key this extension published last through [`crate::ctx::Ui::set_widget`].
+/// A handler that changes what the widget shows republishes it through `ctx.ui().set_widget(..)`
+/// before returning. [`crate::widget::WidgetEventOutcome::Unhandled`] leaves a click to the text
+/// selection under it.
+pub trait WidgetEventHandler: 'static {
+    /// One event for the widget.
+    fn on_widget_event(
+        &self,
+        event: &crate::widget::WidgetEvent,
+        ctx: &Ctx,
+    ) -> crate::widget::WidgetEventOutcome;
+}
+
+impl<F> WidgetEventHandler for F
+where
+    F: Fn(&crate::widget::WidgetEvent, &Ctx) -> crate::widget::WidgetEventOutcome + 'static,
+{
+    fn on_widget_event(
+        &self,
+        event: &crate::widget::WidgetEvent,
+        ctx: &Ctx,
+    ) -> crate::widget::WidgetEventOutcome {
+        self(event, ctx)
+    }
+}
+
 impl<F> TerminalInputHandler for F
 where
     F: Fn(&str) -> Option<TerminalInputResult> + 'static,
@@ -992,6 +1022,11 @@ pub struct ExtensionApi {
     /// but the host's subscriber table is keyed by EXTENSION, so a guest with two callbacks would
     /// be notified once.
     pub(crate) branch_change_handler: Option<Box<dyn BranchChangeHandler>>,
+    /// SUBA-210 / SUBA-211: the handler for each widget key this extension answers for, the
+    /// guest half of pi's mounted widget component. Keyed like the widget map itself: the host
+    /// calls `handle-widget-event` with the key of a widget THIS extension published last.
+    pub(crate) widget_event_handlers:
+        std::collections::BTreeMap<String, Box<dyn WidgetEventHandler>>,
     pub(crate) autocomplete: Vec<String>,
     /// Stacked global autocomplete providers (Pi `addAutocompleteProvider`, sdk gap #2). Folded in
     /// registration order over the host's built-in suggestions by [`Self::autocomplete_suggest`].
@@ -1401,6 +1436,31 @@ impl ExtensionApi {
     /// `ui.subscribe-branch-change` import at init).
     pub fn has_branch_change_handler(&self) -> bool {
         self.branch_change_handler.is_some()
+    }
+
+    /// Answer the events of the widget published under `key` (SUBA-210, SUBA-211) — pi's mounted
+    /// widget component, whose `handleMouse` folds a card on a click and whose render reads the
+    /// terminal size. A second call for the same key REPLACES the first, as a second
+    /// `setWidget(key, …)` replaces the mounted component upstream.
+    pub fn on_widget_event(&mut self, key: impl Into<String>, handler: impl WidgetEventHandler) {
+        self.widget_event_handlers
+            .insert(key.into(), Box::new(handler));
+    }
+
+    /// Run the handler registered for widget `key` (the `handle-widget-event` export body).
+    /// [`crate::widget::WidgetEventOutcome::Unhandled`] when none is, so an unexpected call is
+    /// harmless and a click stays the text selection's.
+    pub fn handle_widget_event(
+        &self,
+        key: &str,
+        event: &crate::widget::WidgetEvent,
+        ctx: &Ctx,
+    ) -> crate::widget::WidgetEventOutcome {
+        self.widget_event_handlers
+            .get(key)
+            .map_or(crate::widget::WidgetEventOutcome::Unhandled, |h| {
+                h.on_widget_event(event, ctx)
+            })
     }
 
     /// Register a custom ENTRY renderer (Pi `pi.registerEntryRenderer(customType, renderer)`,

@@ -748,6 +748,9 @@ impl SubagentExecutor {
         // (`async-execution.ts:749-768,794-795` @v0.34.0), needed only for the `subagent.nested.started`
         // event's `agent`/`agents`/`chainStepCount` fields.
         let event_agents = plan_step_agent_names(&steps);
+        // SUBA-211 — pi `handleStarted`'s `agents` (`async-job-tracker.ts:731-737` @ad11b7ab): the
+        // launch's agents, cut to the parallel group that starts at step 0 when there is one.
+        let launch_roster = launch_roster_for(&steps, &event_agents);
         let event_step_count = i64::try_from(steps.len()).unwrap_or(i64::MAX);
         let event_mode_str = match mode {
             RunMode::Single => "single",
@@ -1185,8 +1188,37 @@ impl SubagentExecutor {
                 Some(std::time::SystemTime::now()),
             )
             .await;
+        // SUBA-211 — pi `handleStarted` seeds the job's `agents` from the launch
+        // (`async-job-tracker.ts:731-758` @ad11b7ab), so the widget and the fleet can count a run's
+        // agents before its `status.json` carries a step.
+        self.tracker.set_launch_roster(&run_id, launch_roster);
 
         Ok(run_id)
+    }
+}
+
+/// SUBA-211 — pi `handleStarted`'s roster (`runs/background/async-job-tracker.ts:731-737,760`
+/// @ad11b7ab): `rawAgents` is the launch's agent list, and when a parallel group starts at step 0
+/// only that group's members are kept (`rawAgents.slice(0, firstGroupCount)`) and the group is
+/// marked live (`activeParallelGroup`). cyrup's plan says which step is a group directly, so the
+/// first step's own members are taken rather than a prefix count.
+pub(crate) fn launch_roster_for(
+    steps: &[crate::spawn::chain_graph::RunnerStep],
+    agents: &[String],
+) -> crate::background::tracker::LaunchRoster {
+    match steps.first() {
+        Some(crate::spawn::chain_graph::RunnerStep::ParallelGroup(group))
+            if !group.steps.is_empty() =>
+        {
+            crate::background::tracker::LaunchRoster {
+                agents: group.steps.iter().map(|spec| spec.agent.clone()).collect(),
+                parallel_group: true,
+            }
+        }
+        _ => crate::background::tracker::LaunchRoster {
+            agents: agents.to_vec(),
+            parallel_group: false,
+        },
     }
 }
 

@@ -921,7 +921,17 @@ impl AsyncJobSnapshot {
             .and_then(|index| view.status.steps.get(index))
             .or_else(|| view.status.steps.first())
             .map(|step| step.agent.clone());
-        Self::from_run_status(&view.status, agent, view.context.unwrap_or_default())
+        let mut row = Self::from_run_status(&view.status, agent, view.context.unwrap_or_default());
+        // SUBA-211 — pi `AsyncJobState.agents` (`async-job-tracker.ts:731-760` @ad11b7ab): the
+        // launch roster [`crate::tui::render::running_leaf_agent_count`] synthesises steps from
+        // while the run reports none, and the launch-time `activeParallelGroup` that says every
+        // member of it is running. Once `status.json` carries steps they win, as pi's
+        // `summaryToJob` replaces both from the status (`:154-190`).
+        if view.status.steps.is_empty() {
+            row.agents = view.launch_roster.agents.clone();
+            row.active_parallel_group |= view.launch_roster.parallel_group;
+        }
+        row
     }
 
     /// Bridge this row to a [`SubagentProgressSnapshot`] — the input the pure
@@ -975,12 +985,10 @@ pub struct AsyncWidgetRender {
     pub viewport: AsyncWidgetViewport,
     /// pi `asyncWidgetLayout`.
     pub layout: AsyncWidgetLayout,
-    /// pi `collapsed` — the one-line card.
-    ///
-    /// \[CYRUP-DELTA] Upstream toggles this on a click on the widget's header row (`handleMouse`,
-    /// `render.ts:2937-2943`, `93d47c0c`/#2235). cyrup's widget seam carries lines only
-    /// (`cyrup_ext::host::HostServices::set_widget`) and the TUI hands a press on an extension
-    /// widget to text selection, so the value is the config's for the widget's whole life.
+    /// pi `collapsed` — the one-line card. Starts from `asyncWidgetCollapsed` and is flipped by a
+    /// plain click on the widget's header row (`handleMouse`, `render.ts:2938-2944` @ad11b7ab,
+    /// `93d47c0c`/#2235): SUBA-210 routes that click to the extension
+    /// (`cyrup_ext::NativeExtension::on_widget_event`), which owns the flag and re-renders.
     pub collapsed: bool,
 }
 

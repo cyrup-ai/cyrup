@@ -155,6 +155,24 @@ macro_rules! export_extension {
                 fn on_branch_change(branch: ::core::option::Option<::std::string::String>) {
                     $crate::guest::on_branch_change(branch)
                 }
+                // SUBA-210 / SUBA-211 — the guest half of pi's mounted widget component.
+                // Called only for a key this guest published last through `ui.set-widget`.
+                fn handle_widget_event(
+                    key: ::std::string::String,
+                    event: $crate::guest::bindings::cyrup::ext::types::WidgetEvent,
+                ) -> $crate::guest::bindings::cyrup::ext::types::WidgetEventOutcome {
+                    match $crate::guest::handle_widget_event(
+                        key,
+                        $crate::guest::widget_event_from_wit(event),
+                    ) {
+                        $crate::widget::WidgetEventOutcome::Handled => {
+                            $crate::guest::bindings::cyrup::ext::types::WidgetEventOutcome::Handled
+                        }
+                        $crate::widget::WidgetEventOutcome::Unhandled => {
+                            $crate::guest::bindings::cyrup::ext::types::WidgetEventOutcome::Unhandled
+                        }
+                    }
+                }
 
                 // --- provider OAuth + streamSimple + autocomplete stacking ---
                 fn provider_login(

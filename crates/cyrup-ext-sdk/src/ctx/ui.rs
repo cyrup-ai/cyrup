@@ -639,6 +639,25 @@ impl Ui {
         #[cfg(not(target_arch = "wasm32"))]
         false
     }
+    /// The terminal's size in cells (SUBA-211; pi `process.stdout.columns` / `.rows`; WIT
+    /// `ui.get-terminal-size`). `None` with no terminal attached — every mode but the interactive TUI —
+    /// and on the host (non-`wasm32`) target; pi's own fallback there is `|| 120` / `|| 30`.
+    /// A resize is pushed to the handler [`crate::api::ExtensionApi::on_widget_event`] registered
+    /// for each widget this extension published, as [`crate::widget::WidgetEvent::Resize`].
+    pub fn terminal_size(&self) -> Option<crate::widget::TerminalSize> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ui::get_terminal_size().map(|size| {
+                crate::widget::TerminalSize {
+                    columns: size.columns,
+                    rows: size.rows,
+                }
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        None
+    }
+
     /// Expand or collapse tool rows (Pi `setToolsExpanded(expanded)`, `types.ts:281` @v0.83.0; WIT
     /// `ui.set-tools-expanded`, `wit/world.wit:751`). Fire-and-forget; a no-op on the host
     /// (non-`wasm32`) target.

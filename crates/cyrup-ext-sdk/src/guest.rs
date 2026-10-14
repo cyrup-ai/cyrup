@@ -588,6 +588,59 @@ pub fn on_branch_change(branch: Option<String>) {
     });
 }
 
+/// `handle-widget-event` export body (SUBA-210, SUBA-211): the handler registered for `key`
+/// through [`crate::api::ExtensionApi::on_widget_event`], or `Unhandled` when none is.
+pub fn handle_widget_event(
+    key: String,
+    event: crate::widget::WidgetEvent,
+) -> crate::widget::WidgetEventOutcome {
+    let ctx = crate::ctx::Ctx::new();
+    API.with(|c| match c.borrow().as_ref() {
+        Some(api) => api.handle_widget_event(&key, &event, &ctx),
+        None => crate::widget::WidgetEventOutcome::Unhandled,
+    })
+}
+
+/// `types.widget-event` in the SDK's own types, field for field.
+pub fn widget_event_from_wit(
+    event: bindings::cyrup::ext::types::WidgetEvent,
+) -> crate::widget::WidgetEvent {
+    use bindings::cyrup::ext::types as wit;
+    match event {
+        wit::WidgetEvent::Mouse(mouse) => {
+            crate::widget::WidgetEvent::Mouse(crate::widget::WidgetMouse {
+                pointer: match mouse.pointer {
+                    wit::WidgetPointer::Press(c) => crate::widget::WidgetPointer::Press {
+                        column: c.column,
+                        row: c.row,
+                    },
+                    wit::WidgetPointer::Click(c) => crate::widget::WidgetPointer::Click {
+                        column: c.column,
+                        row: c.row,
+                        count: c.count,
+                    },
+                    wit::WidgetPointer::Wheel(w) => crate::widget::WidgetPointer::Wheel {
+                        column: w.column,
+                        row: w.row,
+                        lines: w.lines,
+                    },
+                },
+                modifiers: crate::widget::PointerModifiers {
+                    shift: mouse.modifiers.shift,
+                    alt: mouse.modifiers.alt,
+                    ctrl: mouse.modifiers.ctrl,
+                },
+            })
+        }
+        wit::WidgetEvent::Resize(size) => {
+            crate::widget::WidgetEvent::Resize(crate::widget::TerminalSize {
+                columns: size.columns,
+                rows: size.rows,
+            })
+        }
+    }
+}
+
 /// `provider-login` export body (Pi `oauth.login`): returns the credentials JSON to persist.
 pub fn provider_login(id: String) -> Result<String, String> {
     API.with(|c| match c.borrow().as_ref() {

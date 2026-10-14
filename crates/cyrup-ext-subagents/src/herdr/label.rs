@@ -448,6 +448,7 @@ mod tests {
             description: Some(SENTINEL.to_string()),
             context: None,
             nested_children: Vec::new(),
+            launch_roster: Default::default(),
         };
 
         let label = RunLabel::from_async_run(&view);
@@ -712,6 +713,7 @@ mod tests {
             description: None,
             context: None,
             nested_children: Vec::new(),
+            launch_roster: Default::default(),
         };
         let label = RunLabel::from_async_run(&view);
         assert_eq!(

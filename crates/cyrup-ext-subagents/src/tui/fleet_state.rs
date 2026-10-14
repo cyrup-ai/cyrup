@@ -415,6 +415,12 @@ pub struct AsyncRunView {
     pub context: Option<ContextMode>,
     /// pi `nestedChildren` (`fleet-status.ts:193,212`).
     pub nested_children: Vec<NestedRunView>,
+    /// SUBA-211 — pi `AsyncJobState.agents` and its launch-time `activeParallelGroup`, as
+    /// `handleStarted` seeds them (`runs/background/async-job-tracker.ts:731-760` @ad11b7ab). Read
+    /// only while [`Self::status`] carries no step: the async-jobs widget's header count and the
+    /// fleet's run-level entries both synthesise steps from it then, so the two read one value.
+    /// Default (empty) for a run this process did not launch.
+    pub launch_roster: crate::background::tracker::LaunchRoster,
 }
 
 impl AsyncRunView {
@@ -698,6 +704,7 @@ mod tests {
             description: None,
             context: None,
             nested_children: Vec::new(),
+            launch_roster: Default::default(),
         };
         assert_eq!(view.updated_at(), 2_000, "the run's own last_update");
         assert!(view.is_active(), "a Running run holds the roster row open");

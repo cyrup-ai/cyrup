@@ -350,7 +350,19 @@ impl Capabilities {
 ///   structuredContent`), re-signing `events.execute-tool`'s return; and `events.prepare-loadout`
 ///   is NEW. A 0.19 guest calls the imports at the old signature and exports no `prepare-loadout`,
 ///   so it fails to link and takes the bump.
-pub const HOST_WORLD: &str = "cyrup:ext@0.20";
+/// - 0.20, still 0.20: IMPORT ADDITION — `registration.register-tool-renderer` and the
+///   `tool-renderer-mode` enum only it uses (EXT-107; pi `pi.registerToolRenderer(resolver)`,
+///   `core/extensions/types.ts:1696` @f1b2e77f5). Not a bump, for the reason the
+///   `ctx-state.get-system-prompt-options` entry above gives.
+/// - 0.20 -> 0.21: EXPORT ADDITION — `events.handle-widget-event` (SUBA-210, SUBA-211), the guest
+///   half of pi's mounted widget COMPONENT (`pi-subagents/src/tui/render.ts:2911` @ad11b7ab): its
+///   `handleMouse` (`:2938-2944`) and the re-render a terminal resize gives it (`:2536-2553`). The
+///   host calls it on the guest that last published the widget's key, with a pointer event local
+///   to the widget or the new terminal size. A 0.20 guest exports nothing under that name — the
+///   fails-to-LINK direction — so it takes the bump on its own (the 0.16 -> 0.17 `route-model`
+///   precedent). The `ui.get-terminal-size` import (pi `process.stdout.rows`/`columns`) and the record
+///   and variant types the two carry are ADDITIVE and would not have required one.
+pub const HOST_WORLD: &str = "cyrup:ext@0.21";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

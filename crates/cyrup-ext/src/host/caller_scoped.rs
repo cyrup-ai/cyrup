@@ -142,6 +142,10 @@ impl HostServices for CallerScopedServices {
         self.inner.tools_expanded()
     }
 
+    fn terminal_size(&self) -> Option<crate::TerminalSize> {
+        self.inner.terminal_size()
+    }
+
     fn footer_data(&self) -> Option<String> {
         self.inner.footer_data()
     }
@@ -155,6 +159,15 @@ impl HostServices for CallerScopedServices {
     }
 
     fn set_widget(&self, key: &str, lines: Option<&[String]>, placement: WidgetPlacement) {
+        // SUBA-210 — the caller becomes the widget's owner, so the host can route the widget's
+        // pointer and resize events back to it (`crate::ExtensionHost::widget_event`). pi's widget
+        // map is one shared map whose last write wins the key (`interactive-mode.ts`
+        // `setExtensionWidget`), and the component mounted under a key is the last writer's; a
+        // removal unmounts it. Recorded BEFORE the write is forwarded, so a click that lands on the
+        // widget the instant it is painted already finds its owner.
+        let _ = self
+            .registry
+            .record_widget(key, lines.is_some(), &self.caller);
         self.inner.set_widget(key, lines, placement)
     }
 

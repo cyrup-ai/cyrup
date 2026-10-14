@@ -41,6 +41,13 @@ type IntercomSeamChannels = (
     Arc<dyn crate::tui::intercom::SteerChannel>,
 );
 
+/// SUBA-210 / SUBA-211 — the rows the human async-jobs card was last rendered from, and where it
+/// was placed: what a fold or a resize re-renders from.
+pub(crate) type AsyncWidgetRows = (
+    Vec<crate::tui::events::AsyncJobSnapshot>,
+    cyrup_ext::host::WidgetPlacement,
+);
+
 pub struct SubagentsExtension {
     id: ExtensionId,
     executor: Arc<SubagentExecutor>,
@@ -94,10 +101,20 @@ pub struct SubagentsExtension {
     /// construction for [`Self::fleet_view_enabled`]'s reason. Gates the async-jobs widget slot in
     /// BOTH modes, and is independent of the fleet view.
     async_widget_enabled: bool,
-    /// SUBA-162 — pi `asyncWidgetCollapsed` (`extension/index.ts:294` @ad11b7ab), captured at
-    /// construction for [`Self::fleet_view_enabled`]'s reason: the async-jobs widget starts (and,
-    /// with no click route to fold it, stays) as its one-line card.
-    async_widget_collapsed: bool,
+    /// SUBA-162 — pi `asyncWidgetCollapsed` (`extension/index.ts:294` @ad11b7ab), read at
+    /// construction for [`Self::fleet_view_enabled`]'s reason: the async-jobs widget STARTS as its
+    /// one-line card. SUBA-210 — and is then pi's `let collapsed = initiallyCollapsed` closure
+    /// variable (`tui/render.ts:2919`): a plain click on the widget's header row flips it
+    /// (`handleMouse`, `:2938-2944`; here `NativeExtension::on_widget_event`), and the flip lasts
+    /// for the extension's life, as pi's lasts until the widget unmounts.
+    async_widget_collapsed: Arc<std::sync::atomic::AtomicBool>,
+    /// SUBA-210 / SUBA-211 — what the human async-jobs widget was last rendered from: its rows and
+    /// its placement. pi's mounted component keeps its `jobs` and re-renders itself on a fold
+    /// (`invalidate()`, `tui/render.ts:2920-2924`) and on every frame after a resize; cyrup's widget
+    /// is published lines, so a fold or a resize re-renders from this and republishes, with no
+    /// fleet read (`on_widget_event` is synchronous and must not block). `None` whenever the slot
+    /// holds no human card (cleared, empty, RPC mode, no UI), so a stale event republishes nothing.
+    async_widget_last: Arc<std::sync::Mutex<Option<AsyncWidgetRows>>>,
     /// SUBA-162 — pi `asyncWidgetLayout` (`extension/index.ts:295` @ad11b7ab), captured likewise.
     async_widget_layout: crate::tui::render::AsyncWidgetLayout,
     /// SUBA-162 — the async-jobs widget's layout session: the locked progressive height and
@@ -342,7 +359,10 @@ impl SubagentsExtension {
             fleet_inspector_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fleet_view_enabled,
             async_widget_enabled,
-            async_widget_collapsed,
+            async_widget_collapsed: Arc::new(std::sync::atomic::AtomicBool::new(
+                async_widget_collapsed,
+            )),
+            async_widget_last: Arc::new(std::sync::Mutex::new(None)),
             async_widget_layout,
             async_widget_session: Arc::new(std::sync::Mutex::new(None)),
             async_slot_occupied: Arc::new(std::sync::atomic::AtomicBool::new(false)),

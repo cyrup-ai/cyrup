@@ -658,6 +658,46 @@ pub fn collect_fleet_status_entries(state: &FleetState, now: i64) -> Vec<FleetSt
             });
             continue;
         }
+        // SUBA-211 — pi `:467-473` @ad11b7ab: a run that reports no steps yet synthesises them
+        // from the launch roster (`job.agents`), one entry per agent, `pending` while the run is
+        // queued or for a chain's non-current step (unless the roster is a live parallel group).
+        // The async-jobs widget's header count reads the same roster
+        // (`AsyncJobSnapshot::from_run_view`), so the two surfaces count the same agents.
+        if status.steps.is_empty() && !job.launch_roster.agents.is_empty() {
+            let current = status.current_step.unwrap_or(0);
+            let sequential = status.mode == RunMode::Chain && !job.launch_roster.parallel_group;
+            for (index, agent) in job.launch_roster.agents.iter().enumerate() {
+                let pending = status.state == crate::background::RunState::Queued
+                    || (sequential && index != current);
+                // pi `:219` — a chain shows only the step actually current.
+                if pending && sequential && index != current {
+                    continue;
+                }
+                entries.push(FleetStatusEntry {
+                    key: format!("async:{}:{index}", status.run_id.as_str()),
+                    agent: agent.clone(),
+                    model_thinking: None,
+                    description: job.description.clone(),
+                    started_at,
+                    tokens: if job.launch_roster.agents.len() == 1 {
+                        total_tokens
+                    } else {
+                        0
+                    },
+                    state: if pending { "pending" } else { "running" }.to_string(),
+                    surface: None,
+                    workflow_wrapper: false,
+                    project_pane: None,
+                    nested_children: job
+                        .nested_children
+                        .iter()
+                        .filter(|nested| nested.parent_step_index == Some(index))
+                        .cloned()
+                        .collect(),
+                });
+            }
+            continue;
+        }
         // pi `:197-215`: no steps at all → one run-level entry.
         if status.steps.is_empty() {
             entries.push(FleetStatusEntry {
@@ -1656,6 +1696,7 @@ mod tests {
             description: Some("do the thing".to_string()),
             context: None,
             nested_children: Vec::new(),
+            launch_roster: Default::default(),
         }
     }
 

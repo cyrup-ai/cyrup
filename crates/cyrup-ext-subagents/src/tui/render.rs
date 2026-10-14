@@ -451,9 +451,10 @@ pub fn lines_to_plain_text(lines: &[Line<'static>]) -> Vec<String> {
 /// and transcript keep for themselves before the widget may claim any.
 pub const RESERVED_NON_WIDGET_ROWS: usize = 19;
 
-/// pi `process.stdout.rows || 30` (`render.ts:2537,2542` @ad11b7ab). \[CYRUP-DELTA] The extension
-/// has no terminal-size accessor (`cyrup_ext::host::HostServices` carries none), so the publisher
-/// always passes upstream's own fallback.
+/// pi `process.stdout.rows || 30` (`render.ts:2537,2542` @ad11b7ab): the rows used when no
+/// terminal is attached. SUBA-211 — the publisher passes the host's measured terminal
+/// (`cyrup_ext::host::HostServices::terminal_size`) when there is one, and this only when there is
+/// not (every mode but the interactive TUI), exactly where pi's `||` takes it.
 pub const ASYNC_WIDGET_FALLBACK_ROWS: usize = 30;
 
 /// pi `process.stdout.columns || 120` (`render.ts:2546` @ad11b7ab); see

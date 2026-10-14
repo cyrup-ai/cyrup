@@ -277,6 +277,8 @@ impl SubagentExecutor {
                 description: None,
                 context: None,
                 nested_children,
+                // SUBA-211 — the launch's agents, for the step-less window.
+                launch_roster: job.launch_roster,
             });
         }
 

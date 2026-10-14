@@ -119,6 +119,9 @@ pub struct TrackedJob {
     /// measured from (R-SA-105). `None` while the run is still active (or terminal-with-live-
     /// descendants).
     pub terminal_since: Option<Instant>,
+    /// SUBA-211 — the agents this run was launched with, as the launch knew them. Empty for a run
+    /// this tracker only learned about after the fact (a restored run), which has no launch here.
+    pub launch_roster: LaunchRoster,
 }
 
 impl TrackedJob {
@@ -130,8 +133,29 @@ impl TrackedJob {
             last_status: None,
             events_cursor: 0,
             terminal_since: None,
+            launch_roster: LaunchRoster::default(),
         }
     }
+}
+
+/// SUBA-211 — a run's launch-time agent list: pi `AsyncJobState.agents` and the
+/// `activeParallelGroup` flag as `handleStarted` seeds them (`runs/background/async-job-tracker.ts:
+/// 731-758` @ad11b7ab), before the run's `status.json` carries any step.
+///
+/// pi takes the started event's `agents` (else its `chain`, else its one `agent`) and, when a
+/// parallel group starts at step 0, keeps only that group's members and marks the group live
+/// (`firstGroupCount`, `:733-737`, `activeParallelGroup: Boolean(firstGroupCount && …)`, `:760`).
+/// Both the async-jobs widget's header count (`runningLeafAgentCount`, `tui/render.ts:2642-2644`)
+/// and the fleet's run-level entries (`fleet-status.ts:467-473`) synthesise steps from it while the
+/// run reports none, which is why it is threaded to both through
+/// [`crate::tui::fleet_state::AsyncRunView`] — one value, so the two surfaces cannot disagree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LaunchRoster {
+    /// pi `AsyncJobState.agents` as launched.
+    pub agents: Vec<String>,
+    /// pi's launch-time `activeParallelGroup`: the roster is a parallel group running from step 0,
+    /// so every member counts, even in a chain.
+    pub parallel_group: bool,
 }
 
 // =================================================================================================
@@ -261,6 +285,18 @@ impl JobTracker {
             );
         }
         self.ensure_poller_started();
+    }
+
+    /// SUBA-211 — record the agents `run_id` was launched with ([`LaunchRoster`]). A no-op for a
+    /// run this tracker does not hold.
+    pub fn set_launch_roster(&self, run_id: &RunId, roster: LaunchRoster) {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(job) = jobs.get_mut(run_id) {
+            job.launch_roster = roster;
+        }
     }
 
     /// Starts tracking `run_id` the way [`JobTracker::track`] does, except the per-run

@@ -562,6 +562,7 @@ mod tests {
             description: None,
             context: None,
             nested_children: Vec::new(),
+            launch_roster: Default::default(),
         }
     }
 

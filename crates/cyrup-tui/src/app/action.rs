@@ -85,6 +85,24 @@ pub enum AppAction {
     /// shortcut key-id; the run loop dispatches it to the session's extension host
     /// (`ExtensionHost::run_shortcut` → `LiveExtension::execute_shortcut`).
     ExtensionShortcut(String),
+    /// SUBA-210 — a clean click that began a text selection landed on an extension widget's
+    /// rows, and the widget's owner must be asked whether it is its own (pi's
+    /// `component.handleMouse(clickEvent)` on the release, `tui-alt-screen.ts:1338-1341`). The
+    /// selection's release is held until it answers: a click the widget takes clears the
+    /// selection, one it leaves alone finishes the release as any other does. It rides an
+    /// `AppAction` because asking is `async` (a WASM guest's handler is) and `App::handle_input` is
+    /// not; the run loop resolves it with [`App::offer_widget_click`].
+    ExtensionWidgetClick {
+        /// The widget's key.
+        key: String,
+        /// The click, local to the widget, with the modifiers held.
+        mouse: cyrup_ext::WidgetMouse,
+    },
+    /// SUBA-211 — the terminal was resized; every mounted widget's owner is told
+    /// ([`cyrup_ext::ExtensionHost::terminal_resized`]) so it can relay itself out for the new
+    /// size and republish, as pi's mounted components re-render on a resize. The extension-visible
+    /// size was already published by the `InputEvent::Resize` arm. Implies a redraw.
+    ExtensionWidgetsResized(cyrup_ext::TerminalSize),
     /// State changed; the frame should be redrawn.
     Redraw,
     /// Nothing to do.

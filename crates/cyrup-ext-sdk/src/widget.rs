@@ -86,6 +86,110 @@ impl WidgetPlacement {
     }
 }
 
+/// The terminal's size in cells — pi `process.stdout.columns` / `.rows` (SUBA-211; WIT
+/// `types.terminal-size`), read through [`crate::ctx::Ui::terminal_size`] and pushed to a widget's
+/// owner on a resize as [`WidgetEvent::Resize`]. The whole terminal, not the widget's region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TerminalSize {
+    /// pi `process.stdout.columns`.
+    pub columns: u16,
+    /// pi `process.stdout.rows`.
+    pub rows: u16,
+}
+
+/// The modifier keys held during a pointer event — pi `MouseEvent.shift` / `.alt` / `.ctrl`
+/// (WIT `types.pointer-modifiers`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PointerModifiers {
+    /// Shift was held.
+    pub shift: bool,
+    /// Alt (Option, Meta) was held.
+    pub alt: bool,
+    /// Control was held.
+    pub ctrl: bool,
+}
+
+impl PointerModifiers {
+    /// Whether any modifier was held.
+    pub fn any(self) -> bool {
+        self.shift || self.alt || self.ctrl
+    }
+}
+
+/// One pointer event on a widget, local to it: `row` 0 is the widget's first line (pi
+/// `event.y === 0`). The button is always the primary one (WIT `types.widget-pointer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WidgetPointer {
+    /// The primary button went down.
+    Press {
+        /// Column inside the widget.
+        column: u16,
+        /// Row inside the widget.
+        row: u16,
+    },
+    /// A press and its release on one cell with nothing in between (pi's `click`); `count` is the
+    /// consecutive-click count, 1 to 3.
+    Click {
+        /// Column inside the widget.
+        column: u16,
+        /// Row inside the widget.
+        row: u16,
+        /// Consecutive clicks on this cell (1 to 3).
+        count: u8,
+    },
+    /// One wheel notch; negative `lines` scrolls up.
+    Wheel {
+        /// Column inside the widget.
+        column: u16,
+        /// Row inside the widget.
+        row: u16,
+        /// Notch direction and size.
+        lines: i32,
+    },
+}
+
+/// A pointer event and the modifiers held during it — pi's widget `handleMouse` argument (WIT
+/// `types.widget-mouse`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WidgetMouse {
+    /// What happened, where.
+    pub pointer: WidgetPointer,
+    /// The modifier keys held.
+    pub modifiers: PointerModifiers,
+}
+
+impl WidgetMouse {
+    /// pi's async-jobs fold test, whole: a click on `row` with no shift, alt or ctrl
+    /// (`pi-subagents/src/tui/render.ts:2939-2940` @ad11b7ab).
+    pub fn is_plain_click_on_row(&self, row: u16) -> bool {
+        matches!(self.pointer, WidgetPointer::Click { row: r, .. } if r == row)
+            && !self.modifiers.any()
+    }
+}
+
+/// What the host tells the extension that published a widget (SUBA-210, SUBA-211; WIT
+/// `types.widget-event`, delivered through the `events.handle-widget-event` export to the handler
+/// [`crate::api::ExtensionApi::on_widget_event`] registered for the widget's key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WidgetEvent {
+    /// A pointer event landed on the widget — pi `component.handleMouse(event)`.
+    Mouse(WidgetMouse),
+    /// The terminal was resized — pi re-renders every mounted component, and a cyrup widget, which
+    /// hands over lines once, republishes.
+    Resize(TerminalSize),
+}
+
+/// How a widget's handler answered a [`WidgetEvent`] — pi's `handleMouse` result, `undefined` or
+/// `{ handled: true }` (WIT `types.widget-event-outcome`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WidgetEventOutcome {
+    /// Not the widget's: a click it leaves alone stays the text selection's.
+    #[default]
+    Unhandled,
+    /// The widget took the event (and republished, if it changed).
+    Handled,
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

@@ -93,7 +93,8 @@ pub use guest_providers::GuestProviderRegistry;
 pub use host_services::{
     ControlSink, EditorFocusMirror, EditorTextMirror, FooterDataMirror, InjectAck, InjectItem,
     InjectMessage, InjectRequest, InjectSink, KeybindingMirror, LiveHostServices, OverlayRequest,
-    OverlaySink, ThemeAccess, UiEffect, UiEffectSink, UiKind, UiReply, UiRequest, UiSink,
+    OverlaySink, TerminalSizeMirror, ThemeAccess, UiEffect, UiEffectSink, UiKind, UiReply,
+    UiRequest, UiSink,
 };
 pub use provider_swap::{ProviderResolver, ProviderSwap};
 pub use runtime::{

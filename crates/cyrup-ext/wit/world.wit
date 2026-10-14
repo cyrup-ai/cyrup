@@ -1,4 +1,4 @@
-// cyrup:ext@0.20.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.21.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -210,7 +210,22 @@
 // 0.18 `models.*` precedent). A guest built against THIS file and loaded on a host from before it
 // is accepted by `check_world` and fails on the missing import — the documented limit of the gate,
 // which no bump could change.
-package cyrup:ext@0.20.0;
+//
+// 0.20 -> 0.21 is the LIVE-WIDGET batch (SUBA-210, SUBA-211), an EXPORT ADDITION:
+// `events.handle-widget-event` is NEW, so a 0.20 guest exports nothing under that name and would
+// die inside wasmtime on the link — `check_world` turns that into a typed `ExtError::WorldVersion`
+// instead (the 0.16 -> 0.17 `route-model` and 0.17 -> 0.18 `on-cache-warming-decision`
+// precedents). It is the guest half of pi's mounted widget COMPONENT
+// (`pi-subagents/src/tui/render.ts:2911` @ad11b7ab): `handleMouse` (`:2938-2944`), which folds
+// the async-jobs card on a plain left click on row 0, and the per-frame re-render that reads
+// `process.stdout.rows`/`columns` (`:2536-2553`). A component cannot cross the boundary
+// (ADR-0002), so the host calls this export on the guest that last published the widget's key,
+// with a pointer event local to the widget or the new terminal size, and the guest republishes
+// through `ui.set-widget`. It is not an `on-*` hook: no `pi.on(...)` event backs it, and the host
+// calls it on the widget's OWNER rather than on a subscriber, so the `on-*` count above is
+// unchanged. The `ui.get-terminal-size` IMPORT (pi `process.stdout.rows`/`columns`) arrives in the
+// same batch and is ADDITIVE — it would not have forced a bump on its own.
+package cyrup:ext@0.21.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -327,6 +342,72 @@ interface types {
     data: option<string>,
   }
 
+  // SUBA-211 — the terminal's size in cells: pi `process.stdout.columns` / `.rows`, which pi's
+  // async-jobs widget reads on every render (`pi-subagents/src/tui/render.ts:2536-2547` @ad11b7ab).
+  // The whole TERMINAL, not the region a widget was painted in.
+  record terminal-size {
+    columns: u16,
+    rows: u16,
+  }
+
+  // SUBA-210 — pi `MouseEvent.shift` / `.alt` / `.ctrl`, which pi's widget `handleMouse` reads to
+  // ignore a modified click (`render.ts:2939` @ad11b7ab).
+  record pointer-modifiers {
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+  }
+
+  // A cell inside a widget: `row` 0 is the widget's first line (pi `event.y === 0`).
+  record widget-cell {
+    column: u16,
+    row: u16,
+  }
+
+  // A press and its release on one cell with nothing in between (pi's `click`); `count` is the
+  // consecutive-click count, 1 to 3.
+  record widget-click {
+    column: u16,
+    row: u16,
+    count: u8,
+  }
+
+  // One wheel notch; `lines` is signed, negative scrolls up.
+  record widget-wheel {
+    column: u16,
+    row: u16,
+    lines: s32,
+  }
+
+  // The pointer event, local to the widget. The same closed set as the native overlay's
+  // `OverlayMouse` (`cyrup-ext/src/host/overlay.rs`): the host has already folded a press/release
+  // pair into a click. The button is always the primary one.
+  variant widget-pointer {
+    press(widget-cell),
+    click(widget-click),
+    wheel(widget-wheel),
+  }
+
+  record widget-mouse {
+    pointer: widget-pointer,
+    modifiers: pointer-modifiers,
+  }
+
+  // What the host tells a widget's owner (`events.handle-widget-event`).
+  variant widget-event {
+    // A pointer event landed on the widget — pi `component.handleMouse(event)`.
+    mouse(widget-mouse),
+    // The terminal was resized to this size — pi re-renders every mounted component on a resize.
+    resize(terminal-size),
+  }
+
+  // pi's `handleMouse` result: `undefined` (not mine: the click stays the text selection's) or
+  // `{ handled: true }`.
+  enum widget-event-outcome {
+    unhandled,
+    handled,
+  }
+
   // Result of a capability-scoped exec (arch-08 caps/exec.rs). 1:1 with Pi's `ExecResult`
   // (exec.ts:23-28): `killed` is true when the host SIGTERMed, then (after a 5s grace period if
   // still alive) SIGKILLed, the process on a timeout/abort — Pi's exact `killProcess` escalation
@@ -393,7 +474,7 @@ interface types {
 // quoted it.
 // ---------------------------------------------------------------------------
 interface events {
-  use types.{hook-outcome, tool-output, terminal-input-result};
+  use types.{hook-outcome, tool-output, terminal-input-result, widget-event, widget-event-outcome};
 
   // --- provider OAuth + custom streaming (pi `ProviderConfig`, `extensions/types.ts:1427-1464`
   // @v0.83.0; `streamSimple` `:1437`, `oauth` `:1450-1463`) ---
@@ -630,6 +711,15 @@ interface events {
   // unchanged poll. `branch` is upstream's `getGitBranch()` tri-state verbatim: a branch name, the
   // literal `"detached"`, or `none` outside a repo (`:126-132`).
   on-branch-change: func(branch: option<string>);
+
+  // SUBA-210 / SUBA-211 — the guest half of pi's mounted widget COMPONENT
+  // (`pi-subagents/src/tui/render.ts:2911` @ad11b7ab): its `handleMouse` (`:2938-2944`) and the
+  // re-render a resize gives it. Called only on the guest that last published `key` through
+  // `ui.set-widget`, with a pointer event local to that widget or the new terminal size. A guest
+  // that changes what the widget shows republishes it through `ui.set-widget` before returning.
+  // `unhandled` — also what a faulting guest is treated as — leaves a click to the text
+  // selection, so a broken extension can never take the pointer.
+  handle-widget-event: func(key: string, event: widget-event) -> widget-event-outcome;
 
   // --- 5.4 tools — the mutating seams ---
   // tool_call [block/mutate] (subscribed at types.ts:1228 @v0.83.0), tool_result [mutate] (:1229).
@@ -1017,6 +1107,8 @@ interface registration {
 //     it (ADR-0002).
 // ---------------------------------------------------------------------------
 interface ui {
+  use types.{terminal-size};
+
   // EXT-036 (the import-surface re-run, completed here): every `types.ts` citation in this
   // interface was re-derived line by line against `v0.83.0`. A cluster of them was stale by a
   // uniform ~7 lines — the same offset, and therefore the same cause, as the cluster the register
@@ -1232,6 +1324,11 @@ interface ui {
   // --- tools-expanded get/set (Pi getToolsExpanded/setToolsExpanded) ---
   get-tools-expanded: func() -> bool;
   set-tools-expanded: func(expanded: bool);
+  // SUBA-211 — pi `process.stdout.columns` / `.rows`. `none` is "no terminal attached" (every mode
+  // but the interactive TUI); pi's own fallback there is `|| 120` / `|| 30` (`render.ts:2542`,
+  // `:2546` @ad11b7ab), which the caller applies. A resize is pushed through
+  // `events.handle-widget-event` to the owner of each mounted widget.
+  get-terminal-size: func() -> option<terminal-size>;
 }
 
 interface session {

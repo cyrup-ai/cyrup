@@ -689,6 +689,7 @@ mod tests {
             description: Some(sentinel.to_string()),
             context: None,
             nested_children: Vec::new(),
+            launch_roster: Default::default(),
         }
     }
 

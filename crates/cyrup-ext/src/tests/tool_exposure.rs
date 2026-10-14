@@ -775,7 +775,7 @@ mod guest {
 /// `tool-descriptor` record at its current shape.
 #[cfg(feature = "wasm-host")]
 pub(super) fn guest_registration_tool_import() -> String {
-    r#"  (import "cyrup:ext/types@0.20.0" (instance $types
+    r#"  (import "cyrup:ext/types@0.21.0" (instance $types
     (type $em (enum "parallel" "sequential"))
     (export "exec-mode" (type $em-x (eq $em)))
     (type $tn (record
@@ -797,7 +797,7 @@ pub(super) fn guest_registration_tool_import() -> String {
       (field "annotations" (option $ta-x)) (field "prepare-loadout" bool)))
     (export "tool-descriptor" (type $td-x (eq $td)))))
   (alias export $types "tool-descriptor" (type $tool-descriptor))
-  (import "cyrup:ext/registration@0.20.0" (instance $reg
+  (import "cyrup:ext/registration@0.21.0" (instance $reg
     (alias outer 1 $tool-descriptor (type $td))
     (export "tool-descriptor" (type $td-x (eq $td)))
     (export "register-tool" (func (param "t" $td-x) (result (result (error string)))))))

@@ -1199,6 +1199,24 @@ pub trait NativeExtension: Send + Sync {
     /// driven from the TUI's own poll arm.
     fn on_branch_change(&self, _branch: Option<&str>) {}
 
+    /// A pointer or resize event for a widget this extension published under `key` through
+    /// [`crate::host::HostServices::set_widget`] (SUBA-210, SUBA-211; pi's mounted widget
+    /// component, `handleMouse` and the per-frame re-render that reads the terminal size). See
+    /// [`crate::widget`] for the contract.
+    ///
+    /// Only called for a key this extension published last (the host records the owner on every
+    /// `set_widget`). An extension that changes what the widget shows republishes it through
+    /// `set_widget` before returning; [`crate::WidgetEventOutcome::Handled`] says the event was its
+    /// own, which for a click means it is NOT also the text selection's.
+    ///
+    /// Sync, and subject to the same "must not block" hazard as [`Self::on_terminal_input`]: the
+    /// TUI awaits the answer on its input path, because whether the click belongs to the widget or
+    /// to the selection under it has to be known before the release is finished. A PANIC is
+    /// contained by the host and treated as [`crate::WidgetEventOutcome::Unhandled`].
+    fn on_widget_event(&self, _key: &str, _event: crate::WidgetEvent) -> crate::WidgetEventOutcome {
+        crate::WidgetEventOutcome::Unhandled
+    }
+
     /// Render a custom ENTRY this extension declared a renderer for via
     /// [`InitApi::register_entry_renderer`] (Pi `EntryRenderer`, extensions/types.ts:1165-1169).
     /// `custom_type` is the entry's `customType`; `entry` is the serialized session entry.

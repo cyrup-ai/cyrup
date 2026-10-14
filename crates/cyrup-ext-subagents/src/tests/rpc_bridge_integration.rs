@@ -95,6 +95,9 @@ struct BusForwardingServices {
     /// The live session branch `HostServices::branch` serves (pi `ctx.sessionManager.getBranch()`)
     /// — what the RPC `cost` method walks.
     branch: Mutex<Vec<Value>>,
+    /// SUBA-211 — the terminal `HostServices::terminal_size` reports (the TUI's mirror in
+    /// production); `None` is "no terminal attached".
+    terminal: Mutex<Option<cyrup_ext::TerminalSize>>,
 }
 
 impl cyrup_ext::host::HostServices for BusForwardingServices {
@@ -112,6 +115,10 @@ impl cyrup_ext::host::HostServices for BusForwardingServices {
 
     fn branch(&self) -> Value {
         Value::Array(self.branch.lock().unwrap().clone())
+    }
+
+    fn terminal_size(&self) -> Option<cyrup_ext::TerminalSize> {
+        *self.terminal.lock().unwrap()
     }
 
     fn set_widget(
@@ -247,6 +254,7 @@ impl Harness {
             session_file: home.path().join("session.jsonl"),
             widgets: Mutex::new(Vec::new()),
             branch: Mutex::new(Vec::new()),
+            terminal: Mutex::new(None),
         });
         let extension = Arc::new(SubagentsExtension::with_mode(
             config.clone(),
@@ -2256,3 +2264,7 @@ async fn rpc_spawn_is_refused_by_the_same_disabled_feature_gate_as_the_tool() {
         "pi's sentence with pi's default `subagent` label — the tool's own gate, reached over RPC"
     );
 }
+
+/// SUBA-210 / SUBA-211 — the async-jobs card as a live widget: the header-click fold, the real
+/// terminal size, the resize relock and the launch roster.
+mod async_widget_live;
