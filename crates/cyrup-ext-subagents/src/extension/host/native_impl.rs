@@ -274,17 +274,24 @@ impl NativeExtension for SubagentsExtension {
                 // predates the native channel reaches for; on an orchestrator that never installed
                 // intercom — precisely the one this channel exists for — that name resolved to no
                 // tool at all.
-                // Both gates read the environment through the crate's injectable resolver, so
-                // `config.env_overrides` can pin (or scrub) what they see without this process
-                // mutating anything global. With no overrides this is byte-for-byte the previous
-                // `std::env::var(k).ok()`.
+                // SUBA-251 — the directory the gate looks in is the one the LAUNCHER resolved and
+                // handed this extension, `roots.agent_dir()` (`Roots::from_config_dirs(dirs)`), which
+                // is the directory `cyrup-intercom` itself answers against (`ConfigDirs::agent_dir`).
+                // It used to be re-derived here from the process environment, which is the same
+                // directory only while nothing else decided the session's agent dir. A session whose
+                // caller did (a test, an embedder) has its `intercom/config.json` where the
+                // environment's ladder does not look: the gate said intercom was absent, registered a
+                // second `intercom`, and the real one failed to load ("Tool \"intercom\" conflicts with
+                // subagents") — and the reverse, an intercom the environment names and the session
+                // does not install left nobody to own the name.
+                //
+                // The install env var is still read through the crate's injectable resolver, so
+                // `config.env_overrides` can pin (or scrub) it without this process mutating anything
+                // global. With no overrides this is byte-for-byte the previous `std::env::var(k).ok()`.
                 let env = self.env_lookup();
                 if crate::native_supervisor::native_intercom_alias_should_register(
                     &env,
-                    &crate::native_supervisor::intercom_agent_dir_from(
-                        &env,
-                        Some(self.cwd.clone()),
-                    ),
+                    self.roots.agent_dir(),
                 ) {
                     api.register_tool(Arc::new(
                         crate::native_supervisor::SubagentSupervisorTool::new_intercom_alias(

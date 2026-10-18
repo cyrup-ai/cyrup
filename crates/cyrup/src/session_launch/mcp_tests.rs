@@ -129,11 +129,16 @@ struct Run {
 }
 
 /// What a test chooses about the world: the server's entry beyond its command, `settings.json`,
-/// the seconds the server takes to start, and the launch flags.
+/// the seconds the server takes to start, whether the subagents extension is installed, and the
+/// launch flags.
 struct World {
     delay: u32,
     entry: Value,
     settings: Value,
+    /// Install the subagents extension the way a user does, with a `subagents/config.json`. A test
+    /// that leaves this off runs in whatever world the process environment makes (`CYRUP_SUBAGENTS`
+    /// installs it too), which is the point of those: the MCP surface must not depend on it.
+    subagents: bool,
 }
 
 impl World {
@@ -142,6 +147,15 @@ impl World {
             delay,
             entry: json!({ "directTools": true }),
             settings: json!({}),
+            subagents: false,
+        }
+    }
+
+    /// The same world with the subagents extension installed by file, whatever the environment says.
+    fn with_subagents(self) -> Self {
+        Self {
+            subagents: true,
+            ..self
         }
     }
 }
@@ -169,6 +183,11 @@ async fn run(world: World, script: &str, configure: impl FnOnce(&mut SessionConf
     )
     .unwrap();
     std::fs::write(agent_dir.join("settings.json"), world.settings.to_string()).unwrap();
+    if world.subagents {
+        let dir = agent_dir.join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+    }
 
     let requests: Requests = Arc::default();
     let provider = scripted(&requests, script);
@@ -407,6 +426,106 @@ async fn exclude_tools_patterns_remove_mcp_tools() {
         |cfg| cfg.exclude_tools = vec!["fx_p*".into(), "fx_boom".into()],
     )
     .await;
+    assert_eq!(
+        run.answer["listed"],
+        json!(["fx_data", "fx_echo"]),
+        "{}",
+        run.answer
+    );
+}
+
+// ------------------------------------------------------ with the subagents extension installed ----
+//
+// SEAM-175. The subagents extension restricts the active set at `session_start` (its `subagents_enable`
+// loader), and an MCP server that connects after that registers its tools live. The host replayed the
+// restriction over them, so every eager tool above was registered and never active: absent from the
+// request and from a script's `tools`. The tests above run in whatever world the environment makes;
+// these install the extension by file, so the property is held whatever the environment says.
+
+/// The control that makes the rest mean something: the extension really is installed in this world.
+async fn assert_subagents_installed(run: &Run) {
+    let session = run.runtime.session().await;
+    assert!(
+        session.all_tools().iter().any(|row| row.name == "subagent"),
+        "the world must actually install the subagents extension, or these prove nothing"
+    );
+}
+
+/// Eager MCP tools reach a script, and the model's request, beside the subagents extension.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eager_mcp_tools_survive_the_subagents_extension_restricting_the_tool_set() {
+    let run = run(
+        World {
+            settings: with_codemode(),
+            ..World::eager(0)
+        }
+        .with_subagents(),
+        LIST_SCRIPT,
+        |_| {},
+    )
+    .await;
+    assert_subagents_installed(&run).await;
+    assert_eq!(
+        run.answer["listed"],
+        json!(["fx_boom", "fx_data", "fx_echo", "fx_pic"]),
+        "{}",
+        run.answer
+    );
+    assert_eq!(
+        run.answer["offered"]["fx_echo"],
+        json!(true),
+        "the tool is callable from the script, not just listed: {}",
+        run.answer
+    );
+    // The script ran in the first turn's tool phase, so the request that carried it is the one
+    // after it: the tools are declared there as well.
+    assert!(
+        run.declared
+            .last()
+            .is_some_and(|names| names.iter().any(|name| name == "fx_echo")),
+        "the model is offered the eager tool: {:?}",
+        run.declared
+    );
+}
+
+/// The subagents tools are still there: the MCP tools are on top of the restriction, not instead of
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_subagents_tools_stay_active_beside_the_mcp_tools() {
+    let run = run(
+        World {
+            settings: with_codemode(),
+            ..World::eager(0)
+        }
+        .with_subagents(),
+        r#"return JSON.stringify({ subagent: "subagent" in tools, bgWait: "bg_wait" in tools, echo: "fx_echo" in tools });"#,
+        |_| {},
+    )
+    .await;
+    assert_subagents_installed(&run).await;
+    assert_eq!(
+        run.answer,
+        json!({ "subagent": true, "bgWait": true, "echo": true }),
+        "{}",
+        run.answer
+    );
+}
+
+/// The negative control: tools the flags exclude stay excluded. A tool that never reaches the
+/// registry cannot be activated by anything that merges the ones that do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn excluded_mcp_tools_stay_excluded_with_the_subagents_extension_installed() {
+    let run = run(
+        World {
+            settings: with_codemode(),
+            ..World::eager(0)
+        }
+        .with_subagents(),
+        LIST_SCRIPT,
+        |cfg| cfg.exclude_tools = vec!["fx_p*".into(), "fx_boom".into()],
+    )
+    .await;
+    assert_subagents_installed(&run).await;
     assert_eq!(
         run.answer["listed"],
         json!(["fx_data", "fx_echo"]),

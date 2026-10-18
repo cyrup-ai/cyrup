@@ -2,6 +2,7 @@
 //! build and run as ONE binary instead of one process per file).
 
 mod abort_settles;
+mod active_tools_ordering;
 mod added_tool_names_producer;
 mod agent_settled;
 mod agent_settled_deferral;

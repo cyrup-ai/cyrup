@@ -155,14 +155,11 @@ impl AgentSession {
     pub(crate) async fn next_turn_tools(&self) -> ToolLoadout {
         // EXT-004: a tool an extension registered from a LIVE handler during this run.
         self.refresh_extension_tools().await;
-        // A guest's `setActiveTools` queued from an event handler / mid-turn tool hook, re-resolved
-        // against the registry the refresh above just updated (the queue holds the requested NAMES
-        // precisely so this resolution happens after it — see `PendingActiveTools`). The rebuilt
-        // prompt becomes the base, which the next reconciliation with the transcript writes.
-        if let Some(names) = self.services.host_services.take_pending_active_tools() {
-            let (loadout, prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
-            self.push_active_tools(loadout, prompt).await;
-        }
+        // A guest's `setActiveTools` made from an event handler / mid-turn tool hook has already
+        // changed the dynamic-tool view; the agent is told here, with the view as the refresh above
+        // left it. The rebuilt prompt becomes the base, which the next reconciliation with the
+        // transcript writes.
+        self.sync_agent_tools().await;
         self.agent.loadout().await
     }
 
@@ -183,8 +180,41 @@ impl AgentSession {
     /// Set the active tool set by name, rebuilding the base system prompt and re-pushing both the
     /// tool array and the prompt to the agent for the next turn (Pi `setActiveToolsByName`,
     /// agent-session.ts:812). Unknown names are ignored.
+    ///
+    /// The later of two writes wins, as in pi (`setActiveToolsByName` replaces the active set at that
+    /// moment): a restriction an extension made earlier does not come back at the next drain, and a
+    /// tool registered before this call and not yet merged is governed by `names`
+    /// ([`crate::tools::DynamicToolState::set_active_over`]).
     pub async fn set_active_tools_by_name(&self, names: &[String]) {
-        let (loadout, prompt) = { Self::lock(&self.dynamic_tools).set_active(names) };
+        let registered = self.registered_tool_names();
+        let (loadout, prompt) =
+            { Self::lock(&self.dynamic_tools).set_active_over(names, &registered) };
+        self.push_active_tools(loadout, prompt).await;
+    }
+
+    /// Every tool name the extension registry holds right now, merged into the dynamic-tool view or
+    /// not: what pi's registry would hold, since pi merges at `registerTool`.
+    pub(crate) fn registered_tool_names(&self) -> Vec<String> {
+        self.services
+            .ext_host
+            .registry()
+            .all_registered_tool_names()
+            .unwrap_or_default()
+    }
+
+    /// Tell the live agent about a synchronous `setActiveTools`, which changed the dynamic-tool view
+    /// and left the agent behind ([`crate::host_services::LiveHostServices::take_agent_tools_stale`]).
+    ///
+    /// Pushes the view as it stands NOW, not what the call asked for: a tool that registered after the
+    /// call, or an explicit write made after it, is in the view already and must not be undone. The
+    /// flag is taken before the view is read, so a call that lands in between raises it again and the
+    /// next drain catches it. Cheap when nothing changed (one atomic swap), which is the common case
+    /// at every drain point.
+    pub(crate) async fn sync_agent_tools(&self) {
+        if !self.services.host_services.take_agent_tools_stale() {
+            return;
+        }
+        let (loadout, prompt) = { Self::lock(&self.dynamic_tools).current() };
         self.push_active_tools(loadout, prompt).await;
     }
 

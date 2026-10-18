@@ -134,35 +134,102 @@ async fn the_bg_wait_tool_is_registered_under_its_v0_68_0_name_and_dispatches_on
     );
 }
 
-/// A fanout child must NOT get `bg_wait`: it has no business blocking on its parent's whole async
-/// root, the same reasoning that makes `control_status`'s no-id listing child-unsafe. The
-/// `ChildSafe` registration arm therefore registers only the restricted `subagent` tool.
+/// SUBA-232 — a fan-out child gets `bg_wait` exactly ONCE, and it is the CHILD's: owned by the
+/// prompt runtime and described for a child (pi `subagent-prompt-runtime.ts:520`, `wait-tool.ts:19`
+/// @ad11b7ab) — never the `ChildSafe` subagents arm's, which loads first in the same session and
+/// would win the registry's first-wins race with the orchestrator's description and a user-input
+/// set nothing feeds. Upstream's fan-out child registers none either (`fanout-child.ts`).
+///
+/// The pair is loaded into one host in launch order (`crates/cyrup/src/session_launch.rs`: the
+/// subagents extension, then the prompt runtime), and the `ChildSafe` arm is checked alone too.
+///
+/// This replaces `a_fanout_child_does_not_get_the_bg_wait_tool`, which asserted a lifecycle
+/// subscription and never looked at the tool at all.
+///
+/// **Proven red at HEAD** (before SUBA-232): the pair registers no `bg_wait` at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fanout_child_does_not_get_the_bg_wait_tool() {
-    use cyrup_ext::native::{InitApi, NativeExtension};
+async fn a_fanout_child_gets_one_bg_wait_and_it_is_the_childs() {
+    use cyrup_ext::NativeExtension;
     use cyrup_ext_subagents::extension::RegistrationMode;
+    use cyrup_ext_subagents::prompt_runtime::{
+        INHERIT_PROJECT_CONTEXT_ENV, PROMPT_RUNTIME_EXTENSION_ID, prompt_runtime_extension_from,
+    };
+    use cyrup_ext_subagents::spawn::nested_events::{CHILD_ENV, FANOUT_CHILD_ENV};
 
     let home = tempfile::tempdir().expect("home tempdir");
     let work_dir = tempfile::tempdir().expect("work tempdir");
+    let child_safe = || -> Arc<dyn NativeExtension> {
+        Arc::new(SubagentsExtension::with_mode(
+            SubagentExtensionConfig {
+                roots: Roots::sandboxed(home.path()),
+                ..SubagentExtensionConfig::default()
+            },
+            work_dir.path().to_path_buf(),
+            RegistrationMode::ChildSafe,
+        ))
+    };
+    let host = || {
+        cyrup_ext::ExtensionHost::new(cyrup_ext::facade::HostConfig {
+            mode: cyrup_ext::native::ExtMode::Tui,
+            has_ui: false,
+            cwd: work_dir.path().to_path_buf(),
+        })
+    };
 
-    let child = SubagentsExtension::with_mode(
-        SubagentExtensionConfig {
-            roots: Roots::sandboxed(home.path()),
-            ..SubagentExtensionConfig::default()
-        },
-        work_dir.path().to_path_buf(),
-        RegistrationMode::ChildSafe,
-    );
-    let mut api = InitApi::new();
-    child
-        .init(&mut api)
+    // The ChildSafe arm alone registers no wait: it is not where a child's wait lives.
+    let alone = host();
+    alone
+        .load_native(child_safe())
         .await
-        .expect("child-safe init succeeds");
-
+        .expect("the ChildSafe arm loads");
     assert!(
-        !api.subscriptions()
-            .contains(cyrup_ext::EventKind::SessionStart),
-        "sanity: this really is the restricted ChildSafe surface, which installs no lifecycle \
-         subscriptions"
+        alone
+            .registry()
+            .tool("bg_wait")
+            .expect("registry")
+            .is_none(),
+        "the ChildSafe subagents arm must not register bg_wait"
+    );
+
+    // The real fan-out child: both extensions, in launch order.
+    let runtime = prompt_runtime_extension_from(&|key| match key {
+        CHILD_ENV | FANOUT_CHILD_ENV | INHERIT_PROJECT_CONTEXT_ENV => Some("1".to_string()),
+        _ => None,
+    })
+    .expect("no tool budget, so the runtime builds")
+    .expect("a child env builds the runtime");
+    let pair = host();
+    pair.load_native(child_safe())
+        .await
+        .expect("the ChildSafe arm loads");
+    pair.load_native(runtime)
+        .await
+        .expect("the prompt runtime loads");
+
+    let tool = pair
+        .registry()
+        .tool("bg_wait")
+        .expect("registry")
+        .expect("a fan-out child must have bg_wait");
+    assert_eq!(
+        pair.registry()
+            .tool_owner("bg_wait")
+            .expect("registry")
+            .map(|id| id.to_string())
+            .as_deref(),
+        Some(PROMPT_RUNTIME_EXTENSION_ID),
+        "the child's bg_wait is the prompt runtime's"
+    );
+    assert!(
+        pair.registry().conflicts().expect("registry").is_empty(),
+        "exactly one registration: {:?}",
+        pair.registry().conflicts()
+    );
+    assert!(
+        tool.description().contains(
+            "This child runtime does not install the root session's native completion notifier."
+        ),
+        "{}",
+        tool.description()
     );
 }

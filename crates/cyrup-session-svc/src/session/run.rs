@@ -1254,15 +1254,12 @@ impl AgentSession {
                 )
                 .await;
             // Pi `setActiveTools` (pi-permission-system index.ts:2155): a handler may have
-            // RESTRICTED the active tool set via `HostServices::set_active_tools`, which stages the
-            // requested NAMES. Drain + apply it IN-TURN here — before `spawn_run` — so the
-            // restriction shapes THIS turn, not the next turn boundary where
+            // RESTRICTED the active tool set via `HostServices::set_active_tools`, which changed the
+            // dynamic-tool view at once and left the agent behind. Push the view IN-TURN here — before
+            // `spawn_run` — so the restriction shapes THIS turn, not the next turn boundary where
             // `apply_pending_agent_control` would otherwise pick it up. pi applies it to the live
             // loadout synchronously, which the selected-tools rule below reads.
-            if let Some(names) = self.services.host_services.take_pending_active_tools() {
-                let (loadout, prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
-                self.push_active_tools(loadout, prompt).await;
-            }
+            self.sync_agent_tools().await;
             // SEAM-128 — apply a handler's `setModel`/`setThinkingLevel` BEFORE reading the resize
             // profile. Upstream's `ctx.setModel` mutates `this.model` synchronously inside the
             // handler, so by the time it reaches `_normalizePromptImages` the new model is already
@@ -1306,9 +1303,7 @@ impl AgentSession {
         // edited `selectedTools` is then APPLIED as the loadout (`_preparePromptAndToolLoadout` →
         // `_applyToolLoadout(options.selectedTools)`, `:1742`).
         if options.selected_tools != base_options.selected_tools {
-            let (loadout, prompt) =
-                { Self::lock(&self.dynamic_tools).set_active(&options.selected_tools) };
-            self.push_active_tools(loadout, prompt).await;
+            self.set_active_tools_by_name(&options.selected_tools).await;
         }
         self.stamp_live_loadout(&mut options);
         // pi builds the sections from these options in `_preparePromptAndToolLoadout`, where an

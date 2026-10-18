@@ -61,21 +61,27 @@ const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 /// runtime once it owns the session; until then control ops are reported as unavailable.
 pub type ControlSink = Arc<dyn Fn(ControlOp) -> Result<(), String> + Send + Sync>;
 
-/// A staged active-tool restriction: the tool NAMES a guest `setActiveTools` asked for (Pi
-/// `setActiveToolsByName`'s ARGUMENT, agent-session.ts:2283,840), queued for the async agent push in
-/// [`crate::AgentSession::apply_pending_control`].
-///
-/// The names, deliberately — NOT the `(tools, prompt)` pair the synchronous guest call already
-/// rebuilt. Every drain point runs the EXT-004 extension-tool refresh FIRST (`refresh_extension_tools`
-/// → `DynamicToolState::merge_registered`, which AUTO-ACTIVATES newly registered names and so writes
-/// the active set itself), and only then applies this. Staging a pre-refresh `(tools, prompt)`
-/// snapshot meant the refresh's auto-activation was the last write to the dynamic-tool view while the
-/// stale snapshot was the last write to the agent: `setActiveTools(["read"])` from a guest whose own
-/// tools had not been merged yet ended with the facade reporting `["read", <guest tools>]` and the
-/// agent running `["read"]`. Re-resolving the NAMES at the drain keeps pi's rule — the refresh happens
-/// inside `registerTool`, strictly earlier, and `setActiveToolsByName` is always the last word
-/// (agent-session.ts:2534-2553) — true for BOTH, from one write.
-type PendingActiveTools = Vec<String>;
+// How a synchronous `setActiveTools` reaches the live agent.
+//
+// A guest (or a native extension handler) calls `HostServices::set_active_tools` synchronously, across
+// a wasm-suspended call or from a handler, and the live agent can only be updated asynchronously
+// ([`crate::AgentSession::push_active_tools`]). So the call does two things. It changes the session's
+// dynamic-tool view AT ONCE, which is the state `getActiveTools` answers from and the only authority
+// for what is active, and it raises a flag that says the AGENT is behind that view. The next drain
+// pushes the view as it then stands ([`crate::AgentSession::sync_agent_tools`]).
+//
+// The flag carries no names, deliberately. This used to queue the requested NAMES and re-apply them at
+// the drain, after the EXT-004 refresh had merged the tools registered in the meantime. That kept one
+// ordering (an extension that registers a tool and then restricts the set gets what it asked for: the
+// refresh runs inside `registerTool`, strictly earlier) and broke the other: a tool registered AFTER the
+// restriction was activated by the refresh and then removed again by the replayed names, and an
+// explicit `set_active_tools_by_name` made after the restriction was undone by it. pi has no replay:
+// `setActiveToolsByName` replaces the active set at that moment and a later registration is activated on
+// top of it (`agent-session.ts:1518-1526`, `:3566-3589` @f1b2e77f5).
+//
+// What the replay was right about is the registrations that PRECEDED the restriction and had not been
+// merged yet. [`DynamicToolState::set_active_over`] records its verdict on exactly those names when the
+// call is made, and the merge that introduces them carries it out.
 
 /// Which dialog family a [`UiRequest`] carries (Pi `ExtensionUIContext.{confirm,input,select,editor}`,
 /// types.ts:127-133,216).
@@ -1098,12 +1104,11 @@ pub struct LiveHostServices {
     /// agent-session.ts:2281,2283). Attached post-build via [`Self::attach_dynamic_tools`]; `None`
     /// until then (default host: `active_tools` returns `None` ⇒ the binding uses its own bookkeeping).
     dynamic_tools: Mutex<Option<Arc<Mutex<DynamicToolState>>>>,
-    /// The tool NAMES a guest `setActiveTools` asked for, queued for the ASYNC agent push
-    /// [`crate::AgentSession::apply_pending_control`] applies before the next turn (the guest is
-    /// wasm-suspended across the SYNC `set_active_tools` call — the same sync→async bridge
-    /// `pending_events`/the control queue use). Last write wins (Pi: the last `setActiveTools` wins).
-    /// See [`PendingActiveTools`] for why this is the names and not the rebuilt push.
-    pending_active_tools: Mutex<Option<PendingActiveTools>>,
+    /// Raised by a synchronous [`HostServices::set_active_tools`]: the dynamic-tool view has changed
+    /// and the live agent has not been told. [`crate::AgentSession::sync_agent_tools`] takes it and
+    /// pushes the view. A flag and not the names, so a drain can never apply a stale list over a
+    /// later change: see the note above this module's first item.
+    agent_tools_stale: std::sync::atomic::AtomicBool,
     /// [`DEFAULT_EXEC_TIMEOUT`] in production; overridable ONLY for tests
     /// (`LiveHostServices::with_exec_timeout`, `#[cfg(test)]`) so the fallback-timeout path is exercisable without a real test
     /// waiting the full production duration.
@@ -1325,7 +1330,7 @@ impl LiveHostServices {
             manager: Mutex::new(None),
             pending_events: Mutex::new(Vec::new()),
             dynamic_tools: Mutex::new(None),
-            pending_active_tools: Mutex::new(None),
+            agent_tools_stale: std::sync::atomic::AtomicBool::new(false),
             exec_timeout: DEFAULT_EXEC_TIMEOUT,
             inject_sink: Mutex::new(None),
             pending_turn_injections: PendingTurnInjections::default(),
@@ -1834,13 +1839,28 @@ impl LiveHostServices {
         *Self::lock(&self.dynamic_tools) = Some(dynamic_tools);
     }
 
-    /// Drain the tool NAMES a guest `setActiveTools` queued;
-    /// [`crate::AgentSession::apply_pending_control`] re-resolves them against the dynamic-tool view
-    /// and applies the result to the live agent before the next turn (the guest ran the restriction
-    /// synchronously across the wasm-suspended call, so the readback was already right; this is what
-    /// makes it the LAST word over the tool refresh that runs at the same drain point).
-    pub fn take_pending_active_tools(&self) -> Option<PendingActiveTools> {
-        Self::lock(&self.pending_active_tools).take()
+    /// Whether a synchronous `setActiveTools` left the live agent behind the dynamic-tool view, and
+    /// clear it. [`crate::AgentSession::sync_agent_tools`] calls this at every drain point and, when
+    /// it answers `true`, pushes the view as it stands. Taking it BEFORE reading the view means a
+    /// call that lands in between raises it again, so no change is lost.
+    pub fn take_agent_tools_stale(&self) -> bool {
+        self.agent_tools_stale
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Every tool name the extension registry holds right now, merged into the session or not; empty
+    /// before the registry is attached. What [`HostServices::set_active_tools`] makes its restriction
+    /// over, because pi would have merged each of them at `registerTool`.
+    fn registered_tool_names(&self) -> Vec<String> {
+        let Some(host) = Self::lock(&self.flag_source)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return Vec::new();
+        };
+        host.registry()
+            .all_registered_tool_names()
+            .unwrap_or_default()
     }
 
     /// Drain the facade events queued by guest state mutations (entry_appended/session_info_changed);
@@ -3202,28 +3222,30 @@ impl HostServices for LiveHostServices {
 
     fn set_active_tools(&self, names: &[String]) {
         // Restrict the live agent's tool set (Pi `setActiveTools` = `setActiveToolsByName`,
-        // agent-session.ts:2283,840-855). Update the authoritative dynamic-tool view SYNCHRONOUSLY —
-        // Pi mutates `this.agent.state.tools` immediately, so the paired `getActiveTools` read (and
-        // the registered-tool wrapper's before/after diff) reflects it at once — and queue the
-        // REQUESTED NAMES for the ASYNC agent push `AgentSession::apply_pending_control` applies
-        // before the next turn (the guest is wasm-suspended across this SYNC call, the same
-        // sync→async bridge control ops use). No-op when no shared view is attached (default host:
-        // no live agent to restrict).
+        // agent-session.ts:1518-1526). Update the authoritative dynamic-tool view SYNCHRONOUSLY — Pi
+        // mutates `this.agent.state.tools` immediately, so the paired `getActiveTools` read (and the
+        // registered-tool wrapper's before/after diff) reflects it at once — and raise the flag that
+        // has the ASYNC agent push land at the next drain before the next turn (the guest is
+        // wasm-suspended across this SYNC call, the same sync→async bridge control ops use). No-op
+        // when no shared view is attached (default host: no live agent to restrict).
         //
-        // The rebuilt pair this synchronous call produces is deliberately DROPPED rather than
-        // queued: the drain re-runs the restriction after its own EXT-004 tool refresh, which can
-        // have auto-activated names in between. See [`PendingActiveTools`].
+        // The restriction is made over the registrations that exist now. Those the view has not
+        // merged yet are the ones pi would already have merged, so they are decided here and the merge
+        // that introduces them carries it out; one registered after this call is activated on top.
+        // Read before the view is locked: nothing may hold the registry's lock and the view's.
         let Some(dt) = Self::lock(&self.dynamic_tools).clone() else {
             return;
         };
-        let (_loadout, rebuilt) = { Self::lock(&dt).set_active(names) };
+        let registered = self.registered_tool_names();
+        let (_loadout, rebuilt) = { Self::lock(&dt).set_active_over(names, &registered) };
         // The mirrored prompt follows the tool set at once, as pi's `setActiveTools` rebuilds
         // `_baseSystemPrompt` before it returns: a `before_agent_start` handler that changes the
         // tools and then reads `getSystemPrompt()` gets the prompt for the tools it just set, not
-        // the one it was handed. The session's own base follows when the drain applies the names
+        // the one it was handed. The session's own base follows when the drain pushes the view
         // (`AgentSession::push_active_tools`), to the same text.
         Self::lock(&self.snapshot).system_prompt = Some(rebuilt.text().to_owned());
-        *Self::lock(&self.pending_active_tools) = Some(names.to_vec());
+        self.agent_tools_stale
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn all_tools(&self) -> Option<Vec<Value>> {

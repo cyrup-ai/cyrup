@@ -98,10 +98,13 @@ fn codemode_sandbox_factory() -> Arc<dyn cyrup_codemode_runtime::tool::SandboxFa
 ///    independent: it builds for a step that actually declared an `outputSchema`, i.e. when the
 ///    parent passed both structured-output env vars — `CYRUP_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA`
 ///    naming a schema DOCUMENT on disk, not carrying one inline — and it also builds for a
-///    fan-out-authorized child that passed neither. Both observed by
-///    [`tests::llama_child_probe`], whose `plain` arm loads exactly `[llama.cpp, mcp]`, whose
-///    `fanout` arm adds `subagents` AND `subagent-prompt-runtime`, and whose `structured` arm adds
-///    `subagent-prompt-runtime` alone (EXT-101). Every other process attaches nothing.
+///    fan-out-authorized child that passed neither. Since SUBA-232 it builds for EVERY subagent
+///    child (`CYRUP_SUBAGENT_CHILD=1`), whose own `bg_wait` it registers (pi
+///    `subagent-prompt-runtime.ts:520` @ad11b7ab loads the runtime into every child). All observed
+///    by [`tests::llama_child_probe`]: its `plain` arm loads `[llama.cpp, subagent-prompt-runtime,
+///    mcp]`, its `fanout` arm adds `subagents`, and its `structured` arm adds the
+///    `structured_output` tool instead (EXT-101). A process that is not a subagent child attaches
+///    this only when it carries one of the other halves' variables.
 /// 4. **Intercom itself**, now that its channels have been handed out.
 /// 5. **The MCP adapter** (gap-analysis 13a, MCP-001, the `pi-mcp-adapter` port). Attached
 ///    UNCONDITIONALLY — upstream is an installed npm package present in every session of every
@@ -1288,6 +1291,20 @@ mod tests {
     struct Loaded {
         loaded: Vec<String>,
         listed: Vec<String>,
+        /// Whether the registry holds the child-side `structured_output` tool — the one thing a
+        /// structured-output child has that every other child does not.
+        structured_output: bool,
+    }
+
+    /// Whether `session`'s registry holds the `structured_output` tool.
+    fn has_structured_output(session: &AgentSession) -> bool {
+        session
+            .services()
+            .ext_host
+            .registry()
+            .tool("structured_output")
+            .unwrap()
+            .is_some()
     }
 
     /// The factory a mode arm would build over `agent_dir` + `cwd`, and the target to build it at.
@@ -1381,7 +1398,12 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let listed = cyrup_tui::StartupReport::from_session(&session, false).extensions;
-        Loaded { loaded, listed }
+        let structured_output = has_structured_output(&session);
+        Loaded {
+            loaded,
+            listed,
+            structured_output,
+        }
     }
 
     /// [`session_through_build_factory`] (no `--no-extensions`) with `extensions` passed as `-e`.
@@ -1410,7 +1432,12 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let listed = cyrup_tui::StartupReport::from_session(&session, false).extensions;
-        Loaded { loaded, listed }
+        let structured_output = has_structured_output(&session);
+        Loaded {
+            loaded,
+            listed,
+            structured_output,
+        }
     }
 
     /// The position of `id` in `ids`, failing loudly (with the whole list) when absent.
@@ -1446,7 +1473,7 @@ mod tests {
     /// breath proves the list is not simply empty.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn llama_is_loaded_but_absent_from_the_startup_extensions_list() {
-        let Loaded { loaded, listed } = session_through_build_factory(true, false).await;
+        let Loaded { loaded, listed, .. } = session_through_build_factory(true, false).await;
         assert!(
             loaded.iter().any(|i| i == LLAMA_ID),
             "llama.cpp is in loaded_ids; got {loaded:?}"
@@ -1485,7 +1512,7 @@ mod tests {
             .iter()
             .map(|id| format!("builtin:{id}"))
             .collect();
-        for (form, Loaded { loaded, listed }) in [
+        for (form, Loaded { loaded, listed, .. }) in [
             ("default", session_through_build_factory(true, false).await),
             (
                 "-e builtin:<name>",
@@ -1624,6 +1651,14 @@ mod tests {
 
     /// `<agent_dir>/mcp.json` with one server `docs` in search mode, and an `mcp-cache.json` that
     /// is valid for it: two tools, so only one of them matches a query. No server is spawned.
+    /// Install the subagents extension the way a user does: a `subagents/config.json` in the agent
+    /// dir (`CYRUP_SUBAGENTS=1` installs it too, from the environment). The file is deterministic.
+    fn install_subagents(agent_dir: &Path) {
+        let dir = agent_dir.join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+    }
+
     fn write_search_mode_world(agent_dir: &Path) {
         let definition = cyrup_mcp::config::ServerEntry {
             command: Some("echo".to_string()),
@@ -1671,12 +1706,25 @@ mod tests {
         provider: Arc<FauxProvider>,
         extra: &[&str],
     ) -> (Arc<AgentSessionRuntime>, tempfile::TempDir) {
+        search_mode_session_with(provider, extra, false).await
+    }
+
+    /// [`search_mode_session`] with the subagents extension installed by file when `subagents` is
+    /// set: a `subagents/config.json`, which installs it whatever the environment says.
+    async fn search_mode_session_with(
+        provider: Arc<FauxProvider>,
+        extra: &[&str],
+        subagents: bool,
+    ) -> (Arc<AgentSessionRuntime>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().join("project");
         let agent_dir = tmp.path().join("agent");
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(&agent_dir).unwrap();
         write_search_mode_world(&agent_dir);
+        if subagents {
+            install_subagents(&agent_dir);
+        }
         let (factory, target) = factory_over(provider, &agent_dir, &cwd, false, false);
         // The runtime, as every mode builds its session: it shares the session (which binds the
         // self-handle the turn-boundary refresh reads, so a mid-run load reaches the next request)
@@ -1737,6 +1785,19 @@ mod tests {
     /// activated by it; the very next request declares it, with the cached schema.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tool_search_finds_a_search_mode_mcp_tool_and_the_next_request_declares_it() {
+        tool_search_finds_a_search_mode_tool(false).await;
+    }
+
+    /// The same with the subagents extension installed by file. Activating `tool_search` after the
+    /// session started is an explicit write made after the extension's `session_start` restriction
+    /// (the `subagents_enable` loader's), and the later write wins (SEAM-175): the first request
+    /// declares `tool_search`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_search_finds_a_search_mode_mcp_tool_with_the_subagents_extension_installed() {
+        tool_search_finds_a_search_mode_tool(true).await;
+    }
+
+    async fn tool_search_finds_a_search_mode_tool(subagents: bool) {
         let declared: Declared = Arc::default();
         let provider = scripted(
             &declared,
@@ -1745,8 +1806,14 @@ mod tests {
                 None,
             ],
         );
-        let (runtime, _tmp) = search_mode_session(provider, &["tool_search"]).await;
+        let (runtime, _tmp) = search_mode_session_with(provider, &["tool_search"], subagents).await;
         let session = runtime.session().await;
+        if subagents {
+            assert!(
+                session.all_tools().iter().any(|row| row.name == "subagent"),
+                "the world must actually install the subagents extension, or this proves nothing"
+            );
+        }
         let _ = session.prompt("find the widget tool").await.unwrap();
         session.wait_for_idle().await;
 
@@ -2033,7 +2100,11 @@ mod tests {
             (true, true) => panic!("one orchestrator environment per probe run"),
         };
         let no_extensions = probe == "no-extensions";
-        let Loaded { loaded, .. } = session_through_build_factory(false, no_extensions).await;
+        let Loaded {
+            loaded,
+            structured_output,
+            ..
+        } = session_through_build_factory(false, no_extensions).await;
         let llama = loaded.iter().any(|i| i == LLAMA_ID);
         let mcp = loaded.iter().any(|i| i == MCP_ID);
         assert_eq!(
@@ -2045,36 +2116,37 @@ mod tests {
             llama, mcp,
             "child {flavour}: llama.cpp follows the MCP adapter's ambient treatment; got {loaded:?}"
         );
+        // SUBA-232: EVERY subagent child attaches the prompt runtime — at minimum for its own
+        // `bg_wait` (pi `subagent-prompt-runtime.ts:520` @ad11b7ab, which loads the runtime into
+        // every child) — so its presence is common to all three arms and proves none of them.
+        let runtime = cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID;
+        assert!(
+            loaded.iter().any(|i| i == runtime),
+            "child {flavour}, no_extensions={no_extensions}: every subagent child carries \
+             `{runtime}` for its bg_wait; got {loaded:?}"
+        );
         // The orchestrator environment DID reach this launch, so neither extra arm is a silent
         // copy of `plain`: a fan-out child attaches the subagents extension off its authorization
-        // alone, and a child carrying the structured-output pair attaches the prompt runtime —
-        // neither of which a `plain` child has (`plain` loads exactly `[llama.cpp, mcp]`). A
-        // misspelled or renamed variable therefore fails HERE instead of quietly re-running the
-        // `plain` case three times.
+        // alone, and a child carrying the structured-output pair registers the `structured_output`
+        // tool — neither of which a `plain` child has. A misspelled or renamed variable therefore
+        // fails HERE instead of quietly re-running the `plain` case three times.
         //
-        // Both companions are install-gated, not ambient, so `--no-extensions` does NOT drop them:
-        // that is the contrast this test is about. llama.cpp goes with the flag, these stay.
-        let companion = match flavour {
-            "fanout" => Some(cyrup_ext_subagents::extension::EXTENSION_ID),
-            "structured" => Some(cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID),
-            _ => None,
-        };
-        if let Some(companion) = companion {
-            assert!(
-                loaded.iter().any(|i| i == companion),
-                "child {flavour}, no_extensions={no_extensions}: `{companion}` proves the \
-                 orchestrator environment reached this launch; got {loaded:?}"
-            );
-        } else {
-            assert!(
-                !loaded
-                    .iter()
-                    .any(|i| i == cyrup_ext_subagents::extension::EXTENSION_ID
-                        || i == cyrup_ext_subagents::prompt_runtime::PROMPT_RUNTIME_EXTENSION_ID),
-                "child plain: neither orchestrator extension may be present, or the two arms \
-                 above prove nothing; got {loaded:?}"
-            );
-        }
+        // Both are install-gated, not ambient, so `--no-extensions` does NOT drop them: that is the
+        // contrast this test is about. llama.cpp goes with the flag, these stay.
+        let subagents = loaded
+            .iter()
+            .any(|i| i == cyrup_ext_subagents::extension::EXTENSION_ID);
+        assert_eq!(
+            (subagents, structured_output),
+            match flavour {
+                "fanout" => (true, false),
+                "structured" => (false, true),
+                _ => (false, false),
+            },
+            "child {flavour}, no_extensions={no_extensions}: (subagents extension, \
+             structured_output tool) must be exactly the flavour's own, or the arms prove \
+             nothing; got {loaded:?}"
+        );
         println!("llama-probe-ok:{flavour}:{probe}");
     }
 
@@ -2264,11 +2336,23 @@ mod tests {
     /// extension in and supplies the bad input — the control and the refusal differ only in the
     /// file's CONTENTS, never in whether intercom was reachable at all.
     async fn launch_with_intercom_config(json: &str) -> (Vec<String>, Vec<RuntimeDiagnostic>) {
+        launch_with_intercom_config_in(json, false).await
+    }
+
+    /// [`launch_with_intercom_config`] with the subagents extension installed by file when
+    /// `subagents` is set.
+    async fn launch_with_intercom_config_in(
+        json: &str,
+        subagents: bool,
+    ) -> (Vec<String>, Vec<RuntimeDiagnostic>) {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().join("project");
         let agent_dir = tmp.path().join("agent");
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(&agent_dir).unwrap();
+        if subagents {
+            install_subagents(&agent_dir);
+        }
         let dir = agent_dir.join("intercom");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), json).unwrap();
@@ -2323,6 +2407,31 @@ mod tests {
         assert_eq!(
             refused, expected,
             "a malformed intercom config must quarantine intercom and NOTHING else (clean: {clean:?})"
+        );
+    }
+
+    /// SUBA-251. Intercom and the subagents extension are installed side by side, as a user with both
+    /// has them, in an agent dir the session was GIVEN (not the one the environment names). Both
+    /// attach and nothing is reported: the subagents extension decides who owns the `intercom` tool
+    /// from the directory the session was built with, so it does not register a second one for the
+    /// real extension to conflict with ("Tool \"intercom\" conflicts with subagents").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_valid_intercom_config_loads_beside_the_installed_subagents_extension() {
+        let (loaded, diagnostics) =
+            launch_with_intercom_config_in(ACCEPTED_INTERCOM_CONFIG, true).await;
+        assert!(
+            loaded.iter().any(|id| id == INTERCOM_ID),
+            "intercom attaches: {loaded:?} {diagnostics:?}"
+        );
+        assert!(
+            loaded
+                .iter()
+                .any(|id| id == cyrup_ext_subagents::extension::EXTENSION_ID),
+            "so does the subagents extension, or this proves nothing: {loaded:?}"
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "a valid intercom config is not a diagnostic: {diagnostics:?}"
         );
     }
 
@@ -2970,12 +3079,40 @@ mod tests {
         faux
     }
 
-    /// What the first request of a session over `policy` (and, when given, `settings.json`)
-    /// declared, and the system prompt it carried.
-    async fn first_request(policy: &str, settings: Option<&str>) -> (Vec<String>, String) {
+    /// What the first request of a session over `policy` (and, when given, `settings.json`) declared
+    /// and said, and what the session knew about the tools it declared.
+    struct FirstRequest {
+        /// The tool names the request declared, sorted.
+        declared: Vec<String>,
+        /// The system prompt the request carried.
+        prompt: String,
+        /// The declared tools that have a prompt snippet. pi lists exactly these in the prompt's
+        /// `<tools>` section: `visibleTools = declaredTools.filter((name) => !!toolSnippets[name])`
+        /// (`core/system-prompt.ts:150-159` @f1b2e77f5). A declared tool with no snippet reaches the
+        /// model through the request alone.
+        with_snippet: Vec<String>,
+        /// Every tool the session registered, active or not.
+        registered: Vec<String>,
+    }
+
+    /// [`first_request_in`] in the world the process environment makes.
+    async fn first_request(policy: &str, settings: Option<&str>) -> FirstRequest {
+        first_request_in(policy, settings, false).await
+    }
+
+    /// The first request of a session over `policy`, with the subagents extension installed by file
+    /// when `subagents` is set (`CYRUP_SUBAGENTS=1` installs it from the environment too).
+    async fn first_request_in(
+        policy: &str,
+        settings: Option<&str>,
+        subagents: bool,
+    ) -> FirstRequest {
         let (tmp, agent_dir, cwd) = permission_world_with(policy);
         if let Some(settings) = settings {
             std::fs::write(agent_dir.join("settings.json"), settings).unwrap();
+        }
+        if subagents {
+            install_subagents(&agent_dir);
         }
         let requests: Requests = Arc::default();
         let (factory, target) = factory_with(recording(&requests), &agent_dir, &cwd, false, |_| {});
@@ -2983,9 +3120,39 @@ mod tests {
         let session = runtime.session().await;
         let _ = session.prompt("go").await.unwrap();
         session.wait_for_idle().await;
-        let first = requests.lock().unwrap().first().cloned().unwrap();
+        let (mut declared, prompt) = requests.lock().unwrap().first().cloned().unwrap();
+        declared.sort();
+        let with_snippet = declared
+            .iter()
+            .filter(|name| {
+                session
+                    .tool_definition(name)
+                    .is_some_and(|tool| tool.prompt_snippet.is_some())
+            })
+            .cloned()
+            .collect();
+        let mut registered: Vec<String> = session
+            .all_tools()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        registered.sort();
         drop(tmp);
+        FirstRequest {
+            declared,
+            prompt,
+            with_snippet,
+            registered,
+        }
+    }
+
+    /// The tools of `declared` that have no prompt snippet, which the `<tools>` section cannot list.
+    fn without_snippet(first: &FirstRequest) -> Vec<&String> {
         first
+            .declared
+            .iter()
+            .filter(|name| !first.with_snippet.contains(name))
+            .collect()
     }
 
     /// The tool names the `<tools>` section of a system prompt lists, in order.
@@ -3012,16 +3179,32 @@ mod tests {
     /// for them (`Use bash for file operations like ls, rg, find`) while the request declared twelve,
     /// including `codemode`, because the permission system returned a sanitized copy of the prompt
     /// it was handed, built before it changed the active tools.
+    ///
+    /// "The tools the request declares" is pi's rule, which lists the declared tools that carry a
+    /// prompt snippet. In a session with nothing installed that is all of them. The subagents
+    /// extension declares two tools with no snippet, `subagent` and `bg_wait`, and nothing else
+    /// without one, so this holds in a world that has it too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_first_prompt_lists_the_tools_the_first_request_declares() {
-        let (mut declared, prompt) = first_request(POLICY_SKILLS_ASK, None).await;
-        declared.sort();
-        let mut listed = listed_tools(&prompt);
+        let first = first_request(POLICY_SKILLS_ASK, None).await;
+        let mut listed = listed_tools(&first.prompt);
         listed.sort();
-        assert_eq!(listed, declared, "the <tools> section of:\n{prompt}");
+        let prompt = &first.prompt;
+        assert_eq!(
+            listed, first.with_snippet,
+            "the <tools> section lists the declared tools that carry a snippet, in:\n{prompt}"
+        );
         assert!(
-            declared.iter().any(|name| name == "codemode"),
-            "codemode is active under this policy: {declared:?}"
+            without_snippet(&first)
+                .iter()
+                .all(|name| matches!(name.as_str(), "subagent" | "bg_wait")),
+            "only the subagents extension declares a tool with no snippet: {:?}",
+            without_snippet(&first)
+        );
+        assert!(
+            first.declared.iter().any(|name| name == "codemode"),
+            "codemode is active under this policy: {:?}",
+            first.declared
         );
         assert!(
             prompt.contains("Use codemode to batch independent tool calls"),
@@ -3036,18 +3219,32 @@ mod tests {
     /// The same under `codemode.mode: only`, where the request declares `codemode` and
     /// `tool_search` alone: the prompt described `read`, `bash`, `edit` and `write` to a model that
     /// was not given them, and never mentioned `codemode`.
+    ///
+    /// "Alone" is of the built-in tools. The subagents extension keeps its `subagents_enable` loader
+    /// active in every mode, so that a session cannot be left with no way to enable `subagent`
+    /// (`before_agent_start_loader_edit`, pi `tool-activation.ts:138-145`): the loader is declared
+    /// exactly when the extension is registered, and nothing else is.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_first_prompt_under_codemode_only_lists_only_what_the_request_declares() {
-        let (mut declared, prompt) = first_request(
+        let first = first_request(
             POLICY_SKILLS_ASK,
             Some(r#"{ "codemode": { "mode": "only" } }"#),
         )
         .await;
-        declared.sort();
-        assert_eq!(declared, ["codemode", "tool_search"], "{prompt}");
-        let mut listed = listed_tools(&prompt);
+        let prompt = &first.prompt;
+        let loader = "subagents_enable".to_string();
+        let mut expected = vec!["codemode".to_string(), "tool_search".to_string()];
+        if first.registered.contains(&loader) {
+            expected.push(loader);
+        }
+        expected.sort();
+        assert_eq!(first.declared, expected, "{prompt}");
+        let mut listed = listed_tools(prompt);
         listed.sort();
-        assert_eq!(listed, declared, "the <tools> section of:\n{prompt}");
+        assert_eq!(
+            listed, first.with_snippet,
+            "the <tools> section of:\n{prompt}"
+        );
         for stale in [
             "Use read to examine",
             "Use bash for",
@@ -3060,6 +3257,58 @@ mod tests {
             prompt.contains("Use codemode to batch independent tool calls"),
             "the codemode rule is missing from:\n{prompt}"
         );
+    }
+
+    /// With the subagents extension installed by file, whatever the environment says: the request
+    /// declares `subagent` and `bg_wait` beside the loader, the prompt lists the loader (it has a
+    /// snippet) and neither of the other two (they have none), and the sets still agree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_the_subagents_extension_installed_the_prompt_lists_the_tools_that_have_a_snippet()
+    {
+        let first = first_request_in(POLICY_SKILLS_ASK, None, true).await;
+        for name in ["subagent", "bg_wait", "subagents_enable"] {
+            assert!(
+                first.declared.iter().any(|n| n == name),
+                "the extension declares `{name}`: {:?}",
+                first.declared
+            );
+        }
+        let mut listed = listed_tools(&first.prompt);
+        listed.sort();
+        assert!(
+            listed.contains(&"subagents_enable".to_string()),
+            "{listed:?}"
+        );
+        assert!(
+            !listed.contains(&"subagent".to_string()) && !listed.contains(&"bg_wait".to_string()),
+            "a tool with no snippet is declared to the model and not listed: {listed:?}"
+        );
+        assert_eq!(listed, first.with_snippet, "{}", first.prompt);
+        assert_eq!(
+            without_snippet(&first),
+            ["bg_wait", "subagent"],
+            "and those two are the only declared tools without one"
+        );
+    }
+
+    /// …and under `codemode.mode: only` the loader stays, and nothing else joins it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_the_subagents_extension_installed_codemode_only_keeps_the_loader() {
+        let first = first_request_in(
+            POLICY_SKILLS_ASK,
+            Some(r#"{ "codemode": { "mode": "only" } }"#),
+            true,
+        )
+        .await;
+        assert_eq!(
+            first.declared,
+            ["codemode", "subagents_enable", "tool_search"],
+            "{}",
+            first.prompt
+        );
+        let mut listed = listed_tools(&first.prompt);
+        listed.sort();
+        assert_eq!(listed, first.declared, "{}", first.prompt);
     }
 
     /// A caller that names a disallowed built-in to `set_active_tools_by_name` (the CLI/host path

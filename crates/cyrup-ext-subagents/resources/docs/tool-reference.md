@@ -380,6 +380,12 @@ variable is a hard configuration error rather than a silent default.
 The tool is registered under the single name `bg_wait`. There is no `wait` alias — a call to `wait`
 is an unknown tool.
 
+Every subagent child registers its own `bg_wait` too, scoped to the child's session, so a child can
+collect the async runs it launched before it answers; its description tells it to. A steer the parent
+sends while the child's wait is open ends that wait the same way. A child reads only
+`CYRUP_SUBAGENT_WAIT_TOOL_ENABLED`: a `waitTool` setting in the parent's `config.json` does not reach
+it.
+
 ## Child-safe mode
 
 A child that the parent authorized to fan out gets a restricted `subagent` tool: the mutating

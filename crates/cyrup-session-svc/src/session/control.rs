@@ -122,29 +122,21 @@ impl AgentSession {
         for ev in self.services.host_services.take_pending_events() {
             self.fanout_emit(ev).await;
         }
-        // Push the tool set a guest `setActiveTools` restricted the session to onto the live agent
-        // (Pi `setActiveTools` = `setActiveToolsByName`, agent-session.ts:2283,850-854). The guest
-        // updated the authoritative dynamic-tool view synchronously across the wasm-suspended call
-        // (so `getActiveTools` already reflects it); the ASYNC agent push lands here — the same
-        // command-tier-safe bridge point control ops / pending events drain at — before the next turn.
         // EXT-004: surface any tool an extension registered since the last drain (Pi calls
         // `refreshTools()` from `registerTool` itself; cyrup's registration crosses a SYNC wasm
-        // import, so the async agent push lands at this same bridge point). Ordered BEFORE the
-        // explicit `setActiveTools` push below so an extension that registered a tool AND then
-        // restricted the active set in the same handler gets what it asked for — in Pi the refresh
-        // happens inside `registerTool`, i.e. strictly earlier than any later `setActiveTools`, and
-        // `setActiveToolsByName` is always the last word.
+        // import, so the async agent push lands at this same bridge point).
         self.refresh_extension_tools().await;
-        // …and the restriction is RE-RESOLVED here, against the just-refreshed registry, rather than
-        // replayed from the pre-refresh pair the synchronous guest call built. `merge_registered`
-        // above auto-activates every newly registered name and writes the active set doing it, so
-        // replaying a stale pair left the dynamic-tool view holding the refresh's set and the agent
-        // holding the restriction's — the guest asked for `["read"]` and the facade answered
-        // `["read", <the guest's own tools>]`. Routing through the SAME facade method the host/CLI
-        // toggle uses keeps both in step and makes `setActiveToolsByName` the last word for real.
-        if let Some(names) = self.services.host_services.take_pending_active_tools() {
-            self.set_active_tools_by_name(&names).await;
-        }
+        // Then push the tool set a guest `setActiveTools` left the session with onto the live agent
+        // (Pi `setActiveTools` = `setActiveToolsByName`, agent-session.ts:1518-1526). The guest
+        // updated the authoritative dynamic-tool view synchronously across the wasm-suspended call
+        // (so `getActiveTools` already reflects it); only the ASYNC agent push lands here — the same
+        // command-tier-safe bridge point control ops / pending events drain at — before the next turn.
+        //
+        // The VIEW is pushed as it stands after the refresh, not the names the guest asked for. A
+        // tool registered before the guest's restriction was decided about by the restriction when
+        // it was made, and one registered after it was activated by the refresh just above, exactly as
+        // pi's `registerTool` would have; replaying the names here removed it again.
+        self.sync_agent_tools().await;
         let ops = self.services.host_services.take_pending_control();
         for op in ops {
             // Agent-state + lifecycle ops (SetModel/SetThinkingLevel/Abort/Shutdown) apply in place
@@ -489,7 +481,7 @@ impl AgentSession {
     ///
     /// In cyrup a guest `setModel` is a QUEUED [`ControlOp::SetModel`] on
     /// [`crate::host_services::LiveHostServices`], and `assemble_run_inputs` drains only
-    /// `take_pending_active_tools()` after the hook — the control queue is next drained at the
+    /// `sync_agent_tools()` after the hook — the control queue is next drained at the
     /// FOLLOWING turn boundary. Porting the position without this drain would leave
     /// [`super::AgentSession::limits_model`] answering the PREVIOUS model: the placement would be
     /// cargo-culted and the row's stated purpose silently unmet, with every other image test still
@@ -497,9 +489,8 @@ impl AgentSession {
     ///
     /// # Why not [`Self::apply_pending_agent_control`]
     ///
-    /// That drain also calls `refresh_extension_tools()` and `set_active_tools_by_name()`, which
-    /// would DOUBLE-APPLY the restriction `assemble_run_inputs` has just applied in-turn (and
-    /// re-resolve it against a registry refreshed mid-assembly). It also services the two SEND ops,
+    /// That drain also calls `refresh_extension_tools()`, which would merge the registry in the
+    /// middle of assembly, after the in-turn push `assemble_run_inputs` has just made. It also services the two SEND ops,
     /// which must not start or join a run from inside prompt assembly. This one touches
     /// `SetModel`/`SetThinkingLevel`/`Abort`/`Shutdown` and nothing else; every other op is
     /// re-queued, never dropped, so the command-tier / post-settle drains still see it. GAP-11's
@@ -540,14 +531,11 @@ impl AgentSession {
         for ev in self.services.host_services.take_pending_events() {
             self.fanout_emit(ev).await;
         }
-        // EXT-004, event-tier twin of the drain in `apply_pending_control` (same ordering rule:
-        // the refresh runs first so an explicit `setActiveTools` still has the last word — and, as
-        // there, the restriction is re-resolved AFTER it rather than replayed from the pre-refresh
-        // pair, so the dynamic-tool view and the agent cannot disagree about what is active).
+        // EXT-004, event-tier twin of the drain in `apply_pending_control` (same order: the refresh,
+        // then the agent is brought up to the dynamic-tool view, so the dynamic-tool view and the
+        // agent cannot disagree about what is active).
         self.refresh_extension_tools().await;
-        if let Some(names) = self.services.host_services.take_pending_active_tools() {
-            self.set_active_tools_by_name(&names).await;
-        }
+        self.sync_agent_tools().await;
         for op in self.services.host_services.take_pending_control() {
             let Some(op) = self.apply_agent_state_op(op).await else {
                 continue;
