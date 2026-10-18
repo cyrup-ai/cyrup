@@ -1383,6 +1383,13 @@ pub trait HostServices: Send + Sync {
     /// turn. No-op by default (the default host grants no tool-restriction authority); the session
     /// service routes this to the live agent's tool set + system-prompt rebuild — the SAME method the
     /// host/CLI tool-toggle path uses, so a guest's call has full, real effect.
+    ///
+    /// **Order.** The call is a write at that moment, as in pi: it replaces the active set, and a
+    /// later write replaces it. A tool registered BEFORE the call is governed by it (inactive unless
+    /// `names` includes it; active if it does, whatever its `defaultActive`), even when the host has
+    /// not merged the registration yet. A tool registered AFTER the call is activated on top of it by
+    /// the usual rule for a new registration. Nothing is replayed later, so a restriction cannot undo
+    /// a registration or an explicit write that came after it.
     fn set_active_tools(&self, _names: &[String]) {}
 
     /// The live session's FULL tool set as `ToolInfo` rows — `{name, description, parameters,

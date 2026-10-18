@@ -308,6 +308,41 @@ impl ToolAccess {
     }
 }
 
+/// What a restriction decided about the tools that were registered when it was made but had not
+/// reached [`DynamicToolState::registry`] yet (see [`DynamicToolState::set_active_over`]).
+///
+/// pi merges a tool at `registerTool`, so a `setActiveToolsByName` that follows governs it: a tool the
+/// names do not include is inactive, one they include is active. cyrup merges at the next drain, so
+/// the restriction records its verdict on each such name and the merge that introduces the tool
+/// carries it out. A tool registered AFTER the restriction has no verdict: it is activated on top of
+/// what the restriction left, as pi's refresh does (`_refreshToolRegistry` starts from
+/// `previousActiveToolNames`, `agent-session.ts:3566` @f1b2e77f5).
+#[derive(Default)]
+struct Decided {
+    /// Registered before the restriction, and named by it: active once it merges, even when
+    /// registration alone would not activate it (naming a tool activates it).
+    named: BTreeSet<String>,
+    /// Registered before the restriction, and not named by it: inactive once it merges.
+    excluded: BTreeSet<String>,
+}
+
+impl Decided {
+    /// Take out the verdicts on `introduced`, the names a merge has just added to the registry.
+    /// What is left waits for a merge that introduces it.
+    fn take(&mut self, introduced: &[String]) -> Self {
+        let mut taken = Self::default();
+        for name in introduced {
+            if self.named.remove(name) {
+                taken.named.insert(name.clone());
+            }
+            if self.excluded.remove(name) {
+                taken.excluded.insert(name.clone());
+            }
+        }
+        taken
+    }
+}
+
 /// The mutable dynamic-tool surface (Pi `_toolRegistry`/`_toolDefinitions`/`_activeToolNames`).
 pub(crate) struct DynamicToolState {
     /// All enable-able tools by name (built-ins after selection + extension/custom tools). Holds
@@ -324,6 +359,8 @@ pub(crate) struct DynamicToolState {
     /// activated when they register, and dropped when [`Self::set_active`] deactivates a tool or
     /// the next run starts ([`Self::clear_pending`]).
     pending: BTreeSet<String>,
+    /// What the last restriction decided about the registrations it could not see yet.
+    decided: Decided,
 }
 
 impl DynamicToolState {
@@ -350,6 +387,7 @@ impl DynamicToolState {
             loadout,
             rebuilder,
             pending: BTreeSet::new(),
+            decided: Decided::default(),
         }
     }
 
@@ -396,6 +434,9 @@ impl DynamicToolState {
         pending: &[String],
     ) -> (ToolLoadout, BuiltPrompt) {
         self.pending = pending.iter().cloned().collect();
+        // A loadout that replaces the active set starts from what it declares: nothing an earlier
+        // restriction decided about a registration is carried into it.
+        self.decided = Decided::default();
         self.activate(names)
     }
 
@@ -412,6 +453,12 @@ impl DynamicToolState {
         self.pending.iter().cloned().collect()
     }
 
+    /// How many registrations a restriction is still waiting to decide about.
+    #[cfg(test)]
+    pub(crate) fn waiting_decisions(&self) -> usize {
+        self.decided.named.len() + self.decided.excluded.len()
+    }
+
     /// Pi `_setActiveTools` (`agent-session.ts:1495-1499` @v1.0.1): resolve `names`, retire the
     /// pending names that are now active, and rebuild the prompt.
     fn activate(&mut self, names: &[String]) -> (ToolLoadout, BuiltPrompt) {
@@ -419,6 +466,13 @@ impl DynamicToolState {
         for tool in self.loadout.executable() {
             self.pending.remove(tool.name());
         }
+        (self.loadout.clone(), self.prompt())
+    }
+
+    /// The loadout and the prompt as they stand: what the live agent must be holding. A synchronous
+    /// restriction changes this state at once and leaves the agent behind
+    /// ([`crate::AgentSession::sync_agent_tools`] catches it up).
+    pub(crate) fn current(&self) -> (ToolLoadout, BuiltPrompt) {
         (self.loadout.clone(), self.prompt())
     }
 
@@ -510,18 +564,52 @@ impl DynamicToolState {
         }
     }
 
-    /// Set the active set by name (Pi `setActiveToolsByName`): unknown names and `hidden` tools are ignored, the
-    /// active list is replaced, and the new `(tools, system_prompt)` to push to the agent are returned.
+    /// [`Self::set_active_over`] when nothing is waiting to merge: the write a test makes. Production
+    /// never has that knowledge, so it only calls `set_active_over`.
+    #[cfg(test)]
+    pub(crate) fn set_active(&mut self, names: &[String]) -> (ToolLoadout, BuiltPrompt) {
+        self.set_active_over(names, &[])
+    }
+
+    /// Set the active set by name (Pi `setActiveToolsByName`): unknown names and `hidden` tools are
+    /// ignored, the active list is replaced, and the new `(tools, system_prompt)` to push to the agent
+    /// are returned.
     ///
     /// A loadout that deactivates a tool replaces the restored one, so its pending names are
     /// dropped; one that only adds tools, like activating `tool_search`, keeps them (pi
     /// `setActiveToolsByName`, `agent-session.ts:1487-1493` @v1.0.1).
-    pub(crate) fn set_active(&mut self, names: &[String]) -> (ToolLoadout, BuiltPrompt) {
+    ///
+    /// `registered` is every name the extension registry holds at this moment, read BEFORE this
+    /// state is locked (nothing may hold the registry's lock and this one together). The ones this
+    /// state has not merged yet are the registrations the call cannot see. pi would have merged them
+    /// at `registerTool`, so `names` governs them: each is recorded as named (active when it merges)
+    /// or excluded (inactive when it merges) and [`Self::merge_registered`] carries the verdict out.
+    /// Anything registered after this call has none, and is activated on top of what the call left.
+    ///
+    /// The record belongs to the latest call: a later `set_active_over`, and a restored loadout, each
+    /// replace it, because each is the later write.
+    pub(crate) fn set_active_over(
+        &mut self,
+        names: &[String],
+        registered: &[String],
+    ) -> (ToolLoadout, BuiltPrompt) {
         let previous = self.active_names();
         let pushed = self.activate(names);
         let active: BTreeSet<String> = self.active_names().into_iter().collect();
         if previous.iter().any(|name| !active.contains(name)) {
             self.pending.clear();
+        }
+        self.decided = Decided::default();
+        let named: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        for name in registered {
+            if self.registry.contains_key(name) {
+                continue;
+            }
+            if named.contains(name.as_str()) {
+                self.decided.named.insert(name.clone());
+            } else {
+                self.decided.excluded.insert(name.clone());
+            }
         }
         pushed
     }
@@ -592,6 +680,9 @@ impl DynamicToolState {
             .map(|t| t.name().to_string())
             .collect();
         let mut registry_moved = false;
+        // The names this merge adds to the registry: the ones a restriction made earlier may have
+        // decided about.
+        let mut introduced: Vec<String> = Vec::new();
         for t in tools
             .into_iter()
             .filter(|t| self.access.permits(t.as_ref()))
@@ -599,7 +690,10 @@ impl DynamicToolState {
             let name = t.name().to_string();
             self.rebuilder.upsert_contribution(&t);
             match self.registry.insert(name.clone(), t) {
-                None => registry_moved = true,
+                None => {
+                    registry_moved = true;
+                    introduced.push(name);
+                }
                 Some(previous) => {
                     if let Some(current) = self.registry.get(&name)
                         && definition_changed(&previous, current)
@@ -610,13 +704,23 @@ impl DynamicToolState {
             }
         }
         let mut names = self.active_names();
-        let newly_activated: Vec<String> = self
+        let mut newly_activated: Vec<String> = self
             .registry
             .values()
             .filter(|t| activated_on_registration(t) && !previously_activated.contains(t.name()))
             .map(|t| t.name().to_string())
             .filter(|n| !names.contains(n))
             .collect();
+        // A restriction made after these tools registered and before they merged governs them (pi
+        // merged them at `registerTool`, so the restriction that followed deactivated or named
+        // them). A tool it never saw is not here, and keeps the activation it just got.
+        let decided = self.decided.take(&introduced);
+        newly_activated.retain(|name| !decided.excluded.contains(name));
+        for name in decided.named {
+            if !names.contains(&name) && !newly_activated.contains(&name) {
+                newly_activated.push(name);
+            }
+        }
         // A registration that activates nothing still moves the loadout: `callable` and
         // `registered` are what `prepare_loadout` hooks read, and pi's `_refreshToolRegistry` ends
         // with an unconditional `_setActiveTools` (`:3541-3543`).
@@ -880,6 +984,180 @@ mod tests {
             names.contains(&"deploy"),
             "…without disturbing what was already active: {names:?}"
         );
+    }
+
+    // ----------------------------------------------- a restriction and the registrations around it --
+    //
+    // pi merges a tool at `registerTool` (`loader.ts:300` @f1b2e77f5) and `setActiveToolsByName`
+    // replaces the active set at that moment (`agent-session.ts:1518-1526`), so a restriction governs
+    // the tools registered before it and the ones registered after it are activated on top. cyrup merges
+    // at the next drain, so a restriction is told which names the extension registry held when it was
+    // made, and decides about them for the merge that introduces them.
+
+    /// What a restriction to `names` means when the extension registry held `registered`.
+    fn restrict(st: &mut DynamicToolState, names: &[&str], registered: &[&str]) {
+        st.set_active_over(&strings(names), &strings(registered));
+    }
+
+    fn active_after(st: &DynamicToolState) -> Vec<String> {
+        let mut names = st.active_names();
+        names.sort();
+        names
+    }
+
+    /// A tool that registers AFTER a restriction is activated on top of it (pi: the refresh that
+    /// `registerTool` runs starts from the active set as the restriction left it).
+    ///
+    /// The host used to replay the restriction's names after the merge, which removed it again.
+    #[test]
+    fn a_tool_that_merges_after_a_restriction_is_activated_on_top_of_it() {
+        let mut st = state_with(vec![
+            Fake::new("read", "builtin").arc(),
+            Fake::new("bash", "builtin").arc(),
+        ]);
+        restrict(&mut st, &["read"], &["read", "bash"]);
+        assert_eq!(active_after(&st), strings(&["read"]));
+
+        st.merge_registered(vec![Fake::new("audit", "new").arc()])
+            .expect("a new name pushes");
+
+        assert_eq!(active_after(&st), strings(&["audit", "read"]));
+    }
+
+    /// A tool registered BEFORE a restriction that does not name it is not activated when it merges:
+    /// in pi the restriction that followed its registration deactivated it.
+    #[test]
+    fn a_tool_registered_before_a_restriction_that_does_not_name_it_is_not_activated() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        // `audit` is in the registry, and has not been merged into this state yet.
+        restrict(&mut st, &["read"], &["read", "audit"]);
+
+        let pushed = st.merge_registered(vec![Fake::new("audit", "new").arc()]);
+
+        assert!(pushed.is_some(), "the registry moved, so the agent is told");
+        assert_eq!(active_after(&st), strings(&["read"]));
+        assert!(
+            st.get("audit").is_some_and(|t| !t.active),
+            "it is registered, and enable-able later"
+        );
+    }
+
+    /// …and one the restriction NAMES is activated when it merges, though registration alone would
+    /// not activate it: naming a tool activates it (`deferred` here).
+    #[test]
+    fn a_tool_registered_before_a_restriction_that_names_it_is_activated() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        restrict(&mut st, &["read", "search"], &["read", "search"]);
+
+        st.merge_registered(vec![Fake::new("search", "deferred").deferred().arc()]);
+
+        assert_eq!(active_after(&st), strings(&["read", "search"]));
+    }
+
+    /// A tool that registered after the restriction, and would not be activated by registration, is
+    /// not activated by the restriction either.
+    #[test]
+    fn a_deferred_tool_registered_after_a_restriction_stays_inactive() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        restrict(&mut st, &["read"], &["read"]);
+
+        st.merge_registered(vec![Fake::new("search", "deferred").deferred().arc()]);
+
+        assert_eq!(active_after(&st), strings(&["read"]));
+    }
+
+    /// The decision is made once, by the merge that introduces the tool, and then forgotten: what a
+    /// restriction records cannot outlive the registrations it was about.
+    #[test]
+    fn a_decision_is_consumed_by_the_merge_that_introduces_the_tool() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        restrict(&mut st, &["read"], &["read", "audit", "search"]);
+        assert_eq!(st.waiting_decisions(), 2, "one verdict per unmerged name");
+
+        st.merge_registered(vec![Fake::new("audit", "new").arc()]);
+        assert_eq!(active_after(&st), strings(&["read"]));
+        assert_eq!(
+            st.waiting_decisions(),
+            1,
+            "the merge decided about `audit` and kept nothing of it; `search` still waits"
+        );
+
+        st.merge_registered(vec![Fake::new("search", "new").deferred().arc()]);
+        assert_eq!(st.waiting_decisions(), 0);
+
+        // A tool activated later by an explicit call is not decided about again, and a refresh that
+        // carries the tool once more (a turn boundary does) changes nothing.
+        st.set_active(&strings(&["read", "audit"]));
+        st.merge_registered(vec![Fake::new("audit", "new").arc()]);
+        assert_eq!(active_after(&st), strings(&["audit", "read"]));
+    }
+
+    /// Of two restrictions made before a merge, the later one decides: it is the later write.
+    #[test]
+    fn a_later_restriction_replaces_the_decisions_of_an_earlier_one() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        restrict(&mut st, &["read"], &["read", "audit"]);
+        restrict(&mut st, &["read", "audit"], &["read", "audit"]);
+
+        st.merge_registered(vec![Fake::new("audit", "new").arc()]);
+
+        assert_eq!(active_after(&st), strings(&["audit", "read"]));
+    }
+
+    /// …and the other way round: a later restriction that does NOT name a tool an earlier one named
+    /// leaves it inactive. (Naming wins over excluding when both verdicts survive, so only this
+    /// direction shows whether the earlier record is really replaced.)
+    #[test]
+    fn a_later_restriction_that_does_not_name_a_tool_overrides_an_earlier_one_that_did() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        restrict(&mut st, &["read", "audit"], &["read", "audit"]);
+        restrict(&mut st, &["read"], &["read", "audit"]);
+
+        st.merge_registered(vec![Fake::new("audit", "new").arc()]);
+
+        assert_eq!(active_after(&st), strings(&["read"]));
+    }
+
+    /// An explicit `set_active` is a restriction made when nothing was waiting to merge, and a
+    /// later write that replaces what an earlier restriction decided.
+    #[test]
+    fn an_explicit_set_active_replaces_the_decisions_of_an_earlier_restriction() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        restrict(&mut st, &["read"], &["read", "audit"]);
+        st.set_active(&strings(&["read"]));
+
+        st.merge_registered(vec![Fake::new("audit", "new").arc()]);
+
+        assert_eq!(
+            active_after(&st),
+            strings(&["audit", "read"]),
+            "the tool registered with nothing deciding about it is activated on registration"
+        );
+    }
+
+    /// Restoring a declared loadout starts from what the transcript declares: nothing an earlier
+    /// restriction decided is carried into it.
+    #[test]
+    fn restoring_a_declared_loadout_discards_the_decisions_of_an_earlier_restriction() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        restrict(&mut st, &["read"], &["read", "audit"]);
+        st.restore_declared(&strings(&["read"]));
+
+        st.merge_registered(vec![Fake::new("audit", "new").arc()]);
+
+        assert_eq!(active_after(&st), strings(&["audit", "read"]));
+    }
+
+    /// A name the registry holds that this state will never merge (the session's flags exclude it) is
+    /// remembered harmlessly: it neither activates nor blocks anything else.
+    #[test]
+    fn a_registered_name_that_never_merges_changes_nothing() {
+        let mut st = state_with(vec![Fake::new("read", "builtin").arc()]);
+        restrict(&mut st, &["read"], &["read", "ghost"]);
+
+        st.merge_registered(vec![Fake::new("audit", "new").arc()]);
+
+        assert_eq!(active_after(&st), strings(&["audit", "read"]));
     }
 
     /// A custom tool registered AFTER build must contribute its prompt guidance, exactly as the
