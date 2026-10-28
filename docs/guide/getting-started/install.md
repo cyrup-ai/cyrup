@@ -19,7 +19,7 @@ own WASM extensions.
 ## Install
 
 ```sh
-cargo install --git https://github.com/cyrup-ai/cyrup cyrup
+cargo install --locked --git https://github.com/cyrup-ai/cyrup cyrup
 ```
 
 This builds and installs exactly one binary, `cyrup`, into `~/.cargo/bin/cyrup`.
@@ -51,7 +51,7 @@ saved sessions gone.
 Re-run the install command. cargo rebuilds from the current tip and replaces the binary in place.
 
 ```sh
-cargo install --git https://github.com/cyrup-ai/cyrup cyrup
+cargo install --locked --git https://github.com/cyrup-ai/cyrup cyrup
 ```
 
 `cyrup update` does not update cyrup itself. The self-update path writes three lines to stderr and
@@ -59,7 +59,7 @@ exits 1:
 
 ```text
 error: cyrup cannot self-update this installation.
-Update it with: cargo install --git https://github.com/cyrup-ai/cyrup cyrup
+Update it with: cargo install --locked --git https://github.com/cyrup-ai/cyrup cyrup
 
 Location of cyrup executable: /Users/you/.cargo/bin/cyrup
 ```

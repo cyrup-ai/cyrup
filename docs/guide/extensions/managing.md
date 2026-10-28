@@ -142,7 +142,7 @@ reaches the same stub, which writes to stderr and exits 1:
 
 ```text
 error: cyrup cannot self-update this installation.
-Update it with: cargo install --git https://github.com/cyrup-ai/cyrup cyrup
+Update it with: cargo install --locked --git https://github.com/cyrup-ai/cyrup cyrup
 
 Location of cyrup executable: /Users/you/.cargo/bin/cyrup
 ```

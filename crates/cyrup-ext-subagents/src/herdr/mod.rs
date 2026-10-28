@@ -2,7 +2,7 @@
 //!
 //! The herdr status bridge — cyrup's fleet in herdr's sidebar.
 //!
-//! When cyrup runs inside a [herdr](https://github.com/herdr) pane, this module is what makes the
+//! When cyrup runs inside a [herdr](https://github.com/herdrdev/herdr) pane, this module is what makes the
 //! pane's row in herdr's Agents sidebar tell the truth: **who is working, who is blocked waiting
 //! on you, who is done.** The transport lives in the workspace's one herdr client,
 //! [`cyrup_herdr`]; everything here is the cyrup half — the state machine, the label rules, and

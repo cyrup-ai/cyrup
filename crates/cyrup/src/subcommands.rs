@@ -388,7 +388,7 @@ pub fn render_command_help(command: PackageCommand) -> String {
         // `cyrup` and records `self`/`pi` as the other accepted spellings; the accepting code and its
         // CYRUP-DELTA are at the `source_is_self` binding in [`parse_package_command`].
         PackageCommand::Update => format!(
-            "Usage:\n  {}\n\nUpdate installed packages or model catalogs. Self-update is unavailable in this build.\n\nOptions:\n  --self                  Update {APP} only (UNAVAILABLE — see below; default when no target is given)\n  --extensions            Update installed packages only\n  --models                Refresh model catalogs only\n  --all                   Update {APP} (UNAVAILABLE) and installed packages\n  --extension <source>    Update one package only\n  -a, --approve           Trust project-local files for this command\n  -na, --no-approve       Ignore project-local files for this command\n  --force                 Reinstall {APP} even if the current version is latest (UNAVAILABLE)\n\nShort forms:\n  {APP} update                Update {APP} only (UNAVAILABLE)\n  {APP} update --all          Update {APP} (UNAVAILABLE) and all extensions\n  {APP} update --extensions   Update all installed packages\n  {APP} update --models       Refresh model catalogs only\n  {APP} update <source>       Update one package\n  {APP} update {APP}          Update {APP} only (self and pi also work as aliases, UNAVAILABLE)\n\nSelf-update: this build cannot replace its own binary. Update it with:\n  cargo install --git {REPO} {APP}\n",
+            "Usage:\n  {}\n\nUpdate installed packages or model catalogs. Self-update is unavailable in this build.\n\nOptions:\n  --self                  Update {APP} only (UNAVAILABLE — see below; default when no target is given)\n  --extensions            Update installed packages only\n  --models                Refresh model catalogs only\n  --all                   Update {APP} (UNAVAILABLE) and installed packages\n  --extension <source>    Update one package only\n  -a, --approve           Trust project-local files for this command\n  -na, --no-approve       Ignore project-local files for this command\n  --force                 Reinstall {APP} even if the current version is latest (UNAVAILABLE)\n\nShort forms:\n  {APP} update                Update {APP} only (UNAVAILABLE)\n  {APP} update --all          Update {APP} (UNAVAILABLE) and all extensions\n  {APP} update --extensions   Update all installed packages\n  {APP} update --models       Refresh model catalogs only\n  {APP} update <source>       Update one package\n  {APP} update {APP}          Update {APP} only (self and pi also work as aliases, UNAVAILABLE)\n\nSelf-update: this build cannot replace its own binary. Update it with:\n  cargo install --locked --git {REPO} {APP}\n",
             usage(command)
         ),
         PackageCommand::List => format!(
@@ -428,7 +428,7 @@ pub fn render_config_help() -> String {
 /// executable's location, and sets `process.exitCode = 1` (`:428-435`, `:855`).
 fn self_update_unavailable() {
     eprintln!("error: cyrup cannot self-update this installation.");
-    eprintln!("Update it with: cargo install --git {SELF_UPDATE_REPO} cyrup");
+    eprintln!("Update it with: cargo install --locked --git {SELF_UPDATE_REPO} cyrup");
     // `const entrypoint = process.argv[1]; if (entrypoint) { … }` (`:431-435`).
     if let Ok(exe) = std::env::current_exe() {
         eprintln!();
@@ -1637,7 +1637,7 @@ mod tests {
         let help = render_command_help(PackageCommand::Update);
         assert!(help.contains("Self-update is unavailable in this build"));
         assert!(
-            help.contains(&format!("cargo install --git {SELF_UPDATE_REPO} cyrup")),
+            help.contains(&format!("cargo install --locked --git {SELF_UPDATE_REPO} cyrup")),
             "the help must name the route that works: {help}"
         );
         assert!(

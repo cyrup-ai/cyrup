@@ -58,7 +58,7 @@ You need a stable Rust toolchain, 1.96 or newer. Nothing else: no Node, no Pytho
 alongside the binary.
 
 ```sh
-cargo install --git https://github.com/cyrup-ai/cyrup cyrup
+cargo install --locked --git https://github.com/cyrup-ai/cyrup cyrup
 ```
 
 The first build takes several minutes, because it compiles a WebAssembly runtime, a JavaScript
@@ -136,7 +136,7 @@ the command palette.
 
 ## herdr
 
-Run cyrup inside [herdr](https://github.com/herdr) and the herdr sidebar shows which pane is
+Run cyrup inside [herdr](https://github.com/herdrdev/herdr) and the herdr sidebar shows which pane is
 blocked waiting on you: permission and MCP dialogs raise the signal, and it is released on exit so
 no phantom `working` row is left behind. An agent can open, drive, inspect and close inspector and
 project panes through seven tool verbs, and subagents can run on a herdr saved machine, with events
